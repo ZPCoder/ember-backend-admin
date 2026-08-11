@@ -69,6 +69,9 @@ type PvpDbMatch = { room_code: string; match_token: string; state_json: string; 
 
 const PVP_SESSION_TTL_MS = 30 * 60 * 1000;
 const PVP_MAX_BODY_BYTES = 32 * 1024;
+// The client renders the countdown, but the Worker must enforce the same
+// window so a backgrounded or disconnected tab cannot hold a live turn open.
+const PVP_TURN_TIME_LIMIT_MS = 75 * 1000;
 
 function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
   const snapshot = JSON.parse(JSON.stringify(state)) as MatchState;
@@ -474,10 +477,44 @@ function canonicalCommand(value: unknown, role: 0 | 1): BattleCommand | null {
   const type = raw.type;
   if (type !== "mulligan" && type !== "play-card" && type !== "trade-card" && type !== "attack" && type !== "hero-attack" && type !== "hero-power" && type !== "use-coin" && type !== "end-turn" && type !== "choose-discover" && type !== "choose-one" && type !== "concede") return null;
   const command = { ...raw, type, player: role } as BattleCommand;
+  // Timeout is a server-only reason; clients may request a normal end turn
+  // but cannot forge an authoritative timeout marker.
+  if (command.type === "end-turn") command.reason = "manual";
   if (role === 1 && command.target?.kind === "hero") {
     command.target = { ...command.target, player: command.target.player === 0 ? 1 : 0 };
   }
   return command;
+}
+
+async function broadcastPvpDbTransition(
+  db: PvpDatabase,
+  room: PvpDbRoom,
+  session: PvpDbSession,
+  action: string,
+  command: BattleCommand,
+  state: MatchState,
+  matchToken: string,
+): Promise<void> {
+  const sequence = await nextPvpSequence(db, room);
+  const recipients = [room.host_client_id, room.guest_client_id].filter(Boolean) as string[];
+  await Promise.all(recipients.map(async (clientId) => {
+    const viewer = pvpRoleIndex(room, clientId);
+    if (viewer === null) return;
+    await queuePvpDbMessage(db, clientId, {
+      type: "action",
+      playerId: session.player_id,
+      peerName: session.name,
+      sequence,
+      action,
+      payload: {
+        command: redactPvpCommandForViewer(command, viewer),
+        state: redactPvpStateForViewer(state, viewer),
+        stateVersion: state.version,
+        result: state.result,
+        matchToken,
+      },
+    });
+  }));
 }
 
 async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: PvpMessage): Promise<void> {
@@ -594,17 +631,45 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
   if (!match || !current || !command) {
     return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, commandId: typeof payload.command === "object" && payload.command ? (payload.command as Record<string, unknown>).commandId : undefined, message: "对局指令无效或对局尚未开始。" });
   }
-  const transition = applyCommand(current, command);
+  const now = Date.now();
+  let baseState = current;
+  let timeoutCommand: BattleCommand | null = null;
+  if (
+    action === "command" &&
+    command.type !== "concede" &&
+    current.phase === "main" &&
+    now - Number(match.updated_at) >= PVP_TURN_TIME_LIMIT_MS
+  ) {
+    timeoutCommand = {
+      type: "end-turn",
+      player: current.activePlayer,
+      reason: "timeout",
+      commandId: `server-timeout-${match.match_token}-${current.version}`,
+    };
+    const timedOut = applyCommand(current, timeoutCommand);
+    if (timedOut.accepted) baseState = timedOut.state;
+    else timeoutCommand = null;
+  }
+
+  const transition = applyCommand(baseState, command);
   if (!transition.accepted) {
+    if (timeoutCommand) {
+      const timeoutUpdated = await db.prepare(`UPDATE pvp_matches SET state_json = ?, updated_at = ? WHERE room_code = ? AND match_token = ? AND state_json = ?`)
+        .bind(JSON.stringify(baseState), now, room.code, match.match_token, match.state_json).run();
+      if ((timeoutUpdated.meta?.changes ?? 0) === 1) {
+        await broadcastPvpDbTransition(db, room, session, action, timeoutCommand, baseState, match.match_token);
+      }
+    }
     return queuePvpDbMessage(db, session.client_id, {
       type: "action_rejected",
       action,
       commandId: command.commandId,
-      ...(transition.error?.code === "version-conflict" ? { resync: true } : {}),
-      message: transition.error?.message ?? "服务器拒绝了这条指令。",
+      resync: true,
+      message: timeoutCommand
+        ? "行动时间已耗尽，回合已自动结束，请等待新的行动窗口。"
+        : transition.error?.message ?? "服务器拒绝了这条指令。",
     });
   }
-  const now = Date.now();
   const updated = await db.prepare(`UPDATE pvp_matches SET state_json = ?, updated_at = ? WHERE room_code = ? AND match_token = ? AND state_json = ?`)
     .bind(JSON.stringify(transition.state), now, room.code, match.match_token, match.state_json).run();
   if ((updated.meta?.changes ?? 0) !== 1) {
@@ -616,30 +681,10 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
       message: "对局状态刚刚更新，请等待同步后再操作。",
     });
   }
-  const sequence = await nextPvpSequence(db, room);
   // Send the post-transition snapshot as well as the command. Clients render
   // this authoritative state directly, so refreshes and slow polling cannot
   // leave either side one reducer step behind.
-  const recipients = [room.host_client_id, room.guest_client_id].filter(Boolean) as string[];
-  await Promise.all(recipients.map(async (clientId) => {
-    const viewer = pvpRoleIndex(room, clientId);
-    if (viewer === null) return;
-    const actionPayload = {
-      command: redactPvpCommandForViewer(command, viewer),
-      state: redactPvpStateForViewer(transition.state, viewer),
-      stateVersion: transition.state.version,
-      result: transition.state.result,
-      matchToken: match.match_token,
-    };
-    await queuePvpDbMessage(db, clientId, {
-      type: "action",
-      playerId: session.player_id,
-      peerName: session.name,
-      sequence,
-      action,
-      payload: actionPayload,
-    });
-  }));
+  await broadcastPvpDbTransition(db, room, session, action, command, transition.state, match.match_token);
 }
 
 async function handlePvpDbMessage(db: PvpDatabase, session: PvpDbSession, message: PvpMessage): Promise<void> {
