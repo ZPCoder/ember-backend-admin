@@ -66,7 +66,6 @@ type PvpDbSession = {
 type PvpDbRoom = { code: string; host_client_id: string; guest_client_id: string | null; next_sequence: number };
 type PvpDbReady = { client_id: string; room_code: string; deck_json: string; updated_at: number };
 type PvpDbMatch = { room_code: string; match_token: string; state_json: string; created_at: number; updated_at: number };
-type PvpDbParticipant = { match_token: string; room_code: string; host_identity: string; guest_identity: string; created_at: number };
 
 const PVP_SESSION_TTL_MS = 30 * 60 * 1000;
 const PVP_MAX_BODY_BYTES = 32 * 1024;
