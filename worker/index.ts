@@ -1,6 +1,13 @@
 /** Cloudflare Worker entry point for 余烬协议. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import {
+  applyCommand,
+  createMatch,
+  validateDeck,
+  type BattleCommand,
+  type MatchState,
+} from "../lib/game/index.ts";
 
 interface Env {
   ASSETS: Fetcher;
@@ -57,8 +64,11 @@ type PvpDbSession = {
   updated_at: number;
 };
 type PvpDbRoom = { code: string; host_client_id: string; guest_client_id: string | null; next_sequence: number };
+type PvpDbReady = { client_id: string; room_code: string; deck_json: string; updated_at: number };
+type PvpDbMatch = { room_code: string; match_token: string; state_json: string; created_at: number; updated_at: number };
 
 const PVP_SESSION_TTL_MS = 30 * 60 * 1000;
+const PVP_MAX_BODY_BYTES = 32 * 1024;
 
 let pvpSchemaReady: Promise<void> | null = null;
 
@@ -93,6 +103,20 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         created_at INTEGER NOT NULL
       )`),
       db.prepare(`CREATE INDEX IF NOT EXISTS pvp_messages_client_cursor_idx ON pvp_messages (client_id, message_id)`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS pvp_ready (
+        client_id TEXT PRIMARY KEY NOT NULL,
+        room_code TEXT NOT NULL,
+        deck_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      )`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS pvp_ready_room_idx ON pvp_ready (room_code)`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS pvp_matches (
+        room_code TEXT PRIMARY KEY NOT NULL,
+        match_token TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )`),
     ]).then(() => undefined).catch((error) => {
       pvpSchemaReady = null;
       throw error;
@@ -127,6 +151,49 @@ async function getPvpDbRoom(db: PvpDatabase, code: string): Promise<PvpDbRoom | 
     .bind(code).first<PvpDbRoom>();
 }
 
+async function getPvpDbReady(db: PvpDatabase, clientId: string): Promise<PvpDbReady | null> {
+  return db.prepare(`SELECT client_id, room_code, deck_json, updated_at FROM pvp_ready WHERE client_id = ?`)
+    .bind(clientId).first<PvpDbReady>();
+}
+
+async function getPvpDbMatch(db: PvpDatabase, roomCode: string): Promise<PvpDbMatch | null> {
+  return db.prepare(`SELECT room_code, match_token, state_json, created_at, updated_at FROM pvp_matches WHERE room_code = ?`)
+    .bind(roomCode).first<PvpDbMatch>();
+}
+
+async function prunePvpDb(db: PvpDatabase): Promise<void> {
+  const cutoff = Date.now() - PVP_SESSION_TTL_MS;
+  const stale = await db.prepare(`SELECT client_id, player_id, name, room_code, updated_at FROM pvp_sessions WHERE updated_at < ? LIMIT 50`)
+    .bind(cutoff).all<PvpDbSession>();
+  for (const session of stale.results ?? []) {
+    await dbLeaveRoom(db, session);
+    await db.prepare(`DELETE FROM pvp_messages WHERE client_id = ?`).bind(session.client_id).run();
+    await db.prepare(`DELETE FROM pvp_sessions WHERE client_id = ?`).bind(session.client_id).run();
+  }
+  await db.batch([
+    db.prepare(`DELETE FROM pvp_messages WHERE created_at < ?`).bind(cutoff),
+    db.prepare(`DELETE FROM pvp_ready WHERE updated_at < ?`).bind(cutoff),
+    db.prepare(`DELETE FROM pvp_matches WHERE updated_at < ?`).bind(cutoff),
+  ]);
+}
+
+function parsePvpDeck(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length !== 30 || value.some((cardId) => typeof cardId !== "string")) return null;
+  const deck = value.map(String);
+  return validateDeck(deck).valid ? deck : null;
+}
+
+function parsePvpState(value: string): MatchState | null {
+  try {
+    const parsed = JSON.parse(value) as MatchState;
+    return parsed && typeof parsed === "object" && Array.isArray(parsed.players) && typeof parsed.version === "number"
+      ? parsed
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 async function dbRoomPlayers(db: PvpDatabase, room: PvpDbRoom): Promise<Array<{ id: string; name: string }>> {
   const ids = [room.host_client_id, room.guest_client_id].filter(Boolean) as string[];
   if (!ids.length) return [];
@@ -140,6 +207,15 @@ async function dbRoomState(db: PvpDatabase, room: PvpDbRoom): Promise<void> {
   const players = await dbRoomPlayers(db, room);
   const payload = { type: "room_state", room: room.code, payload: { players } };
   await Promise.all([room.host_client_id, room.guest_client_id].filter(Boolean).map((clientId) => queuePvpDbMessage(db, clientId as string, payload)));
+}
+
+async function clearPvpMatchIfActive(db: PvpDatabase, roomCode: string): Promise<void> {
+  const match = await getPvpDbMatch(db, roomCode);
+  const state = match ? parsePvpState(match.state_json) : null;
+  // Keep completed snapshots long enough for /api/game to verify the result
+  // even if one player leaves the room immediately after the final action.
+  if (state?.phase === "game-over") return;
+  await db.prepare(`DELETE FROM pvp_matches WHERE room_code = ?`).bind(roomCode).run();
 }
 
 async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise<void> {
@@ -167,12 +243,24 @@ async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise
     }
   }
   await dbRoomState(db, room);
+  const match = await getPvpDbMatch(db, room.code);
+  const matchState = match ? parsePvpState(match.state_json) : null;
+  if (matchState) {
+    await queuePvpDbMessage(db, session.client_id, {
+      type: "match_sync",
+      room: room.code,
+      payload: { state: matchState, matchToken: match.match_token },
+    });
+  }
 }
 
 async function dbLeaveRoom(db: PvpDatabase, session: PvpDbSession): Promise<void> {
   if (!session.room_code) return;
+  const leavingRoomCode = session.room_code;
   const room = await getPvpDbRoom(db, session.room_code);
   if (!room) {
+    await db.prepare(`DELETE FROM pvp_ready WHERE client_id = ?`).bind(session.client_id).run();
+    await clearPvpMatchIfActive(db, leavingRoomCode);
     await db.prepare(`UPDATE pvp_sessions SET room_code = NULL, updated_at = ? WHERE client_id = ?`)
       .bind(Date.now(), session.client_id).run();
     return;
@@ -187,10 +275,14 @@ async function dbLeaveRoom(db: PvpDatabase, session: PvpDbSession): Promise<void
       .bind(nextRoom.host, nextRoom.guest, Date.now(), room.code).run();
     await db.prepare(`UPDATE pvp_sessions SET room_code = NULL, updated_at = ? WHERE client_id = ?`)
       .bind(Date.now(), session.client_id).run();
+    await db.prepare(`DELETE FROM pvp_ready WHERE room_code = ?`).bind(room.code).run();
+    await clearPvpMatchIfActive(db, room.code);
     await db.prepare(`UPDATE pvp_sessions SET room_code = ? WHERE client_id = ?`).bind(room.code, opponentId).run();
     const remaining = await getPvpDbRoom(db, room.code);
     if (remaining) await dbRoomState(db, remaining);
   } else {
+    await db.prepare(`DELETE FROM pvp_ready WHERE room_code = ?`).bind(room.code).run();
+    await clearPvpMatchIfActive(db, room.code);
     await db.prepare(`DELETE FROM pvp_rooms WHERE code = ?`).bind(room.code).run();
     await db.prepare(`UPDATE pvp_sessions SET room_code = NULL, updated_at = ? WHERE client_id = ?`)
       .bind(Date.now(), session.client_id).run();
@@ -219,8 +311,8 @@ async function dbJoinRoom(db: PvpDatabase, session: PvpDbSession, code: string):
   if (!room) return queuePvpDbMessage(db, session.client_id, { type: "error", message: `房间 ${code} 不存在` });
   if (room.host_client_id === session.client_id || room.guest_client_id === session.client_id) {
     await db.prepare(`UPDATE pvp_sessions SET room_code = ?, updated_at = ? WHERE client_id = ?`).bind(code, Date.now(), session.client_id).run();
-    await queuePvpDbMessage(db, session.client_id, { type: "room_joined", room: code, message: "已恢复房间连接" });
-    await dbRoomState(db, room);
+    const refreshed = await getPvpDbSession(db, session.client_id);
+    if (refreshed) await dbRestoreSession(db, refreshed);
     return;
   }
   if (room.guest_client_id) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "房间已满" });
@@ -238,18 +330,134 @@ async function dbJoinRoom(db: PvpDatabase, session: PvpDbSession, code: string):
   await dbRoomState(db, updated);
 }
 
+async function nextPvpSequence(db: PvpDatabase, room: PvpDbRoom): Promise<number> {
+  const now = Date.now();
+  await db.prepare(`UPDATE pvp_rooms SET next_sequence = next_sequence + 1, updated_at = ? WHERE code = ?`)
+    .bind(now, room.code).run();
+  const updated = await getPvpDbRoom(db, room.code);
+  return updated?.next_sequence ?? room.next_sequence + 1;
+}
+
+function pvpRoleIndex(room: PvpDbRoom, clientId: string): 0 | 1 | null {
+  if (room.host_client_id === clientId) return 0;
+  if (room.guest_client_id === clientId) return 1;
+  return null;
+}
+
+function canonicalCommand(value: unknown, role: 0 | 1): BattleCommand | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const type = raw.type;
+  if (type !== "play-card" && type !== "attack" && type !== "hero-power" && type !== "end-turn" && type !== "concede") return null;
+  const command = { ...raw, type, player: role } as BattleCommand;
+  if (role === 1 && command.target?.kind === "hero") {
+    command.target = { ...command.target, player: command.target.player === 0 ? 1 : 0 };
+  }
+  return command;
+}
+
 async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: PvpMessage): Promise<void> {
   const room = session.room_code ? await getPvpDbRoom(db, session.room_code) : null;
   if (!room) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "请先创建或加入房间" });
+  const role = pvpRoleIndex(room, session.client_id);
+  if (role === null) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "联机会话不属于当前房间" });
   const action = typeof message.action === "string" ? message.action : "";
   if (!["ready", "match_start", "command"].includes(action)) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "联机指令类型无效" });
-  const payload = message.payload && typeof message.payload === "object" ? message.payload : {};
-  await db.prepare(`UPDATE pvp_rooms SET next_sequence = next_sequence + 1, updated_at = ? WHERE code = ?`).bind(Date.now(), room.code).run();
-  const updated = await getPvpDbRoom(db, room.code);
-  const sequence = updated?.next_sequence ?? room.next_sequence + 1;
-  const opponentId = room.host_client_id === session.client_id ? room.guest_client_id : room.host_client_id;
-  if (opponentId) await queuePvpDbMessage(db, opponentId, { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload });
-  await queuePvpDbMessage(db, session.client_id, { type: "action_ack", action, sequence });
+  const payload = message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
+    ? message.payload as Record<string, unknown>
+    : {};
+
+  if (action === "ready") {
+    const deckIds = parsePvpDeck(payload.deckIds);
+    if (!deckIds) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "卡组无效，无法准备。" });
+    const now = Date.now();
+    await db.prepare(`INSERT INTO pvp_ready (client_id, room_code, deck_json, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(client_id) DO UPDATE SET room_code = excluded.room_code, deck_json = excluded.deck_json, updated_at = excluded.updated_at`)
+      .bind(session.client_id, room.code, JSON.stringify(deckIds), now).run();
+    const sequence = await nextPvpSequence(db, room);
+    const opponentId = role === 0 ? room.guest_client_id : room.host_client_id;
+    if (opponentId) await queuePvpDbMessage(db, opponentId, { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: { deckIds } });
+    await queuePvpDbMessage(db, session.client_id, { type: "action_ack", action, sequence });
+    return;
+  }
+
+  if (action === "match_start") {
+    if (role !== 0) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "只有房主可以开始对局。" });
+    if (!room.guest_client_id) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "等待对手加入房间。" });
+    const hostReady = await getPvpDbReady(db, room.host_client_id);
+    const guestReady = await getPvpDbReady(db, room.guest_client_id);
+    let hostDeck: string[] | null = null;
+    let guestDeck: string[] | null = null;
+    try {
+      hostDeck = hostReady ? parsePvpDeck(JSON.parse(hostReady.deck_json)) : null;
+      guestDeck = guestReady ? parsePvpDeck(JSON.parse(guestReady.deck_json)) : null;
+    } catch {
+      hostDeck = null;
+      guestDeck = null;
+    }
+    if (!hostDeck || !guestDeck) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "双方都需要先用合法卡组准备。" });
+    const existing = await getPvpDbMatch(db, room.code);
+    const existingState = existing ? parsePvpState(existing.state_json) : null;
+    if (existingState?.phase === "playing") {
+      return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "对局已经开始，请等待本局结束。" });
+    }
+    const suppliedSeed = Number(payload.seed);
+    const seed = Number.isSafeInteger(suppliedSeed) ? suppliedSeed : Math.floor(Math.random() * 0x7fffffff);
+    const state = createMatch({ decks: [hostDeck, guestDeck], startingPlayer: 0, seed });
+    const matchToken = crypto.randomUUID();
+    const now = Date.now();
+    await db.prepare(`INSERT INTO pvp_matches (room_code, match_token, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(room_code) DO UPDATE SET match_token = excluded.match_token, state_json = excluded.state_json, updated_at = excluded.updated_at`)
+      .bind(room.code, matchToken, JSON.stringify(state), now, now).run();
+    const sequence = await nextPvpSequence(db, room);
+    const startPayload = { seed, decks: [hostDeck, guestDeck], matchToken };
+    const actionMessage = { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: startPayload };
+    await queuePvpDbMessage(db, session.client_id, actionMessage);
+    await queuePvpDbMessage(db, room.guest_client_id, actionMessage);
+    return;
+  }
+
+  const match = await getPvpDbMatch(db, room.code);
+  const current = match ? parsePvpState(match.state_json) : null;
+  const command = canonicalCommand(payload.command, role);
+  if (!match || !current || !command) {
+    return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, commandId: typeof payload.command === "object" && payload.command ? (payload.command as Record<string, unknown>).commandId : undefined, message: "对局指令无效或对局尚未开始。" });
+  }
+  const transition = applyCommand(current, command);
+  if (!transition.accepted) {
+    return queuePvpDbMessage(db, session.client_id, {
+      type: "action_rejected",
+      action,
+      commandId: command.commandId,
+      message: transition.error?.message ?? "服务器拒绝了这条指令。",
+    });
+  }
+  const now = Date.now();
+  const updated = await db.prepare(`UPDATE pvp_matches SET state_json = ?, updated_at = ? WHERE room_code = ? AND match_token = ? AND state_json = ?`)
+    .bind(JSON.stringify(transition.state), now, room.code, match.match_token, match.state_json).run();
+  if ((updated.meta?.changes ?? 0) !== 1) {
+    return queuePvpDbMessage(db, session.client_id, {
+      type: "action_rejected",
+      action,
+      commandId: command.commandId,
+      message: "对局状态刚刚更新，请等待同步后再操作。",
+    });
+  }
+  const sequence = await nextPvpSequence(db, room);
+  // Send the post-transition snapshot as well as the command. Clients render
+  // this authoritative state directly, so refreshes and slow polling cannot
+  // leave either side one reducer step behind.
+  const actionPayload = {
+    command,
+    state: transition.state,
+    stateVersion: transition.state.version,
+    result: transition.state.result,
+    matchToken: match.match_token,
+  };
+  const actionMessage = { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: actionPayload };
+  await queuePvpDbMessage(db, session.client_id, actionMessage);
+  if (room.host_client_id !== session.client_id) await queuePvpDbMessage(db, room.host_client_id, actionMessage);
+  if (room.guest_client_id && room.guest_client_id !== session.client_id) await queuePvpDbMessage(db, room.guest_client_id, actionMessage);
 }
 
 async function handlePvpDbMessage(db: PvpDatabase, session: PvpDbSession, message: PvpMessage): Promise<void> {
@@ -336,7 +544,8 @@ function joinPvpRoom(peer: PvpPeer, code: string): void {
   room.peers.push(peer);
   peer.room = room.code;
   pvpJson(peer, { type: "room_joined", room: room.code, message: "已加入房间" });
-  room.peers.filter((other) => other !== peer).forEach((other) => pvpJson(other, {
+  const recipients = room.peers.filter((other) => other !== peer);
+  recipients.forEach((other) => pvpJson(other, {
     type: "peer_joined",
     peerName: peer.name,
     playerId: peer.id,
@@ -354,7 +563,8 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
   }
   const payload = message.payload && typeof message.payload === "object" ? message.payload : {};
   const sequence = ++room.nextSequence;
-  room.peers.filter((other) => other !== peer).forEach((other) => pvpJson(other, {
+  const recipients = action === "ready" ? room.peers.filter((other) => other !== peer) : room.peers;
+  recipients.forEach((other) => pvpJson(other, {
     type: "action",
     playerId: peer.id,
     peerName: peer.name,
@@ -509,15 +719,24 @@ async function handlePvpPoll(request: Request, env: Env): Promise<Response> {
       return pvpJsonResponse({ ok: true });
     }
     if (request.method !== "POST") return pvpJsonResponse({ ok: false, message: "仅支持 GET、POST、DELETE。" }, 405);
+    const declaredLength = Number(request.headers.get("content-length") ?? 0);
+    if (Number.isFinite(declaredLength) && declaredLength > PVP_MAX_BODY_BYTES) {
+      return pvpJsonResponse({ ok: false, message: "联机消息过大。" }, 413);
+    }
     let body: Record<string, unknown>;
     try {
-      const parsed = await request.json();
+      const rawBody = await request.text();
+      if (new TextEncoder().encode(rawBody).byteLength > PVP_MAX_BODY_BYTES) {
+        return pvpJsonResponse({ ok: false, message: "联机消息过大。" }, 413);
+      }
+      const parsed = JSON.parse(rawBody);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid body");
       body = parsed as Record<string, unknown>;
     } catch {
       return pvpJsonResponse({ ok: false, message: "联机消息格式无效。" }, 400);
     }
     if (body.type === "connect") {
+      await prunePvpDb(db);
       const now = Date.now();
       const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 24) : "旅者";
       const requestedClientId = typeof body.clientId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(body.clientId)

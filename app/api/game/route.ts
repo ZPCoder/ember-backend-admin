@@ -50,6 +50,8 @@ type GameAction =
       result: MatchResult;
       mode: MatchMode;
       opponent: string;
+      pvpToken?: string;
+      pvpPlayer?: 0 | 1;
     }
   | {
       action: "reset_demo";
@@ -284,12 +286,23 @@ function parseAction(value: unknown): GameAction {
         "result",
         "mode",
         "opponent",
-      ]);
+      ], ["action", "idempotencyKey", "result", "mode", "opponent", "pvpToken", "pvpPlayer"]);
       if (value.result !== "win" && value.result !== "loss") {
         throw new PayloadError("result 必须是 win 或 loss。");
       }
       if (value.mode !== "ai" && value.mode !== "pvp") {
         throw new PayloadError("mode 必须是 ai 或 pvp。");
+      }
+      const pvpToken = value.pvpToken === undefined
+        ? undefined
+        : parseTrimmedString(value.pvpToken, "pvpToken", 16, 128);
+      const pvpPlayer = value.pvpPlayer === undefined
+        ? undefined
+        : value.pvpPlayer === 0 || value.pvpPlayer === 1
+          ? value.pvpPlayer
+          : (() => { throw new PayloadError("pvpPlayer 必须是 0 或 1。"); })();
+      if (value.mode === "pvp" && (!pvpToken || pvpPlayer === undefined)) {
+        throw new PayloadError("PVP 对局必须携带服务器对局凭证。");
       }
       return {
         action: "record_match",
@@ -297,6 +310,8 @@ function parseAction(value: unknown): GameAction {
         result: value.result,
         mode: value.mode,
         opponent: parseTrimmedString(value.opponent, "opponent", 1, 40),
+        ...(pvpToken ? { pvpToken } : {}),
+        ...(pvpPlayer === undefined ? {} : { pvpPlayer }),
       };
     case "reset_demo":
       assertExactKeys(value, ["action"]);

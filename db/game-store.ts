@@ -119,6 +119,11 @@ type AuditRow = {
   resultJson: string;
 };
 
+type PvpMatchRow = {
+  matchToken: string;
+  stateJson: string;
+};
+
 type D1RunResultLike = {
   success: boolean;
   meta?: {
@@ -375,11 +380,39 @@ export async function recordMatch(
     result: MatchResult;
     mode: MatchMode;
     opponent: string;
+    pvpToken?: string;
+    pvpPlayer?: 0 | 1;
   },
 ): Promise<RecordMatchResult> {
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
+  if (input.mode === "pvp") {
+    if (!input.pvpToken || input.pvpPlayer === undefined) {
+      throw new GameStoreError("PVP_PROOF_REQUIRED", "联机对局缺少服务器凭证。", 400);
+    }
+    const row = await db
+      .prepare("SELECT match_token AS matchToken, state_json AS stateJson FROM pvp_matches WHERE match_token = ?")
+      .bind(input.pvpToken)
+      .first<PvpMatchRow>();
+    if (!row) {
+      throw new GameStoreError("PVP_PROOF_INVALID", "联机对局凭证无效或已过期。", 409);
+    }
+    let state: { phase?: string; result?: { winner?: number | null } };
+    try {
+      state = JSON.parse(row.stateJson) as typeof state;
+    } catch {
+      throw new GameStoreError("PVP_PROOF_INVALID", "联机对局状态无法验证。", 409);
+    }
+    const winner = state.phase === "game-over" ? state.result?.winner : null;
+    if (winner !== 0 && winner !== 1) {
+      throw new GameStoreError("PVP_NOT_FINISHED", "联机对局尚未结束。", 409);
+    }
+    const expectedResult: MatchResult = winner === input.pvpPlayer ? "win" : "loss";
+    if (input.result !== expectedResult) {
+      throw new GameStoreError("PVP_RESULT_MISMATCH", "对局结果与服务器战报不一致。", 409);
+    }
+  }
   const rewardGold =
     input.result === "win" ? WIN_REWARD_GOLD : LOSS_REWARD_GOLD;
   const match: MatchRecord = {
@@ -400,6 +433,8 @@ export async function recordMatch(
       result: input.result,
       mode: input.mode,
       opponent: input.opponent,
+      ...(input.pvpToken ? { pvpToken: input.pvpToken } : {}),
+      ...(input.pvpPlayer === undefined ? {} : { pvpPlayer: input.pvpPlayer }),
     },
     (current) => ({
       nextState: {
@@ -825,6 +860,21 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
     db.prepare(
       `CREATE INDEX IF NOT EXISTS audit_events_player_created_idx
        ON audit_events (player_id, created_at)`,
+    ),
+    // PVP match snapshots are written by the polling worker and verified here
+    // before a client can turn a result into ranked/profile rewards.
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS pvp_matches (
+        room_code TEXT PRIMARY KEY NOT NULL,
+        match_token TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )`,
+    ),
+    db.prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS pvp_matches_token_uidx
+       ON pvp_matches (match_token)`,
     ),
   ]);
 }
