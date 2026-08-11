@@ -78,3 +78,30 @@ export const auditEvents = sqliteTable(
     ),
   ],
 );
+
+// These snapshots are written by the PVP Worker and read by the game API when
+// a client submits a result. Keeping them in the shared schema makes the
+// runtime-created tables visible to D1 migrations as well.
+export const pvpMatches = sqliteTable(
+  "pvp_matches",
+  {
+    roomCode: text("room_code").primaryKey(),
+    matchToken: text("match_token").notNull(),
+    stateJson: text("state_json").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [uniqueIndex("pvp_matches_token_uidx").on(table.matchToken)],
+);
+
+export const pvpMatchParticipants = sqliteTable(
+  "pvp_match_participants",
+  {
+    matchToken: text("match_token").primaryKey(),
+    roomCode: text("room_code").notNull(),
+    hostIdentity: text("host_identity").notNull(),
+    guestIdentity: text("guest_identity").notNull(),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [index("pvp_match_participants_created_idx").on(table.createdAt)],
+);
