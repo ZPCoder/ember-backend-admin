@@ -98,6 +98,13 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       choices: [],
     };
   }
+  if (snapshot.chooseOne && snapshot.chooseOne.player !== viewer) {
+    snapshot.chooseOne = {
+      player: snapshot.chooseOne.player,
+      sourceCardId: "",
+      options: [],
+    };
+  }
 
   snapshot.events = snapshot.events.map((event) => {
     if (event.player === viewer) return event;
@@ -128,6 +135,20 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       return {
         ...event,
         message: "对手完成了发现选择。",
+        data: undefined,
+      };
+    }
+    if (event.type === "choose-one-started") {
+      return {
+        ...event,
+        message: "对手正在完成抉择。",
+        data: undefined,
+      };
+    }
+    if (event.type === "choose-one-chosen") {
+      return {
+        ...event,
+        message: "对手完成了抉择。",
         data: undefined,
       };
     }
