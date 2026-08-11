@@ -78,9 +78,9 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       ...player,
       // Counts are enough for the opponent UI; card identities must remain
       // server-side until a card is publicly played.
-      deck: player.deck.map(() => "__hidden-card__"),
-      hand: player.hand.map(() => "__hidden-card__"),
-      secrets: player.secrets.map((_, secretIndex) => ({
+      deck: (player.deck ?? []).map(() => "__hidden-card__"),
+      hand: (player.hand ?? []).map(() => "__hidden-card__"),
+      secrets: (player.secrets ?? []).map((_, secretIndex) => ({
         cardId: `hidden-secret-${secretIndex}`,
         secretId: `hidden-secret-${secretIndex}`,
         name: "未知奥秘",
