@@ -472,7 +472,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
       .bind(session.client_id, room.code, JSON.stringify(deckIds), now).run();
     const sequence = await nextPvpSequence(db, room);
     const opponentId = role === 0 ? room.guest_client_id : room.host_client_id;
-    if (opponentId) await queuePvpDbMessage(db, opponentId, { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: { deckIds } });
+    if (opponentId) await queuePvpDbMessage(db, opponentId, { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: { ready: true } });
     await queuePvpDbMessage(db, session.client_id, { type: "action_ack", action, sequence });
     return;
   }
@@ -766,7 +766,9 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     pvpJson(peer, { type: "action_ack", action, sequence });
     return;
   }
-  const payload = action === "command" && rawPayload && !Array.isArray(rawPayload)
+  const payload = action === "ready"
+    ? { ready: true }
+    : action === "command" && rawPayload && !Array.isArray(rawPayload)
     ? {
         ...(rawPayload as Record<string, unknown>),
         command: canonicalCommand(
