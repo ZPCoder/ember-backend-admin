@@ -20,16 +20,29 @@ interface ExecutionContext {
 }
 
 type PvpMessage = Record<string, unknown>;
-type PvpPeer = { socket: WebSocket; id: string; name: string; room: string | null };
+type PvpPeer = {
+  socket?: WebSocket;
+  clientId: string;
+  id: string;
+  name: string;
+  room: string | null;
+  queue?: PvpMessage[];
+};
 type PvpRoom = { code: string; peers: PvpPeer[] };
 
 const pvpRooms = new Map<string, PvpRoom>();
 const pvpPeers = new Map<WebSocket, PvpPeer>();
+const pvpPollSessions = new Map<string, PvpPeer>();
 const pvpAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 
 function pvpJson(peer: PvpPeer, message: PvpMessage): void {
   try {
-    peer.socket.send(JSON.stringify(message));
+    if (peer.socket) {
+      peer.socket.send(JSON.stringify(message));
+      return;
+    }
+    peer.queue?.push(message);
+    if (peer.queue && peer.queue.length > 100) peer.queue.splice(0, peer.queue.length - 100);
   } catch {
     leavePvpPeer(peer);
   }
@@ -65,8 +78,8 @@ function leavePvpRoom(peer: PvpPeer): void {
 }
 
 function leavePvpPeer(peer: PvpPeer): void {
-  if (!pvpPeers.has(peer.socket)) return;
-  pvpPeers.delete(peer.socket);
+  if (peer.socket) pvpPeers.delete(peer.socket);
+  if (pvpPollSessions.get(peer.clientId) === peer) pvpPollSessions.delete(peer.clientId);
   leavePvpRoom(peer);
 }
 
@@ -155,6 +168,7 @@ function handlePvpUpgrade(request: Request): Response {
   const server = pair[1];
   const peer: PvpPeer = {
     socket: server,
+    clientId: `ws-${crypto.randomUUID()}`,
     id: `p-${crypto.randomUUID()}`,
     name: "旅者",
     room: null,
@@ -166,6 +180,66 @@ function handlePvpUpgrade(request: Request): Response {
   server.addEventListener("error", () => leavePvpPeer(peer));
   pvpJson(peer, { type: "welcome", playerId: peer.id, message: "连接成功" });
   return new Response(null, { status: 101, webSocket: client });
+}
+
+function pvpJsonResponse(payload: PvpMessage, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+async function handlePvpPoll(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "GET") {
+    const clientId = url.searchParams.get("clientId") ?? "";
+    const peer = pvpPollSessions.get(clientId);
+    if (!peer) return pvpJsonResponse({ ok: false, message: "联机会话已过期，请重新连接。" }, 404);
+    const cursor = Math.max(0, Number(url.searchParams.get("cursor") ?? 0) || 0);
+    const messages = peer.queue ?? [];
+    return pvpJsonResponse({ ok: true, cursor: messages.length, messages: messages.slice(cursor) });
+  }
+  if (request.method === "DELETE") {
+    const clientId = url.searchParams.get("clientId") ?? "";
+    const peer = pvpPollSessions.get(clientId);
+    if (peer) leavePvpPeer(peer);
+    return pvpJsonResponse({ ok: true });
+  }
+  if (request.method !== "POST") return pvpJsonResponse({ ok: false, message: "仅支持 GET、POST、DELETE。" }, 405);
+
+  let body: Record<string, unknown>;
+  try {
+    const parsed = await request.json();
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid body");
+    body = parsed as Record<string, unknown>;
+  } catch {
+    return pvpJsonResponse({ ok: false, message: "联机消息格式无效。" }, 400);
+  }
+
+  if (body.type === "connect") {
+    const clientId = `poll-${crypto.randomUUID()}`;
+    const peer: PvpPeer = {
+      clientId,
+      id: `p-${crypto.randomUUID()}`,
+      name: typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 24) : "旅者",
+      room: null,
+      queue: [],
+    };
+    pvpPollSessions.set(clientId, peer);
+    pvpJson(peer, { type: "welcome", playerId: peer.id, message: "连接成功" });
+    return pvpJsonResponse({ ok: true, clientId, cursor: 0, messages: peer.queue ?? [] });
+  }
+
+  const clientId = typeof body.clientId === "string" ? body.clientId : "";
+  const peer = pvpPollSessions.get(clientId);
+  if (!peer) return pvpJsonResponse({ ok: false, message: "联机会话已过期，请重新连接。" }, 404);
+  if (body.type === "message" && body.message && typeof body.message === "object") {
+    handlePvpMessage(peer, JSON.stringify(body.message));
+  }
+  return pvpJsonResponse({ ok: true });
 }
 
 // Image security config. SVG sources with .svg extension auto-skip the
@@ -190,6 +264,7 @@ const worker = {
     }
 
     if (url.pathname === "/api/pvp") return handlePvpUpgrade(request);
+    if (url.pathname === "/api/pvp-poll") return handlePvpPoll(request);
 
     return handler.fetch(request, env, ctx);
   },
