@@ -590,6 +590,15 @@ function joinPvpRoom(peer: PvpPeer, code: string): void {
     playerId: peer.id,
     message: `${peer.name} 已加入房间`,
   }));
+  const host = room.peers[0];
+  if (host && host !== peer) {
+    pvpJson(peer, {
+      type: "peer_joined",
+      peerName: host.name,
+      playerId: host.id,
+      message: `${host.name} 已在房间中`,
+    });
+  }
   pvpRoomState(room);
 }
 
@@ -600,7 +609,16 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
   if (!["ready", "match_start", "command"].includes(action)) {
     return pvpError(peer, "联机指令类型无效");
   }
-  const payload = message.payload && typeof message.payload === "object" ? message.payload : {};
+  const rawPayload = message.payload && typeof message.payload === "object" ? message.payload : {};
+  const payload = action === "command" && rawPayload && !Array.isArray(rawPayload)
+    ? {
+        ...(rawPayload as Record<string, unknown>),
+        command: canonicalCommand(
+          (rawPayload as Record<string, unknown>).command,
+          room.peers[0] === peer ? 0 : 1,
+        ) ?? (rawPayload as Record<string, unknown>).command,
+      }
+    : rawPayload;
   const sequence = ++room.nextSequence;
   const recipients = action === "ready" ? room.peers.filter((other) => other !== peer) : room.peers;
   recipients.forEach((other) => pvpJson(other, {
