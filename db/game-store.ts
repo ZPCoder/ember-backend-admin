@@ -691,18 +691,59 @@ async function ensurePlayer(
 ): Promise<PlayerRow> {
   const normalizedEmail = identity.email.trim().toLowerCase();
   const displayName = identity.displayName.trim() || normalizedEmail;
-  const playerId = `player-${(await stableId(normalizedEmail)).slice(0, 24)}`;
+  // Prefer the platform's stable subject (or the durable anonymous-device
+  // key) over an email address. Email can change; the identity key is what
+  // keeps a player's collection, decks and match history attached to them.
+  const identityKey = identity.identityKey?.trim() || `email:${normalizedEmail}`;
   const now = new Date().toISOString();
   const defaultState = createDefaultState(now);
+
+  const byIdentity = await db
+    .prepare(
+      `SELECT id, email, display_name AS displayName
+       FROM players
+       WHERE identity_key = ?
+       LIMIT 1`,
+    )
+    .bind(identityKey)
+    .first<PlayerRow>();
+  const byEmail = byIdentity
+    ? null
+    : await db
+        .prepare(
+          `SELECT id, email, display_name AS displayName
+           FROM players
+           WHERE email = ?
+           LIMIT 1`,
+        )
+        .bind(normalizedEmail)
+        .first<PlayerRow>();
+  const existing = byIdentity ?? byEmail;
+
+  if (existing) {
+    // Backfill legacy email-based rows on first access. If the authenticated
+    // email changes, keep the old row and update its display metadata.
+    await db
+      .prepare(
+        `UPDATE players
+         SET email = ?, identity_key = ?, display_name = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .bind(normalizedEmail, identityKey, displayName, now, existing.id)
+      .run();
+    return { ...existing, email: normalizedEmail, displayName };
+  }
+
+  const playerId = `player-${(await stableId(identityKey)).slice(0, 24)}`;
 
   await db.batch([
     db
       .prepare(
         `INSERT OR IGNORE INTO players
-           (id, email, display_name, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)`,
+           (id, email, identity_key, display_name, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .bind(playerId, normalizedEmail, displayName, now, now),
+      .bind(playerId, normalizedEmail, identityKey, displayName, now, now),
     db
       .prepare(
         `INSERT OR IGNORE INTO player_states
@@ -819,6 +860,7 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
       `CREATE TABLE IF NOT EXISTS players (
         id TEXT PRIMARY KEY NOT NULL,
         email TEXT NOT NULL,
+        identity_key TEXT,
         display_name TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -907,6 +949,20 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
        ON pvp_match_participants (created_at)`,
     ),
   ]);
+
+  // Existing deployments were created before identity_key was introduced.
+  // SQLite/D1 has no IF NOT EXISTS form for ADD COLUMN, so make the migration
+  // idempotent by treating the already-present-column error as success.
+  try {
+    await db.prepare("ALTER TABLE players ADD COLUMN identity_key TEXT").run();
+  } catch {
+    // Column already exists on new installations or a previous migration.
+  }
+  await db.prepare(
+    `CREATE UNIQUE INDEX IF NOT EXISTS players_identity_key_uidx
+     ON players (identity_key)
+     WHERE identity_key IS NOT NULL`,
+  ).run();
 }
 
 function createDefaultState(now: string): StoredPlayerState {

@@ -376,7 +376,7 @@ function canonicalCommand(value: unknown, role: 0 | 1): BattleCommand | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const type = raw.type;
-  if (type !== "play-card" && type !== "attack" && type !== "hero-power" && type !== "end-turn" && type !== "concede") return null;
+  if (type !== "mulligan" && type !== "play-card" && type !== "attack" && type !== "hero-power" && type !== "use-coin" && type !== "end-turn" && type !== "concede") return null;
   const command = { ...raw, type, player: role } as BattleCommand;
   if (role === 1 && command.target?.kind === "hero") {
     command.target = { ...command.target, player: command.target.player === 0 ? 1 : 0 };
@@ -426,7 +426,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     if (!hostDeck || !guestDeck) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "双方都需要先用合法卡组准备。" });
     const existing = await getPvpDbMatch(db, room.code);
     const existingState = existing ? parsePvpState(existing.state_json) : null;
-    if (existingState?.phase === "playing") {
+    if (existingState?.phase === "main" || existingState?.phase === "mulligan") {
       return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "对局已经开始，请等待本局结束。" });
     }
     const suppliedSeed = Number(payload.seed);
