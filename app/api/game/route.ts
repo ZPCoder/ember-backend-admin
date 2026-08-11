@@ -20,6 +20,7 @@ const DEMO_IDENTITY: GameIdentity = {
   displayName: "本地演示玩家",
   isDemo: true,
   isAnonymous: false,
+  identityKey: "demo",
 };
 
 const ANONYMOUS_COOKIE = "ember-device-id";
@@ -157,6 +158,9 @@ async function resolveIdentity(
         displayName: authenticated.displayName,
         isDemo: false,
         isAnonymous: false,
+        identityKey: authenticated.id
+          ? `oai-id:${authenticated.id}`
+          : `oai-email:${authenticated.email.trim().toLowerCase()}`,
       },
     };
   }
@@ -170,6 +174,7 @@ async function resolveIdentity(
     displayName: "本机指挥官",
     isDemo: false,
     isAnonymous: true,
+    identityKey: `device:${deviceId}`,
   };
   return {
     identity,

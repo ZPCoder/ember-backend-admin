@@ -13,6 +13,8 @@ export type GameIdentity = {
   displayName: string;
   isDemo: boolean;
   isAnonymous: boolean;
+  /** Stable server-derived key used to bind PVP rewards to a participant. */
+  identityKey?: string;
 };
 
 export type PlayerDeck = {
@@ -122,6 +124,11 @@ type AuditRow = {
 type PvpMatchRow = {
   matchToken: string;
   stateJson: string;
+};
+
+type PvpParticipantRow = {
+  hostIdentity: string;
+  guestIdentity: string;
 };
 
 type D1RunResultLike = {
@@ -411,6 +418,16 @@ export async function recordMatch(
     const expectedResult: MatchResult = winner === input.pvpPlayer ? "win" : "loss";
     if (input.result !== expectedResult) {
       throw new GameStoreError("PVP_RESULT_MISMATCH", "对局结果与服务器战报不一致。", 409);
+    }
+    const participant = await db
+      .prepare("SELECT host_identity AS hostIdentity, guest_identity AS guestIdentity FROM pvp_match_participants WHERE match_token = ?")
+      .bind(input.pvpToken)
+      .first<PvpParticipantRow>();
+    const participantIdentity = input.pvpPlayer === 0
+      ? participant?.hostIdentity
+      : participant?.guestIdentity;
+    if (participantIdentity && identity.identityKey && participantIdentity !== identity.identityKey) {
+      throw new GameStoreError("PVP_OWNER_MISMATCH", "该对局不属于当前玩家身份。", 403);
     }
   }
   const rewardGold =
@@ -875,6 +892,19 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
     db.prepare(
       `CREATE UNIQUE INDEX IF NOT EXISTS pvp_matches_token_uidx
        ON pvp_matches (match_token)`,
+    ),
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS pvp_match_participants (
+        match_token TEXT PRIMARY KEY NOT NULL,
+        room_code TEXT NOT NULL,
+        host_identity TEXT NOT NULL,
+        guest_identity TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      )`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS pvp_match_participants_created_idx
+       ON pvp_match_participants (created_at)`,
     ),
   ]);
 }
