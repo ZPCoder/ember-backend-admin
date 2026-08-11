@@ -12,11 +12,15 @@ export const players = sqliteTable(
   {
     id: text("id").primaryKey(),
     email: text("email").notNull(),
+    identityKey: text("identity_key"),
     displayName: text("display_name").notNull(),
     createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
     updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   },
-  (table) => [uniqueIndex("players_email_uidx").on(table.email)],
+  (table) => [
+    uniqueIndex("players_email_uidx").on(table.email),
+    uniqueIndex("players_identity_key_uidx").on(table.identityKey),
+  ],
 );
 
 export const playerStates = sqliteTable("player_states", {

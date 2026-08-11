@@ -15,6 +15,13 @@
       "when": 1786436185672,
       "tag": "0001_fluffy_electro",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1786438174385,
+      "tag": "0002_flashy_stature",
+      "breakpoints": true
     }
   ]
 }
