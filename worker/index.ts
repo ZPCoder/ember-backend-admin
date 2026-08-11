@@ -376,7 +376,7 @@ function canonicalCommand(value: unknown, role: 0 | 1): BattleCommand | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const type = raw.type;
-  if (type !== "mulligan" && type !== "play-card" && type !== "attack" && type !== "hero-power" && type !== "use-coin" && type !== "end-turn" && type !== "concede") return null;
+  if (type !== "mulligan" && type !== "play-card" && type !== "attack" && type !== "hero-attack" && type !== "hero-power" && type !== "use-coin" && type !== "end-turn" && type !== "concede") return null;
   const command = { ...raw, type, player: role } as BattleCommand;
   if (role === 1 && command.target?.kind === "hero") {
     command.target = { ...command.target, player: command.target.player === 0 ? 1 : 0 };
