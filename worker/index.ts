@@ -49,8 +49,16 @@ const pvpPeers = new Map<WebSocket, PvpPeer>();
 const pvpPollSessions = new Map<string, PvpPeer>();
 const pvpAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 
-type PvpDbSession = { client_id: string; player_id: string; name: string; room_code: string | null };
+type PvpDbSession = {
+  client_id: string;
+  player_id: string;
+  name: string;
+  room_code: string | null;
+  updated_at: number;
+};
 type PvpDbRoom = { code: string; host_client_id: string; guest_client_id: string | null; next_sequence: number };
+
+const PVP_SESSION_TTL_MS = 30 * 60 * 1000;
 
 let pvpSchemaReady: Promise<void> | null = null;
 
@@ -110,7 +118,7 @@ async function queuePvpDbMessage(db: PvpDatabase, clientId: string, message: Pvp
 }
 
 async function getPvpDbSession(db: PvpDatabase, clientId: string): Promise<PvpDbSession | null> {
-  return db.prepare(`SELECT client_id, player_id, name, room_code FROM pvp_sessions WHERE client_id = ?`)
+  return db.prepare(`SELECT client_id, player_id, name, room_code, updated_at FROM pvp_sessions WHERE client_id = ?`)
     .bind(clientId).first<PvpDbSession>();
 }
 
@@ -132,6 +140,33 @@ async function dbRoomState(db: PvpDatabase, room: PvpDbRoom): Promise<void> {
   const players = await dbRoomPlayers(db, room);
   const payload = { type: "room_state", room: room.code, payload: { players } };
   await Promise.all([room.host_client_id, room.guest_client_id].filter(Boolean).map((clientId) => queuePvpDbMessage(db, clientId as string, payload)));
+}
+
+async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise<void> {
+  const now = Date.now();
+  await db.prepare(`DELETE FROM pvp_messages WHERE client_id = ?`).bind(session.client_id).run();
+  await queuePvpDbMessage(db, session.client_id, { type: "welcome", playerId: session.player_id, message: "连接成功" });
+  if (!session.room_code) return;
+  const room = await getPvpDbRoom(db, session.room_code);
+  if (!room) {
+    await db.prepare(`UPDATE pvp_sessions SET room_code = NULL, updated_at = ? WHERE client_id = ?`)
+      .bind(now, session.client_id).run();
+    return;
+  }
+  const isHost = room.host_client_id === session.client_id;
+  await queuePvpDbMessage(db, session.client_id, {
+    type: isHost ? "room_created" : "room_joined",
+    room: room.code,
+    message: "已恢复房间连接，请双方重新准备。",
+  });
+  const peerId = isHost ? room.guest_client_id : room.host_client_id;
+  if (peerId) {
+    const peer = await getPvpDbSession(db, peerId);
+    if (peer) {
+      await queuePvpDbMessage(db, session.client_id, { type: "peer_joined", peerName: peer.name, playerId: peer.player_id, message: `${peer.name} 已在房间中` });
+    }
+  }
+  await dbRoomState(db, room);
 }
 
 async function dbLeaveRoom(db: PvpDatabase, session: PvpDbSession): Promise<void> {
@@ -483,10 +518,40 @@ async function handlePvpPoll(request: Request, env: Env): Promise<Response> {
       return pvpJsonResponse({ ok: false, message: "联机消息格式无效。" }, 400);
     }
     if (body.type === "connect") {
-      const clientId = `poll-${crypto.randomUUID()}`;
-      const playerId = `p-${crypto.randomUUID()}`;
       const now = Date.now();
       const name = typeof body.name === "string" && body.name.trim() ? body.name.trim().slice(0, 24) : "旅者";
+      const requestedClientId = typeof body.clientId === "string" && /^[A-Za-z0-9_-]{8,96}$/.test(body.clientId)
+        ? body.clientId
+        : "";
+      // A browser refresh should reattach to its short-lived session instead of
+      // creating a second player and orphaning the room. Expired sessions are
+      // discarded so a stale tab cannot reclaim a room indefinitely.
+      if (requestedClientId) {
+        const existing = await getPvpDbSession(db, requestedClientId);
+        if (existing && now - Number(existing.updated_at || 0) <= PVP_SESSION_TTL_MS) {
+          await db.prepare(`UPDATE pvp_sessions SET name = ?, updated_at = ? WHERE client_id = ?`)
+            .bind(name, now, requestedClientId).run();
+          const refreshed = await getPvpDbSession(db, requestedClientId);
+          if (refreshed) {
+            await dbRestoreSession(db, refreshed);
+            const result = await db.prepare(`SELECT message_id, payload_json FROM pvp_messages WHERE client_id = ? ORDER BY message_id ASC`)
+              .bind(requestedClientId).all<{ message_id: number; payload_json: string }>();
+            const rows = result.results ?? [];
+            return pvpJsonResponse({
+              ok: true,
+              clientId: requestedClientId,
+              cursor: rows.length ? Math.max(...rows.map((row) => Number(row.message_id) || 0)) : 0,
+              messages: rows.map((row) => parsePvpPayload(row.payload_json)).filter((message): message is PvpMessage => Boolean(message)),
+            });
+          }
+        }
+        if (existing) {
+          await db.prepare(`DELETE FROM pvp_messages WHERE client_id = ?`).bind(requestedClientId).run();
+          await db.prepare(`DELETE FROM pvp_sessions WHERE client_id = ?`).bind(requestedClientId).run();
+        }
+      }
+      const clientId = requestedClientId || `poll-${crypto.randomUUID()}`;
+      const playerId = `p-${crypto.randomUUID()}`;
       await db.prepare(`INSERT INTO pvp_sessions (client_id, player_id, name, room_code, created_at, updated_at) VALUES (?, ?, ?, NULL, ?, ?)`)
         .bind(clientId, playerId, name, now, now).run();
       await queuePvpDbMessage(db, clientId, { type: "welcome", playerId, message: "连接成功" });
