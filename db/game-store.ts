@@ -323,7 +323,7 @@ export async function openPack(
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
-  const openedCards = drawPack();
+  let openedCards: Array<{ cardId: string; count: number }> = [];
 
   return commitMutation(
     db,
@@ -339,6 +339,10 @@ export async function openPack(
           409,
         );
       }
+
+      // Draw only after the availability check. This keeps an exhausted-pack
+      // request side-effect free and makes retries easier to reason about.
+      openedCards = drawPack();
 
       const collection = { ...current.collection };
       for (const opened of openedCards) {
