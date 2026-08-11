@@ -108,10 +108,14 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
         data: undefined,
       };
     }
-    if (event.type === "card-drawn" || event.type === "card-burned") {
+    if (event.type === "card-drawn" || event.type === "card-burned" || event.type === "card-traded") {
       const safeData = { ...(event.data ?? {}) };
       delete safeData.cardId;
-      return { ...event, data: safeData };
+      return {
+        ...event,
+        message: event.type === "card-traded" ? "对手完成了一次可交易循环。" : event.message,
+        data: safeData,
+      };
     }
     if (event.type === "discover-started") {
       return {
@@ -134,7 +138,9 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
 
 function redactPvpCommandForViewer(command: BattleCommand, viewer: 0 | 1): BattleCommand {
   if (command.player === viewer) return command;
-  if (command.type === "choose-discover") return { ...command, cardId: "__hidden-card__" };
+  if (command.type === "choose-discover" || command.type === "trade-card") {
+    return { ...command, cardId: "__hidden-card__" };
+  }
   return command;
 }
 
@@ -445,7 +451,7 @@ function canonicalCommand(value: unknown, role: 0 | 1): BattleCommand | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
   const type = raw.type;
-  if (type !== "mulligan" && type !== "play-card" && type !== "attack" && type !== "hero-attack" && type !== "hero-power" && type !== "use-coin" && type !== "end-turn" && type !== "choose-discover" && type !== "choose-one" && type !== "concede") return null;
+  if (type !== "mulligan" && type !== "play-card" && type !== "trade-card" && type !== "attack" && type !== "hero-attack" && type !== "hero-power" && type !== "use-coin" && type !== "end-turn" && type !== "choose-discover" && type !== "choose-one" && type !== "concede") return null;
   const command = { ...raw, type, player: role } as BattleCommand;
   if (role === 1 && command.target?.kind === "hero") {
     command.target = { ...command.target, player: command.target.player === 0 ? 1 : 0 };
