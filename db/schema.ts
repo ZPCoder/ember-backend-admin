@@ -18,7 +18,7 @@ export const players = sqliteTable(
     updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   },
   (table) => [
-    uniqueIndex("players_email_uidx").on(table.email),
+    index("players_email_idx").on(table.email),
     uniqueIndex("players_identity_key_uidx").on(table.identityKey),
   ],
 );

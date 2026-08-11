@@ -707,18 +707,24 @@ async function ensurePlayer(
     )
     .bind(identityKey)
     .first<PlayerRow>();
-  const byEmail = byIdentity
+  // Email is a display/contact attribute, not an account key. Only claim an
+  // email row when it is an old pre-identity record (or the synthetic
+  // email-based identity created by an earlier build). If another stable
+  // identity already owns the same email, create/resolve a separate player
+  // instead of silently moving that account's collection to this user.
+  const legacyByEmail = byIdentity
     ? null
     : await db
         .prepare(
           `SELECT id, email, display_name AS displayName
            FROM players
            WHERE email = ?
+             AND (identity_key IS NULL OR identity_key = ?)
            LIMIT 1`,
         )
-        .bind(normalizedEmail)
+        .bind(normalizedEmail, `email:${normalizedEmail}`)
         .first<PlayerRow>();
-  const existing = byIdentity ?? byEmail;
+  const existing = byIdentity ?? legacyByEmail;
 
   if (existing) {
     // Backfill legacy email-based rows on first access. If the authenticated
@@ -751,23 +757,16 @@ async function ensurePlayer(
          VALUES (?, ?, 1, ?)`,
       )
       .bind(playerId, JSON.stringify(defaultState), now),
-    db
-      .prepare(
-        `UPDATE players
-         SET display_name = ?, updated_at = ?
-         WHERE email = ?`,
-      )
-      .bind(displayName, now, normalizedEmail),
   ]);
 
   const row = await db
     .prepare(
       `SELECT id, email, display_name AS displayName
        FROM players
-       WHERE email = ?
+       WHERE identity_key = ?
        LIMIT 1`,
     )
-    .bind(normalizedEmail)
+    .bind(identityKey)
     .first<PlayerRow>();
 
   if (!row) {
@@ -866,10 +865,10 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`,
     ),
-    db.prepare(
-      `CREATE UNIQUE INDEX IF NOT EXISTS players_email_uidx
-       ON players (email)`,
-    ),
+    // Email addresses are not guaranteed to be unique across platform
+    // identities. Stable identity_key ownership is enforced separately.
+    db.prepare(`DROP INDEX IF EXISTS players_email_uidx`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS players_email_idx ON players (email)`),
     db.prepare(
       `CREATE TABLE IF NOT EXISTS player_states (
         player_id TEXT PRIMARY KEY NOT NULL
@@ -960,9 +959,13 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
   }
   await db.prepare(
     `CREATE UNIQUE INDEX IF NOT EXISTS players_identity_key_uidx
-     ON players (identity_key)
-     WHERE identity_key IS NOT NULL`,
+       ON players (identity_key)
+       WHERE identity_key IS NOT NULL`,
   ).run();
+  // Older deployments may have created the email uniqueness index in a
+  // previous request before the migration batch above ran.
+  await db.prepare(`DROP INDEX IF EXISTS players_email_uidx`).run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS players_email_idx ON players (email)`).run();
 }
 
 function createDefaultState(now: string): StoredPlayerState {

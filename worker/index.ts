@@ -390,7 +390,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
   const role = pvpRoleIndex(room, session.client_id);
   if (role === null) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "联机会话不属于当前房间" });
   const action = typeof message.action === "string" ? message.action : "";
-  if (!["ready", "match_start", "command"].includes(action)) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "联机指令类型无效" });
+  if (!["ready", "match_start", "command", "rematch"].includes(action)) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "联机指令类型无效" });
   const payload = message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
     ? message.payload as Record<string, unknown>
     : {};
@@ -449,6 +449,27 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     const actionMessage = { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: startPayload };
     await queuePvpDbMessage(db, session.client_id, actionMessage);
     await queuePvpDbMessage(db, room.guest_client_id, actionMessage);
+    return;
+  }
+
+  if (action === "rematch") {
+    if (role !== 0) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "只有房主可以发起再来一局。" });
+    if (!room.guest_client_id) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "等待对手加入房间。" });
+    const existing = await getPvpDbMatch(db, room.code);
+    const existingState = existing ? parsePvpState(existing.state_json) : null;
+    if (!existingState || existingState.phase !== "game-over") {
+      return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "本局尚未结束，暂时不能重新开始。" });
+    }
+    const now = Date.now();
+    await db.batch([
+      db.prepare(`DELETE FROM pvp_matches WHERE room_code = ?`).bind(room.code),
+      db.prepare(`DELETE FROM pvp_ready WHERE room_code = ?`).bind(room.code),
+    ]);
+    const sequence = await nextPvpSequence(db, room);
+    const resetMessage = { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: {} };
+    await queuePvpDbMessage(db, session.client_id, resetMessage);
+    await queuePvpDbMessage(db, room.guest_client_id, resetMessage);
+    await db.prepare(`UPDATE pvp_rooms SET updated_at = ? WHERE code = ?`).bind(now, room.code).run();
     return;
   }
 
@@ -605,8 +626,22 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
   const room = peer.room ? pvpRooms.get(peer.room) : null;
   if (!room) return pvpError(peer, "请先创建或加入房间");
   const action = typeof message.action === "string" ? message.action : "";
-  if (!["ready", "match_start", "command"].includes(action)) {
+  if (!["ready", "match_start", "command", "rematch"].includes(action)) {
     return pvpError(peer, "联机指令类型无效");
+  }
+  if (action === "rematch") {
+    if (room.peers[0] !== peer) return pvpError(peer, "只有房主可以发起再来一局");
+    const sequence = ++room.nextSequence;
+    room.peers.forEach((other) => pvpJson(other, {
+      type: "action",
+      playerId: peer.id,
+      peerName: peer.name,
+      sequence,
+      action,
+      payload: {},
+    }));
+    pvpJson(peer, { type: "action_ack", action, sequence });
+    return;
   }
   const rawPayload = message.payload && typeof message.payload === "object" ? message.payload : {};
   const payload = action === "command" && rawPayload && !Array.isArray(rawPayload)
