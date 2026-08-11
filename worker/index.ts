@@ -70,6 +70,73 @@ type PvpDbMatch = { room_code: string; match_token: string; state_json: string; 
 const PVP_SESSION_TTL_MS = 30 * 60 * 1000;
 const PVP_MAX_BODY_BYTES = 32 * 1024;
 
+function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
+  const snapshot = JSON.parse(JSON.stringify(state)) as MatchState;
+  snapshot.players = snapshot.players.map((player, index) => {
+    if (index === viewer) return player;
+    return {
+      ...player,
+      // Counts are enough for the opponent UI; card identities must remain
+      // server-side until a card is publicly played.
+      deck: player.deck.map(() => "__hidden-card__"),
+      hand: player.hand.map(() => "__hidden-card__"),
+      secrets: player.secrets.map((_, secretIndex) => ({
+        cardId: `hidden-secret-${secretIndex}`,
+        secretId: `hidden-secret-${secretIndex}`,
+        name: "未知奥秘",
+        description: "等待敌方行为触发。",
+        trigger: "opponent-plays-spell" as const,
+        effect: { kind: "armor" as const, amount: 0 },
+      })),
+    };
+  }) as [MatchState["players"][0], MatchState["players"][1]];
+
+  if (snapshot.discover && snapshot.discover.player !== viewer) {
+    snapshot.discover = {
+      player: snapshot.discover.player,
+      sourceCardId: "",
+      choices: [],
+    };
+  }
+
+  snapshot.events = snapshot.events.map((event) => {
+    if (event.player === viewer) return event;
+    if (event.type === "secret-armed") {
+      return {
+        ...event,
+        message: `玩家 ${event.player ?? 1} 设置了一个奥秘。`,
+        data: undefined,
+      };
+    }
+    if (event.type === "card-drawn" || event.type === "card-burned") {
+      const safeData = { ...(event.data ?? {}) };
+      delete safeData.cardId;
+      return { ...event, data: safeData };
+    }
+    if (event.type === "discover-started") {
+      return {
+        ...event,
+        message: "对手正在发现一张卡牌。",
+        data: undefined,
+      };
+    }
+    if (event.type === "discover-chosen") {
+      return {
+        ...event,
+        message: "对手完成了发现选择。",
+        data: undefined,
+      };
+    }
+    return event;
+  });
+  return snapshot;
+}
+
+function redactPvpCommandForViewer(command: BattleCommand, viewer: 0 | 1): BattleCommand {
+  if (command.type !== "choose-discover" || command.player === viewer) return command;
+  return { ...command, cardId: "__hidden-card__" };
+}
+
 let pvpSchemaReady: Promise<void> | null = null;
 
 function getPvpDatabase(env: Env): PvpDatabase | null {
@@ -266,10 +333,11 @@ async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise
   const match = await getPvpDbMatch(db, room.code);
   const matchState = match ? parsePvpState(match.state_json) : null;
   if (matchState) {
+    const viewer = isHost ? 0 : 1;
     await queuePvpDbMessage(db, session.client_id, {
       type: "match_sync",
       room: room.code,
-      payload: { state: matchState, matchToken: match.match_token },
+      payload: { state: redactPvpStateForViewer(matchState, viewer), matchToken: match.match_token },
     });
   }
 }
@@ -445,10 +513,29 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
         guest_identity = excluded.guest_identity, created_at = excluded.created_at`)
       .bind(matchToken, room.code, hostIdentity, guestIdentity, now).run();
     const sequence = await nextPvpSequence(db, room);
-    const startPayload = { seed, decks: [hostDeck, guestDeck], matchToken };
-    const actionMessage = { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: startPayload };
-    await queuePvpDbMessage(db, session.client_id, actionMessage);
-    await queuePvpDbMessage(db, room.guest_client_id, actionMessage);
+    const startPayload = (viewer: 0 | 1) => ({
+      seed,
+      // The client only needs its own deck to open the pre-sync mulligan
+      // screen. The authoritative snapshot follows through command sync.
+      deck: viewer === 0 ? hostDeck : guestDeck,
+      matchToken,
+    });
+    await queuePvpDbMessage(db, session.client_id, {
+      type: "action",
+      playerId: session.player_id,
+      peerName: session.name,
+      sequence,
+      action,
+      payload: startPayload(0),
+    });
+    await queuePvpDbMessage(db, room.guest_client_id, {
+      type: "action",
+      playerId: session.player_id,
+      peerName: session.name,
+      sequence,
+      action,
+      payload: startPayload(1),
+    });
     return;
   }
 
@@ -505,17 +592,26 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
   // Send the post-transition snapshot as well as the command. Clients render
   // this authoritative state directly, so refreshes and slow polling cannot
   // leave either side one reducer step behind.
-  const actionPayload = {
-    command,
-    state: transition.state,
-    stateVersion: transition.state.version,
-    result: transition.state.result,
-    matchToken: match.match_token,
-  };
-  const actionMessage = { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: actionPayload };
-  await queuePvpDbMessage(db, session.client_id, actionMessage);
-  if (room.host_client_id !== session.client_id) await queuePvpDbMessage(db, room.host_client_id, actionMessage);
-  if (room.guest_client_id && room.guest_client_id !== session.client_id) await queuePvpDbMessage(db, room.guest_client_id, actionMessage);
+  const recipients = [room.host_client_id, room.guest_client_id].filter(Boolean) as string[];
+  await Promise.all(recipients.map(async (clientId) => {
+    const viewer = pvpRoleIndex(room, clientId);
+    if (viewer === null) return;
+    const actionPayload = {
+      command: redactPvpCommandForViewer(command, viewer),
+      state: redactPvpStateForViewer(transition.state, viewer),
+      stateVersion: transition.state.version,
+      result: transition.state.result,
+      matchToken: match.match_token,
+    };
+    await queuePvpDbMessage(db, clientId, {
+      type: "action",
+      playerId: session.player_id,
+      peerName: session.name,
+      sequence,
+      action,
+      payload: actionPayload,
+    });
+  }));
 }
 
 async function handlePvpDbMessage(db: PvpDatabase, session: PvpDbSession, message: PvpMessage): Promise<void> {
@@ -644,6 +740,32 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     return;
   }
   const rawPayload = message.payload && typeof message.payload === "object" ? message.payload : {};
+  const sequence = ++room.nextSequence;
+  if (action === "match_start" && rawPayload && !Array.isArray(rawPayload)) {
+    const supplied = rawPayload as Record<string, unknown>;
+    const decks = Array.isArray(supplied.decks) && supplied.decks.length === 2
+      ? supplied.decks.map((deck) => Array.isArray(deck) ? deck.map(String) : [])
+      : [];
+    const seed = Number(supplied.seed);
+    const matchToken = typeof supplied.matchToken === "string" ? supplied.matchToken : undefined;
+    const startPayload = (viewer: 0 | 1) => ({
+      seed,
+      deck: Array.isArray(decks[viewer]) ? decks[viewer] : [],
+      ...(matchToken ? { matchToken } : {}),
+    });
+    room.peers.forEach((other, index) => {
+      pvpJson(other, {
+        type: "action",
+        playerId: peer.id,
+        peerName: peer.name,
+        sequence,
+        action,
+        payload: startPayload(index === 0 ? 0 : 1),
+      });
+    });
+    pvpJson(peer, { type: "action_ack", action, sequence });
+    return;
+  }
   const payload = action === "command" && rawPayload && !Array.isArray(rawPayload)
     ? {
         ...(rawPayload as Record<string, unknown>),
@@ -653,7 +775,6 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
         ) ?? (rawPayload as Record<string, unknown>).command,
       }
     : rawPayload;
-  const sequence = ++room.nextSequence;
   const recipients = action === "ready" ? room.peers.filter((other) => other !== peer) : room.peers;
   recipients.forEach((other) => pvpJson(other, {
     type: "action",
