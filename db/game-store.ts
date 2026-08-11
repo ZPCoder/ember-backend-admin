@@ -12,6 +12,7 @@ export type GameIdentity = {
   email: string;
   displayName: string;
   isDemo: boolean;
+  isAnonymous: boolean;
 };
 
 export type PlayerDeck = {

@@ -28,7 +28,7 @@ type PvpPeer = {
   room: string | null;
   queue?: PvpMessage[];
 };
-type PvpRoom = { code: string; peers: PvpPeer[] };
+type PvpRoom = { code: string; peers: PvpPeer[]; nextSequence: number };
 
 const pvpRooms = new Map<string, PvpRoom>();
 const pvpPeers = new Map<WebSocket, PvpPeer>();
@@ -89,7 +89,7 @@ function createPvpRoom(peer: PvpPeer): void {
   do {
     code = Array.from({ length: 4 }, () => pvpAlphabet[Math.floor(Math.random() * pvpAlphabet.length)]).join("");
   } while (pvpRooms.has(code));
-  const room: PvpRoom = { code, peers: [peer] };
+  const room: PvpRoom = { code, peers: [peer], nextSequence: 0 };
   pvpRooms.set(code, room);
   peer.room = code;
   pvpJson(peer, { type: "room_created", room: code, message: "房间已创建，等待对手加入" });
@@ -116,14 +116,21 @@ function joinPvpRoom(peer: PvpPeer, code: string): void {
 function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
   const room = peer.room ? pvpRooms.get(peer.room) : null;
   if (!room) return pvpError(peer, "请先创建或加入房间");
+  const action = typeof message.action === "string" ? message.action : "";
+  if (!["ready", "match_start", "command"].includes(action)) {
+    return pvpError(peer, "联机指令类型无效");
+  }
+  const payload = message.payload && typeof message.payload === "object" ? message.payload : {};
+  const sequence = ++room.nextSequence;
   room.peers.filter((other) => other !== peer).forEach((other) => pvpJson(other, {
     type: "action",
     playerId: peer.id,
     peerName: peer.name,
-    action: message.action,
-    payload: message.payload && typeof message.payload === "object" ? message.payload : {},
+    sequence,
+    action,
+    payload,
   }));
-  pvpJson(peer, { type: "action_ack", action: message.action });
+  pvpJson(peer, { type: "action_ack", action, sequence });
 }
 
 function handlePvpMessage(peer: PvpPeer, raw: unknown): void {

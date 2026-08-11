@@ -19,7 +19,11 @@ const DEMO_IDENTITY: GameIdentity = {
   email: "demo@local.invalid",
   displayName: "本地演示玩家",
   isDemo: true,
+  isAnonymous: false,
 };
+
+const ANONYMOUS_COOKIE = "ember-device-id";
+const ANONYMOUS_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 
 type GameAction =
   | {
@@ -57,19 +61,20 @@ class PayloadError extends Error {
 
 export async function GET(request: Request): Promise<Response> {
   try {
-    const identity = await resolveIdentity(request);
-    if (!identity) return unauthorized();
+    const resolved = await resolveIdentity(request);
+    if (!resolved) return unauthorized();
 
-    const player = await getPlayerState(identity);
+    const player = await getPlayerState(resolved.identity);
     return json({
       ok: true,
       identity: {
-        email: identity.email,
-        displayName: identity.displayName,
-        isDemo: identity.isDemo,
+        email: resolved.identity.email,
+        displayName: resolved.identity.displayName,
+        isDemo: resolved.identity.isDemo,
+        isAnonymous: resolved.identity.isAnonymous,
       },
       player,
-    });
+    }, 200, resolved.setCookie);
   } catch (error) {
     return handleError(error);
   }
@@ -77,8 +82,9 @@ export async function GET(request: Request): Promise<Response> {
 
 export async function POST(request: Request): Promise<Response> {
   try {
-    const identity = await resolveIdentity(request);
-    if (!identity) return unauthorized();
+    const resolved = await resolveIdentity(request);
+    if (!resolved) return unauthorized();
+    const identity = resolved.identity;
 
     const action = parseAction(await readJsonBody(request));
     switch (action.action) {
@@ -90,7 +96,7 @@ export async function POST(request: Request): Promise<Response> {
           player: result.player,
           savedDeck: result.savedDeck,
           replayed: result.replayed,
-        });
+        }, 200, resolved.setCookie);
       }
       case "claim_task": {
         const result = await claimTask(identity, action);
@@ -101,7 +107,7 @@ export async function POST(request: Request): Promise<Response> {
           claimedTaskId: result.claimedTaskId,
           rewardGold: result.rewardGold,
           replayed: result.replayed,
-        });
+        }, 200, resolved.setCookie);
       }
       case "open_pack": {
         const result = await openPack(identity, action);
@@ -111,7 +117,7 @@ export async function POST(request: Request): Promise<Response> {
           player: result.player,
           openedCards: result.openedCards,
           replayed: result.replayed,
-        });
+        }, 200, resolved.setCookie);
       }
       case "record_match": {
         const result = await recordMatch(identity, action);
@@ -121,7 +127,7 @@ export async function POST(request: Request): Promise<Response> {
           player: result.player,
           match: result.match,
           replayed: result.replayed,
-        });
+        }, 200, resolved.setCookie);
       }
       case "reset_demo": {
         const player = await resetDemoPlayer(identity);
@@ -130,7 +136,7 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player,
           replayed: false,
-        });
+        }, 200, resolved.setCookie);
       }
     }
   } catch (error) {
@@ -140,17 +146,55 @@ export async function POST(request: Request): Promise<Response> {
 
 async function resolveIdentity(
   request: Request,
-): Promise<GameIdentity | null> {
+): Promise<{ identity: GameIdentity; setCookie?: string } | null> {
   const authenticated = await getChatGPTUser();
   if (authenticated) {
     return {
-      email: authenticated.email,
-      displayName: authenticated.displayName,
-      isDemo: false,
+      identity: {
+        email: authenticated.email,
+        displayName: authenticated.displayName,
+        isDemo: false,
+        isAnonymous: false,
+      },
     };
   }
 
-  return isLocalRequest(request) ? DEMO_IDENTITY : null;
+  if (isLocalRequest(request)) return { identity: DEMO_IDENTITY };
+
+  const existingDeviceId = readCookie(request.headers.get("cookie"), ANONYMOUS_COOKIE);
+  const deviceId = isDeviceId(existingDeviceId) ? existingDeviceId : crypto.randomUUID();
+  const identity: GameIdentity = {
+    email: `device-${deviceId}@anonymous.ember.local`,
+    displayName: "本机指挥官",
+    isDemo: false,
+    isAnonymous: true,
+  };
+  return {
+    identity,
+    ...(existingDeviceId === deviceId ? {} : { setCookie: makeDeviceCookie(deviceId) }),
+  };
+}
+
+function readCookie(header: string | null, name: string): string | null {
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
+    try {
+      return decodeURIComponent(part.slice(separator + 1).trim());
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function isDeviceId(value: string | null): value is string {
+  return value !== null && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function makeDeviceCookie(deviceId: string): string {
+  return `${ANONYMOUS_COOKIE}=${encodeURIComponent(deviceId)}; Max-Age=${ANONYMOUS_COOKIE_MAX_AGE}; Path=/; SameSite=Lax; Secure; HttpOnly`;
 }
 
 function isLocalRequest(request: Request): boolean {
@@ -394,11 +438,13 @@ function handleError(error: unknown): Response {
   );
 }
 
-function json(body: unknown, status = 200): Response {
-  return Response.json(body, {
+function json(body: unknown, status = 200, setCookie?: string): Response {
+  const response = Response.json(body, {
     status,
     headers: {
       "cache-control": "no-store",
     },
   });
+  if (setCookie) response.headers.set("set-cookie", setCookie);
+  return response;
 }
