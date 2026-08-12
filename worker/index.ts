@@ -81,6 +81,22 @@ const PVP_MAX_BODY_BYTES = 32 * 1024;
 // window so a backgrounded or disconnected tab cannot hold a live turn open.
 const PVP_TURN_TIME_LIMIT_MS = 75 * 1000;
 
+function createAuthoritativePvpSeed(): number {
+  // The room creator must not be able to search for a favorable opening hand
+  // by supplying a client-controlled seed. Generate the seed inside the
+  // Worker, then return it to both clients so their local mulligan shell and
+  // replay remain deterministic after the server has committed the match.
+  const random = new Uint32Array(1);
+  crypto.getRandomValues(random);
+  return random[0] & 0x7fffffff;
+}
+
+function createAuthoritativeStartingPlayer(): 0 | 1 {
+  const random = new Uint8Array(1);
+  crypto.getRandomValues(random);
+  return (random[0] & 1) as 0 | 1;
+}
+
 function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
   const snapshot = JSON.parse(JSON.stringify(state)) as MatchState;
   snapshot.players = snapshot.players.map((player, index) => {
@@ -570,11 +586,10 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     if (existingState?.phase === "main" || existingState?.phase === "mulligan") {
       return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "对局已经开始，请等待本局结束。" });
     }
-    const suppliedSeed = Number(payload.seed);
-    const seed = Number.isSafeInteger(suppliedSeed) ? suppliedSeed : Math.floor(Math.random() * 0x7fffffff);
+    const seed = createAuthoritativePvpSeed();
     // Choose first player on the authoritative path; the room creator is not
     // always first, matching the normal Hearthstone opening cadence.
-    const startingPlayer: 0 | 1 = Math.random() < 0.5 ? 0 : 1;
+    const startingPlayer = createAuthoritativeStartingPlayer();
     const state = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed });
     const matchToken = crypto.randomUUID();
     const now = Date.now();
@@ -895,9 +910,8 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     if (room.matchState?.phase === "main" || room.matchState?.phase === "mulligan") {
       return rejectMemoryPvpAction(peer, action, "对局已经开始，请等待本局结束。");
     }
-    const suppliedSeed = Number(rawPayload.seed);
-    const seed = Number.isSafeInteger(suppliedSeed) ? suppliedSeed : Math.floor(Math.random() * 0x7fffffff);
-    const startingPlayer: 0 | 1 = Math.random() < 0.5 ? 0 : 1;
+    const seed = createAuthoritativePvpSeed();
+    const startingPlayer = createAuthoritativeStartingPlayer();
     room.matchState = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed });
     room.matchToken = crypto.randomUUID();
     room.matchUpdatedAt = Date.now();
