@@ -17,7 +17,7 @@
 - 卡组工坊支持保存多套卡组、切换已保存卡组与新建卡组草稿
 - 响应式中文界面、键盘操作、ARIA 标签与社交分享图
 
-网页纵向切片默认进入 AI 练习；战术对战页同时提供基础 PVP 房间大厅，已发布网页默认连接当前站点的 `wss://…/api/pvp`，手机和电脑只需打开同一网址即可通过房间码进行 1v1 同步出牌、攻击、回合和胜负结算。联机服务当前是房间转发型 MVP，正式运营还需要服务端权威校验、断线重连和赛季排行榜。仓库也提供 `flutter_app/` 全端客户端，支持 Web、macOS、Windows、Linux、iOS、Android。
+网页纵向切片默认进入 AI 练习；战术对战页同时提供 PVP 房间大厅，已发布网页和 Flutter 客户端默认连接当前站点的 `wss://…/api/pvp`。手机和电脑只需打开同一网址即可通过房间码进行 1v1 同步出牌、攻击、回合和胜负结算；生产 Worker 负责权威规则校验、隐藏信息、回合时限和断线同步。仓库也提供 `flutter_app/` 全端客户端，支持 Web、macOS、Windows、Linux、iOS、Android。
 
 ## Flutter 全端客户端
 
@@ -31,7 +31,7 @@ flutter run                 # Android / iOS 设备
 
 联机房间服务器和双客户端协议烟测见 [`flutter_app/README.md`](flutter_app/README.md)。
 
-本地开发时可在仓库根目录运行 `dart run server/multiplayer_server.dart 8787`，再打开网页“战术对战 → 基础联机对战”，填入 `ws://127.0.0.1:8787`；发布网页不需要这一步，直接使用页面默认的站点联机地址即可。
+本地开发时可在仓库根目录运行 `dart run server/multiplayer_server.dart 8787` 做房间 UI/连接测试；完整规则联机应使用部署 Worker 的 `wss://当前站点/api/pvp`，发布网页和手机端不需要启动本地服务器。
 
 ## 技术结构
 
