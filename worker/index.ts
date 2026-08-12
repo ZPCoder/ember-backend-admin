@@ -564,7 +564,10 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     }
     const suppliedSeed = Number(payload.seed);
     const seed = Number.isSafeInteger(suppliedSeed) ? suppliedSeed : Math.floor(Math.random() * 0x7fffffff);
-    const state = createMatch({ decks: [hostDeck, guestDeck], startingPlayer: 0, seed });
+    // Choose first player on the authoritative path; the room creator is not
+    // always first, matching the normal Hearthstone opening cadence.
+    const startingPlayer: 0 | 1 = Math.random() < 0.5 ? 0 : 1;
+    const state = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed });
     const matchToken = crypto.randomUUID();
     const now = Date.now();
     const hostIdentity = await getPvpDbIdentity(db, room.host_client_id);
@@ -580,6 +583,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     const sequence = await nextPvpSequence(db, room);
     const startPayload = (viewer: 0 | 1) => ({
       seed,
+      startingPlayer,
       // The client only needs its own deck to open the pre-sync mulligan
       // screen. The authoritative snapshot follows through command sync.
       deck: viewer === 0 ? hostDeck : guestDeck,
@@ -820,9 +824,13 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
       ? supplied.decks.map((deck) => Array.isArray(deck) ? deck.map(String) : [])
       : [];
     const seed = Number(supplied.seed);
+    // Roll first player on the server so both clients receive the same fair
+    // result instead of letting the room creator always open the game.
+    const startingPlayer: 0 | 1 = Math.random() < 0.5 ? 0 : 1;
     const matchToken = typeof supplied.matchToken === "string" ? supplied.matchToken : undefined;
     const startPayload = (viewer: 0 | 1) => ({
       seed,
+      startingPlayer,
       deck: Array.isArray(decks[viewer]) ? decks[viewer] : [],
       ...(matchToken ? { matchToken } : {}),
     });
