@@ -4,6 +4,7 @@ import {
   DEFAULT_STARTER_DECK,
   validateDeck,
 } from "../lib/game";
+import { drawPack } from "../lib/game/pack.ts";
 
 export type MatchResult = "win" | "loss";
 export type MatchMode = "ai" | "pvp";
@@ -355,7 +356,14 @@ export async function openPack(
 
       // Draw only after the availability check. This keeps an exhausted-pack
       // request side-effect free and makes retries easier to reason about.
-      openedCards = drawPack();
+      if (CARD_CATALOG.length === 0) {
+        throw new GameStoreError(
+          "CARD_CATALOG_EMPTY",
+          "卡牌目录尚未就绪。",
+          503,
+        );
+      }
+      openedCards = drawPack(current.collection);
 
       const collection = { ...current.collection };
       for (const opened of openedCards) {
@@ -1173,29 +1181,6 @@ function assertCardsOwned(
       missing,
     );
   }
-}
-
-function drawPack(): Array<{ cardId: string; count: number }> {
-  if (CARD_CATALOG.length === 0) {
-    throw new GameStoreError(
-      "CARD_CATALOG_EMPTY",
-      "卡牌目录尚未就绪。",
-      503,
-    );
-  }
-
-  const counts = new Map<string, number>();
-  const random = new Uint32Array(5);
-  crypto.getRandomValues(random);
-  for (const value of random) {
-    const card = CARD_CATALOG[value % CARD_CATALOG.length];
-    counts.set(card.id, (counts.get(card.id) ?? 0) + 1);
-  }
-
-  return [...counts.entries()].map(([cardId, count]) => ({
-    cardId,
-    count,
-  }));
 }
 
 async function stableId(value: string): Promise<string> {
