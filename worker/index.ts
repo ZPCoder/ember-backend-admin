@@ -49,7 +49,15 @@ type PvpPeer = {
   room: string | null;
   queue?: PvpMessage[];
 };
-type PvpRoom = { code: string; peers: PvpPeer[]; nextSequence: number };
+type PvpRoom = {
+  code: string;
+  peers: PvpPeer[];
+  nextSequence: number;
+  readyDecks: Map<string, string[]>;
+  matchState?: MatchState;
+  matchToken?: string;
+  matchUpdatedAt?: number;
+};
 
 const pvpRooms = new Map<string, PvpRoom>();
 const pvpPeers = new Map<WebSocket, PvpPeer>();
@@ -745,8 +753,18 @@ function leavePvpRoom(peer: PvpPeer): void {
     peerName: peer.name,
     message: `${peer.name} 已离开房间`,
   }));
-  if (room.peers.length === 0) pvpRooms.delete(code);
-  else pvpRoomState(room);
+  if (room.peers.length === 0) {
+    pvpRooms.delete(code);
+  } else {
+    // A memory room is authoritative while it exists. Once one player leaves,
+    // discard the private match and both ready decks so a replacement player
+    // cannot inherit a stale state or an opponent's hidden cards.
+    room.readyDecks.clear();
+    room.matchState = undefined;
+    room.matchToken = undefined;
+    room.matchUpdatedAt = undefined;
+    pvpRoomState(room);
+  }
 }
 
 function leavePvpPeer(peer: PvpPeer): void {
@@ -761,7 +779,12 @@ function createPvpRoom(peer: PvpPeer): void {
   do {
     code = Array.from({ length: 4 }, () => pvpAlphabet[Math.floor(Math.random() * pvpAlphabet.length)]).join("");
   } while (pvpRooms.has(code));
-  const room: PvpRoom = { code, peers: [peer], nextSequence: 0 };
+  const room: PvpRoom = {
+    code,
+    peers: [peer],
+    nextSequence: 0,
+    readyDecks: new Map(),
+  };
   pvpRooms.set(code, room);
   peer.room = code;
   pvpJson(peer, { type: "room_created", room: code, message: "房间已创建，等待对手加入" });
@@ -795,15 +818,115 @@ function joinPvpRoom(peer: PvpPeer, code: string): void {
   pvpRoomState(room);
 }
 
+function memoryPvpRoleIndex(room: PvpRoom, peer: PvpPeer): 0 | 1 | null {
+  const index = room.peers.indexOf(peer);
+  return index === 0 ? 0 : index === 1 ? 1 : null;
+}
+
+function broadcastMemoryPvpTransition(
+  room: PvpRoom,
+  sender: PvpPeer,
+  action: string,
+  command: BattleCommand,
+  state: MatchState,
+): void {
+  const sequence = ++room.nextSequence;
+  room.peers.forEach((recipient) => {
+    const viewer = memoryPvpRoleIndex(room, recipient);
+    if (viewer === null) return;
+    pvpJson(recipient, {
+      type: "action",
+      playerId: sender.id,
+      peerName: sender.name,
+      sequence,
+      action,
+      payload: {
+        command: redactPvpCommandForViewer(command, viewer),
+        state: redactPvpStateForViewer(state, viewer),
+        stateVersion: state.version,
+        result: state.result,
+        ...(room.matchToken ? { matchToken: room.matchToken } : {}),
+      },
+    });
+  });
+  pvpJson(sender, { type: "action_ack", action, sequence });
+}
+
+function rejectMemoryPvpAction(peer: PvpPeer, action: string, message: string, extras: PvpMessage = {}): void {
+  pvpJson(peer, { type: "action_rejected", action, message, ...extras });
+}
+
 function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
   const room = peer.room ? pvpRooms.get(peer.room) : null;
   if (!room) return pvpError(peer, "请先创建或加入房间");
+  const role = memoryPvpRoleIndex(room, peer);
+  if (role === null) return pvpError(peer, "联机会话不属于当前房间");
   const action = typeof message.action === "string" ? message.action : "";
   if (!["ready", "match_start", "command", "rematch"].includes(action)) {
     return pvpError(peer, "联机指令类型无效");
   }
+  const rawPayload = message.payload && typeof message.payload === "object" && !Array.isArray(message.payload)
+    ? message.payload as Record<string, unknown>
+    : {};
+
+  if (action === "ready") {
+    const deckIds = parsePvpDeck(rawPayload.deckIds);
+    if (!deckIds) return rejectMemoryPvpAction(peer, action, "卡组无效，无法准备。");
+    room.readyDecks.set(peer.clientId, deckIds);
+    const sequence = ++room.nextSequence;
+    room.peers.filter((other) => other !== peer).forEach((other) => pvpJson(other, {
+      type: "action",
+      playerId: peer.id,
+      peerName: peer.name,
+      sequence,
+      action,
+      payload: { ready: true },
+    }));
+    pvpJson(peer, { type: "action_ack", action, sequence });
+    return;
+  }
+
+  if (action === "match_start") {
+    if (role !== 0) return rejectMemoryPvpAction(peer, action, "只有房主可以开始对局。");
+    if (room.peers.length < 2) return rejectMemoryPvpAction(peer, action, "等待对手加入房间。");
+    const hostDeck = room.readyDecks.get(room.peers[0].clientId);
+    const guestDeck = room.readyDecks.get(room.peers[1].clientId);
+    if (!hostDeck || !guestDeck) return rejectMemoryPvpAction(peer, action, "双方都需要先用合法卡组准备。");
+    if (room.matchState?.phase === "main" || room.matchState?.phase === "mulligan") {
+      return rejectMemoryPvpAction(peer, action, "对局已经开始，请等待本局结束。");
+    }
+    const suppliedSeed = Number(rawPayload.seed);
+    const seed = Number.isSafeInteger(suppliedSeed) ? suppliedSeed : Math.floor(Math.random() * 0x7fffffff);
+    const startingPlayer: 0 | 1 = Math.random() < 0.5 ? 0 : 1;
+    room.matchState = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed });
+    room.matchToken = crypto.randomUUID();
+    room.matchUpdatedAt = Date.now();
+    const sequence = ++room.nextSequence;
+    room.peers.forEach((other, index) => pvpJson(other, {
+      type: "action",
+      playerId: peer.id,
+      peerName: peer.name,
+      sequence,
+      action,
+      payload: {
+        seed,
+        startingPlayer,
+        deck: index === 0 ? hostDeck : guestDeck,
+        matchToken: room.matchToken,
+      },
+    }));
+    pvpJson(peer, { type: "action_ack", action, sequence });
+    return;
+  }
+
   if (action === "rematch") {
-    if (room.peers[0] !== peer) return pvpError(peer, "只有房主可以发起再来一局");
+    if (role !== 0) return rejectMemoryPvpAction(peer, action, "只有房主可以发起再来一局");
+    if (!room.peers[1]) return rejectMemoryPvpAction(peer, action, "等待对手加入房间。");
+    if (room.matchState?.phase !== "game-over") return rejectMemoryPvpAction(peer, action, "本局尚未结束，暂时不能重新开始。");
+    room.readyDecks.clear();
+    room.matchState = undefined;
+    room.matchToken = undefined;
+    room.matchUpdatedAt = undefined;
     const sequence = ++room.nextSequence;
     room.peers.forEach((other) => pvpJson(other, {
       type: "action",
@@ -816,58 +939,49 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     pvpJson(peer, { type: "action_ack", action, sequence });
     return;
   }
-  const rawPayload = message.payload && typeof message.payload === "object" ? message.payload : {};
-  const sequence = ++room.nextSequence;
-  if (action === "match_start" && rawPayload && !Array.isArray(rawPayload)) {
-    const supplied = rawPayload as Record<string, unknown>;
-    const decks = Array.isArray(supplied.decks) && supplied.decks.length === 2
-      ? supplied.decks.map((deck) => Array.isArray(deck) ? deck.map(String) : [])
-      : [];
-    const seed = Number(supplied.seed);
-    // Roll first player on the server so both clients receive the same fair
-    // result instead of letting the room creator always open the game.
-    const startingPlayer: 0 | 1 = Math.random() < 0.5 ? 0 : 1;
-    const matchToken = typeof supplied.matchToken === "string" ? supplied.matchToken : undefined;
-    const startPayload = (viewer: 0 | 1) => ({
-      seed,
-      startingPlayer,
-      deck: Array.isArray(decks[viewer]) ? decks[viewer] : [],
-      ...(matchToken ? { matchToken } : {}),
+
+  const current = room.matchState;
+  const command = canonicalCommand(rawPayload.command, role);
+  if (!current || !command) {
+    return pvpJson(peer, {
+      type: "action_rejected",
+      action,
+      commandId: typeof rawPayload.command === "object" && rawPayload.command ? (rawPayload.command as Record<string, unknown>).commandId : undefined,
+      message: "对局指令无效或对局尚未开始。",
     });
-    room.peers.forEach((other, index) => {
-      pvpJson(other, {
-        type: "action",
-        playerId: peer.id,
-        peerName: peer.name,
-        sequence,
-        action,
-        payload: startPayload(index === 0 ? 0 : 1),
-      });
-    });
-    pvpJson(peer, { type: "action_ack", action, sequence });
-    return;
   }
-  const payload = action === "ready"
-    ? { ready: true }
-    : action === "command" && rawPayload && !Array.isArray(rawPayload)
-    ? {
-        ...(rawPayload as Record<string, unknown>),
-        command: canonicalCommand(
-          (rawPayload as Record<string, unknown>).command,
-          room.peers[0] === peer ? 0 : 1,
-        ) ?? (rawPayload as Record<string, unknown>).command,
-      }
-    : rawPayload;
-  const recipients = action === "ready" ? room.peers.filter((other) => other !== peer) : room.peers;
-  recipients.forEach((other) => pvpJson(other, {
-    type: "action",
-    playerId: peer.id,
-    peerName: peer.name,
-    sequence,
-    action,
-    payload,
-  }));
-  pvpJson(peer, { type: "action_ack", action, sequence });
+  const now = Date.now();
+  let baseState = current;
+  let timeoutCommand: BattleCommand | null = null;
+  if (current.phase === "main" && command.type !== "concede" && now - (room.matchUpdatedAt ?? now) >= PVP_TURN_TIME_LIMIT_MS) {
+    timeoutCommand = {
+      type: "end-turn",
+      player: current.activePlayer,
+      reason: "timeout",
+      commandId: `server-timeout-${room.matchToken ?? "memory"}-${current.version}`,
+    };
+    const timedOut = applyCommand(current, timeoutCommand);
+    if (timedOut.accepted) baseState = timedOut.state;
+    else timeoutCommand = null;
+  }
+  const transition = applyCommand(baseState, command);
+  if (!transition.accepted) {
+    if (timeoutCommand) {
+      room.matchState = baseState;
+      room.matchUpdatedAt = now;
+      broadcastMemoryPvpTransition(room, peer, action, timeoutCommand, baseState);
+    }
+    return pvpJson(peer, {
+      type: "action_rejected",
+      action,
+      commandId: command.commandId,
+      resync: true,
+      message: timeoutCommand ? "行动时间已耗尽，回合已自动结束，请等待新的行动窗口。" : transition.error?.message ?? "服务器拒绝了这条指令。",
+    });
+  }
+  room.matchState = transition.state;
+  room.matchUpdatedAt = now;
+  broadcastMemoryPvpTransition(room, peer, action, command, transition.state);
 }
 
 function handlePvpMessage(peer: PvpPeer, raw: unknown): void {
@@ -897,7 +1011,20 @@ function handlePvpMessage(peer: PvpPeer, raw: unknown): void {
       break;
     case "sync": {
       const room = peer.room ? pvpRooms.get(peer.room) : null;
-      if (room) pvpRoomState(room);
+      if (room) {
+        pvpRoomState(room);
+        const viewer = memoryPvpRoleIndex(room, peer);
+        if (viewer !== null && room.matchState && room.matchToken) {
+          pvpJson(peer, {
+            type: "match_sync",
+            room: room.code,
+            payload: {
+              state: redactPvpStateForViewer(room.matchState, viewer),
+              matchToken: room.matchToken,
+            },
+          });
+        }
+      }
       break;
     }
     case "leave_room":
