@@ -1,9 +1,13 @@
 import { env } from "cloudflare:workers";
 import {
+  AI_ARCHETYPES,
   CARD_CATALOG,
   DEFAULT_STARTER_DECK,
+  applyCommand,
+  createMatch,
   validateDeck,
 } from "../lib/game";
+import type { BattleCommand } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
 import {
   REWARD_TRACK,
@@ -13,6 +17,7 @@ import {
 
 export type MatchResult = "win" | "loss";
 export type MatchMode = "ai" | "pvp";
+export type MatchFormat = "ranked" | "casual";
 
 export type GameIdentity = {
   email: string;
@@ -48,6 +53,7 @@ export type TaskCycle = {
   dailyRerollsRemaining: number;
   packsBoughtToday: number;
   aiRewardsToday: number;
+  weeklyFreePackClaimed: boolean;
 };
 
 export type PlayerProgression = {
@@ -60,21 +66,33 @@ export type RewardTrackState = {
 };
 
 export type PlayerLadder = {
+  seasonKey: string;
   rating: number;
   tier: string;
   stars: number;
   wins: number;
   losses: number;
+  highestRating: number;
 };
 
 export type MatchRecord = {
   id: string;
   result: MatchResult;
   mode: MatchMode;
+  format?: MatchFormat;
   opponent: string;
   rewardGold: number;
   pvpToken?: string;
   createdAt: string;
+};
+
+/** Client transcript that the server replays before granting AI rewards. */
+export type AiMatchProof = {
+  seed: number;
+  startingPlayer: 0 | 1;
+  playerDeck: string[];
+  opponentArchetypeId: string;
+  commands: BattleCommand[];
 };
 
 export type PlayerState = {
@@ -119,6 +137,11 @@ export type ClaimTaskResult = {
 export type OpenPackResult = {
   player: PlayerState;
   openedCards: Array<{ cardId: string; count: number }>;
+  replayed: boolean;
+};
+
+export type ClaimWeeklyPackResult = {
+  player: PlayerState;
   replayed: boolean;
 };
 
@@ -176,6 +199,7 @@ type MatchRow = {
   id: string;
   result: MatchResult;
   mode: MatchMode;
+  format?: MatchFormat | null;
   opponent: string;
   rewardGold: number;
   pvpToken?: string | null;
@@ -190,6 +214,7 @@ type AuditRow = {
 type PvpMatchRow = {
   matchToken: string;
   stateJson: string;
+  format?: MatchFormat | null;
 };
 
 type PvpParticipantRow = {
@@ -504,6 +529,36 @@ export async function openPack(
   }));
 }
 
+/** Hearthstone-style weekly shop gift: one free pack per UTC week. */
+export async function claimWeeklyPack(
+  identity: GameIdentity,
+  input: { idempotencyKey: string },
+): Promise<ClaimWeeklyPackResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  return commitMutation(
+    db,
+    player,
+    "claim_weekly_pack",
+    input.idempotencyKey,
+    {},
+    (current) => {
+      if (current.taskCycle.weeklyFreePackClaimed) {
+        throw new GameStoreError("WEEKLY_PACK_ALREADY_CLAIMED", "本周免费卡包已经领取。", 409);
+      }
+      return {
+        nextState: {
+          ...current,
+          packsAvailable: current.packsAvailable + 1,
+          taskCycle: { ...current.taskCycle, weeklyFreePackClaimed: true },
+        },
+        result: {},
+      };
+    },
+  ).then(({ player: nextPlayer, replayed }) => ({ player: nextPlayer, replayed }));
+}
+
 export async function buyPack(
   identity: GameIdentity,
   input: { idempotencyKey: string },
@@ -733,21 +788,28 @@ export async function recordMatch(
     opponent: string;
     pvpToken?: string;
     pvpPlayer?: 0 | 1;
+    format?: MatchFormat;
+    aiProof?: AiMatchProof;
   },
 ): Promise<RecordMatchResult> {
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
+  let verifiedFormat: MatchFormat = "ranked";
   if (input.mode === "pvp") {
     if (!input.pvpToken || input.pvpPlayer === undefined) {
       throw new GameStoreError("PVP_PROOF_REQUIRED", "联机对局缺少服务器凭证。", 400);
     }
     const row = await db
-      .prepare("SELECT match_token AS matchToken, state_json AS stateJson FROM pvp_matches WHERE match_token = ?")
+      .prepare("SELECT match_token AS matchToken, state_json AS stateJson, format FROM pvp_matches WHERE match_token = ?")
       .bind(input.pvpToken)
       .first<PvpMatchRow>();
     if (!row) {
       throw new GameStoreError("PVP_PROOF_INVALID", "联机对局凭证无效或已过期。", 409);
+    }
+    verifiedFormat = row.format === "casual" ? "casual" : "ranked";
+    if (input.format !== undefined && input.format !== verifiedFormat) {
+      throw new GameStoreError("PVP_FORMAT_MISMATCH", "对战模式与服务器房间不一致。", 409);
     }
     let state: { phase?: string; result?: { winner?: number | null } };
     try {
@@ -781,6 +843,9 @@ export async function recordMatch(
       throw new GameStoreError("PVP_ALREADY_SETTLED", "该联机对局已经结算过。", 409);
     }
   }
+  if (input.mode === "ai" && !input.aiProof) {
+    throw new GameStoreError("AI_PROOF_REQUIRED", "AI 对局缺少服务端重放凭证。", 400);
+  }
   const matchId = `match-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 20)}`;
   const matchCreatedAt = new Date().toISOString();
 
@@ -795,16 +860,28 @@ export async function recordMatch(
       opponent: input.opponent,
       ...(input.pvpToken ? { pvpToken: input.pvpToken } : {}),
       ...(input.pvpPlayer === undefined ? {} : { pvpPlayer: input.pvpPlayer }),
+      ...(input.format ? { format: input.format } : {}),
+      ...(input.aiProof ? { aiProof: input.aiProof } : {}),
     },
     (current) => {
+      if (input.mode === "ai") {
+        const verifiedResult = verifyAiMatchProof(current, input.aiProof as AiMatchProof);
+        if (verifiedResult !== input.result) {
+          throw new GameStoreError("AI_RESULT_MISMATCH", "对局结果与服务端重放结果不一致。", 409);
+        }
+      }
       const aiRewardEligible = input.mode !== "ai" || current.taskCycle.aiRewardsToday < DAILY_AI_REWARD_LIMIT;
       const rewardGold = aiRewardEligible
         ? input.result === "win" ? WIN_REWARD_GOLD : LOSS_REWARD_GOLD
         : 0;
+      const matchFormat: MatchFormat | undefined = input.mode === "pvp"
+        ? (input.format ?? verifiedFormat)
+        : undefined;
       const match: MatchRecord = {
         id: matchId,
         result: input.result,
         mode: input.mode,
+        ...(matchFormat ? { format: matchFormat } : {}),
         opponent: input.opponent,
         rewardGold,
         ...(input.pvpToken ? { pvpToken: input.pvpToken } : {}),
@@ -829,7 +906,7 @@ export async function recordMatch(
             ? Math.min(DAILY_AI_REWARD_LIMIT, current.taskCycle.aiRewardsToday + 1)
             : current.taskCycle.aiRewardsToday,
         },
-        ladder: input.mode === "pvp" ? updateLadder(current.ladder, input.result) : current.ladder,
+        ladder: input.mode === "pvp" && matchFormat === "ranked" ? updateLadder(current.ladder, input.result) : current.ladder,
       };
       return {
         nextState,
@@ -953,8 +1030,8 @@ async function commitMutation<T extends Record<string, unknown>>(
         db
           .prepare(
             `INSERT INTO match_records
-               (id, player_id, idempotency_key, pvp_token, result, mode, opponent, reward_gold, created_at)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+               (id, player_id, idempotency_key, pvp_token, result, mode, opponent, reward_gold, format, created_at)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              WHERE EXISTS (
                SELECT 1 FROM audit_events WHERE id = ?
              )`,
@@ -968,6 +1045,7 @@ async function commitMutation<T extends Record<string, unknown>>(
             match.mode,
             match.opponent,
             match.rewardGold,
+            match.format ?? null,
             match.createdAt,
             auditId,
           ),
@@ -1158,6 +1236,7 @@ async function loadPublicPlayer(
     .prepare(
       `SELECT id, result, mode, opponent, reward_gold AS rewardGold,
               pvp_token AS pvpToken,
+              format,
               created_at AS createdAt
        FROM match_records
        WHERE player_id = ?
@@ -1173,7 +1252,10 @@ async function loadPublicPlayer(
     displayName: player.displayName,
     ...cloneState(stored),
     recentMatches: matchResult.results.map((match) => {
-      const safeMatch = { ...match };
+      const safeMatch: MatchRecord = {
+        ...match,
+        format: match.format === "casual" ? "casual" : "ranked",
+      };
       delete safeMatch.pvpToken;
       return safeMatch;
     }),
@@ -1263,6 +1345,7 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
         mode TEXT NOT NULL CHECK (mode IN ('ai', 'pvp')),
         opponent TEXT NOT NULL,
         reward_gold INTEGER NOT NULL,
+        format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`,
     ),
@@ -1339,6 +1422,11 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
   ).run();
   try {
     await db.prepare("ALTER TABLE match_records ADD COLUMN pvp_token TEXT").run();
+  } catch {
+    // Column already exists on new installations or a previous migration.
+  }
+  try {
+    await db.prepare("ALTER TABLE match_records ADD COLUMN format TEXT NOT NULL DEFAULT 'ranked'").run();
   } catch {
     // Column already exists on new installations or a previous migration.
   }
@@ -1429,10 +1517,11 @@ function createDefaultState(now: string): StoredPlayerState {
       dailyRerollsRemaining: DAILY_REROLL_LIMIT,
       packsBoughtToday: 0,
       aiRewardsToday: 0,
+      weeklyFreePackClaimed: false,
     },
     progression: { xp: 0, level: 1 },
     rewardTrack: { claimedLevels: [] },
-    ladder: { rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0 },
+    ladder: { seasonKey: utcSeasonKey(now), rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0, highestRating: 1000 },
     stats: {
       wins: 0,
       losses: 0,
@@ -1489,8 +1578,9 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
         aiRewardsToday: isFiniteNonNegativeInteger(value.taskCycle.aiRewardsToday)
           ? Math.min(value.taskCycle.aiRewardsToday, DAILY_AI_REWARD_LIMIT)
           : 0,
+        weeklyFreePackClaimed: value.taskCycle.weeklyFreePackClaimed === true,
       }
-    : { dayKey: "", weekKey: "", dailyRerollsRemaining: DAILY_REROLL_LIMIT, packsBoughtToday: 0, aiRewardsToday: 0 };
+    : { dayKey: "", weekKey: "", dailyRerollsRemaining: DAILY_REROLL_LIMIT, packsBoughtToday: 0, aiRewardsToday: 0, weeklyFreePackClaimed: false };
   const legacyMatches = isRecord(value.stats) && isFiniteNonNegativeInteger(value.stats.matchesPlayed)
     ? value.stats.matchesPlayed
     : 0;
@@ -1514,13 +1604,17 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
     : { claimedLevels: [] };
   const ladder = isRecord(value.ladder)
     ? {
+        seasonKey: typeof value.ladder.seasonKey === "string" ? value.ladder.seasonKey : utcSeasonKey(new Date().toISOString()),
         rating: isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : 1000,
         tier: typeof value.ladder.tier === "string" ? value.ladder.tier : "青铜",
         stars: isFiniteNonNegativeInteger(value.ladder.stars) ? value.ladder.stars : 0,
         wins: isFiniteNonNegativeInteger(value.ladder.wins) ? value.ladder.wins : 0,
         losses: isFiniteNonNegativeInteger(value.ladder.losses) ? value.ladder.losses : 0,
+        highestRating: isFiniteNonNegativeInteger(value.ladder.highestRating)
+          ? value.ladder.highestRating
+          : (isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : 1000),
       }
-    : { rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0 };
+    : { seasonKey: utcSeasonKey(new Date().toISOString()), rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0, highestRating: 1000 };
   return { ...value, tasks, taskCycle, progression, rewardTrack, ladder } as StoredPlayerState;
 }
 
@@ -1565,6 +1659,7 @@ function isTaskCycle(value: unknown): value is TaskCycle {
     isFiniteNonNegativeInteger(value.dailyRerollsRemaining) &&
     isFiniteNonNegativeInteger(value.packsBoughtToday) &&
     isFiniteNonNegativeInteger(value.aiRewardsToday) &&
+    typeof value.weeklyFreePackClaimed === "boolean" &&
     value.aiRewardsToday <= DAILY_AI_REWARD_LIMIT
   );
 }
@@ -1580,11 +1675,13 @@ function isRewardTrack(value: unknown): value is RewardTrackState {
 function isLadder(value: unknown): value is PlayerLadder {
   return (
     isRecord(value) &&
+    typeof value.seasonKey === "string" &&
     isFiniteNonNegativeInteger(value.rating) &&
     typeof value.tier === "string" &&
     isFiniteNonNegativeInteger(value.stars) &&
     isFiniteNonNegativeInteger(value.wins) &&
-    isFiniteNonNegativeInteger(value.losses)
+    isFiniteNonNegativeInteger(value.losses) &&
+    isFiniteNonNegativeInteger(value.highestRating)
   );
 }
 
@@ -1669,11 +1766,13 @@ function updateLadder(ladder: PlayerLadder, result: MatchResult): PlayerLadder {
   const rating = Math.max(0, ladder.rating + (result === "win" ? 25 : -20));
   const tier = rating >= 1800 ? "传说" : rating >= 1600 ? "钻石" : rating >= 1400 ? "白金" : rating >= 1200 ? "黄金" : rating >= 1000 ? "白银" : "青铜";
   return {
+    seasonKey: ladder.seasonKey,
     rating,
     tier,
     stars: Math.floor((rating % 200) / 50),
     wins: ladder.wins + (result === "win" ? 1 : 0),
     losses: ladder.losses + (result === "loss" ? 1 : 0),
+    highestRating: Math.max(ladder.highestRating, rating),
   };
 }
 
@@ -1703,10 +1802,12 @@ function advanceTasksMatching(
 function refreshTaskCycle(state: StoredPlayerState, now: string): StoredPlayerState {
   const dayKey = utcDayKey(now);
   const weekKey = utcWeekKey(now);
+  const seasonKey = utcSeasonKey(now);
   const firstLoad = !state.taskCycle.dayKey || !state.taskCycle.weekKey;
   const dayChanged = !firstLoad && state.taskCycle.dayKey !== dayKey;
   const weekChanged = !firstLoad && state.taskCycle.weekKey !== weekKey;
-  if (!dayChanged && !weekChanged && !firstLoad) return state;
+  const seasonChanged = state.ladder.seasonKey !== seasonKey;
+  if (!dayChanged && !weekChanged && !seasonChanged && !firstLoad) return state;
 
   let tasks = state.tasks.map(cloneTask);
   if (dayChanged || firstLoad) {
@@ -1726,7 +1827,11 @@ function refreshTaskCycle(state: StoredPlayerState, now: string): StoredPlayerSt
       dailyRerollsRemaining: dayChanged || firstLoad ? DAILY_REROLL_LIMIT : state.taskCycle.dailyRerollsRemaining,
       packsBoughtToday: dayChanged || firstLoad ? 0 : state.taskCycle.packsBoughtToday,
       aiRewardsToday: dayChanged || firstLoad ? 0 : state.taskCycle.aiRewardsToday,
+      weeklyFreePackClaimed: weekChanged || firstLoad ? false : state.taskCycle.weeklyFreePackClaimed,
     },
+    ladder: seasonChanged || firstLoad
+      ? { ...state.ladder, seasonKey, rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0 }
+      : state.ladder,
   };
 }
 
@@ -1805,6 +1910,10 @@ function utcWeekKey(value: string): string {
   return date.toISOString().slice(0, 10);
 }
 
+function utcSeasonKey(value: string): string {
+  return value.slice(0, 7);
+}
+
 async function refreshPlayerCycle(db: D1DatabaseLike, player: PlayerRow): Promise<void> {
   for (let attempt = 0; attempt < MAX_MUTATION_ATTEMPTS; attempt += 1) {
     const row = await loadStateRow(db, player.id);
@@ -1847,6 +1956,61 @@ function assertCardsOwned(
       missing,
     );
   }
+}
+
+function verifyAiMatchProof(
+  current: StoredPlayerState,
+  proof: AiMatchProof,
+): MatchResult {
+  if (
+    !Number.isSafeInteger(proof.seed) ||
+    proof.seed < 0 ||
+    !Array.isArray(proof.playerDeck) ||
+    proof.playerDeck.length !== 30 ||
+    !Array.isArray(proof.commands) ||
+    proof.commands.length === 0 ||
+    proof.commands.length > 400 ||
+    (proof.startingPlayer !== 0 && proof.startingPlayer !== 1)
+  ) {
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局重放凭证格式无效。", 409);
+  }
+  const archetype = AI_ARCHETYPES.find((candidate) => candidate.id === proof.opponentArchetypeId);
+  if (!archetype) {
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对手原型不存在。", 409);
+  }
+  const deckValidation = validateDeck(proof.playerDeck);
+  if (!deckValidation.valid) {
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局使用了无效玩家卡组。", 409, deckValidation.errors);
+  }
+  assertCardsOwned(proof.playerDeck, current.collection);
+  const savedDeckMatches = current.decks.some(
+    (deck) => deck.cardIds.length === proof.playerDeck.length && deck.cardIds.every((cardId, index) => cardId === proof.playerDeck[index]),
+  );
+  if (!savedDeckMatches) {
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局卡组不是当前账号已保存卡组。", 409);
+  }
+
+  let state = createMatch({
+    seed: proof.seed,
+    startingPlayer: proof.startingPlayer,
+    decks: [proof.playerDeck, [...archetype.deck]],
+  });
+  const commandIds = new Set<string>();
+  for (const command of proof.commands) {
+    if (!isRecord(command) || (typeof command.commandId === "string" && commandIds.has(command.commandId))) {
+      throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令序列包含重复或无效命令。", 409);
+    }
+    if (typeof command.commandId === "string") commandIds.add(command.commandId);
+    const result = applyCommand(state, command);
+    if (!result.accepted) {
+      throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令无法通过服务端规则重放。", 409, result.error);
+    }
+    state = result.state;
+  }
+  if (state.phase !== "game-over" || state.result?.winner === null || state.result?.winner === undefined) {
+    throw new GameStoreError("AI_PROOF_INCOMPLETE", "AI 对局尚未完成，不能结算奖励。", 409);
+  }
+  return state.result.winner === 0 ? "win" : "loss";
 }
 
 async function stableId(value: string): Promise<string> {

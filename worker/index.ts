@@ -51,6 +51,7 @@ type PvpPeer = {
 };
 type PvpRoom = {
   code: string;
+  format: "ranked" | "casual";
   peers: PvpPeer[];
   nextSequence: number;
   readyDecks: Map<string, string[]>;
@@ -71,9 +72,9 @@ type PvpDbSession = {
   room_code: string | null;
   updated_at: number;
 };
-type PvpDbRoom = { code: string; host_client_id: string; guest_client_id: string | null; next_sequence: number };
+type PvpDbRoom = { code: string; host_client_id: string; guest_client_id: string | null; next_sequence: number; format: "ranked" | "casual" };
 type PvpDbReady = { client_id: string; room_code: string; deck_json: string; updated_at: number };
-type PvpDbMatch = { room_code: string; match_token: string; state_json: string; created_at: number; updated_at: number };
+type PvpDbMatch = { room_code: string; match_token: string; state_json: string; format: "ranked" | "casual"; created_at: number; updated_at: number };
 
 const PVP_SESSION_TTL_MS = 30 * 60 * 1000;
 const PVP_MAX_BODY_BYTES = 32 * 1024;
@@ -214,6 +215,7 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         code TEXT PRIMARY KEY NOT NULL,
         host_client_id TEXT NOT NULL,
         guest_client_id TEXT,
+        format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
         next_sequence INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -236,6 +238,7 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         room_code TEXT PRIMARY KEY NOT NULL,
         match_token TEXT NOT NULL,
         state_json TEXT NOT NULL,
+        format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )`),
@@ -251,7 +254,12 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         created_at INTEGER NOT NULL
       )`),
       db.prepare(`CREATE INDEX IF NOT EXISTS pvp_match_participants_created_idx ON pvp_match_participants (created_at)`),
-    ]).then(() => undefined).catch((error) => {
+    ]).then(async () => {
+      // Existing D1 rooms/matches predate the format split. Migrations are
+      // intentionally idempotent so rolling deploys keep old rooms playable.
+      try { await db.prepare(`ALTER TABLE pvp_rooms ADD COLUMN format TEXT NOT NULL DEFAULT 'ranked'`).run(); } catch { /* already present */ }
+      try { await db.prepare(`ALTER TABLE pvp_matches ADD COLUMN format TEXT NOT NULL DEFAULT 'ranked'`).run(); } catch { /* already present */ }
+    }).catch((error) => {
       pvpSchemaReady = null;
       throw error;
     });
@@ -287,7 +295,7 @@ async function getPvpDbIdentity(db: PvpDatabase, clientId: string): Promise<stri
 }
 
 async function getPvpDbRoom(db: PvpDatabase, code: string): Promise<PvpDbRoom | null> {
-  return db.prepare(`SELECT code, host_client_id, guest_client_id, next_sequence FROM pvp_rooms WHERE code = ?`)
+  return db.prepare(`SELECT code, host_client_id, guest_client_id, next_sequence, COALESCE(format, 'ranked') AS format FROM pvp_rooms WHERE code = ?`)
     .bind(code).first<PvpDbRoom>();
 }
 
@@ -297,7 +305,7 @@ async function getPvpDbReady(db: PvpDatabase, clientId: string): Promise<PvpDbRe
 }
 
 async function getPvpDbMatch(db: PvpDatabase, roomCode: string): Promise<PvpDbMatch | null> {
-  return db.prepare(`SELECT room_code, match_token, state_json, created_at, updated_at FROM pvp_matches WHERE room_code = ?`)
+  return db.prepare(`SELECT room_code, match_token, state_json, COALESCE(format, 'ranked') AS format, created_at, updated_at FROM pvp_matches WHERE room_code = ?`)
     .bind(roomCode).first<PvpDbMatch>();
 }
 
@@ -325,6 +333,10 @@ function parsePvpDeck(value: unknown): string[] | null {
   return validateDeck(deck).valid ? deck : null;
 }
 
+function parsePvpFormat(value: unknown): "ranked" | "casual" {
+  return value === "casual" ? "casual" : "ranked";
+}
+
 function parsePvpState(value: string): MatchState | null {
   try {
     const parsed = JSON.parse(value) as MatchState;
@@ -347,7 +359,7 @@ async function dbRoomPlayers(db: PvpDatabase, room: PvpDbRoom): Promise<Array<{ 
 
 async function dbRoomState(db: PvpDatabase, room: PvpDbRoom): Promise<void> {
   const players = await dbRoomPlayers(db, room);
-  const payload = { type: "room_state", room: room.code, payload: { players } };
+  const payload = { type: "room_state", room: room.code, format: room.format, payload: { players, format: room.format } };
   await Promise.all([room.host_client_id, room.guest_client_id].filter(Boolean).map((clientId) => queuePvpDbMessage(db, clientId as string, payload)));
 }
 
@@ -375,6 +387,7 @@ async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise
   await queuePvpDbMessage(db, session.client_id, {
     type: isHost ? "room_created" : "room_joined",
     room: room.code,
+    format: room.format,
     message: "已恢复房间连接，请双方重新准备。",
   });
   const peerId = isHost ? room.guest_client_id : room.host_client_id;
@@ -392,7 +405,7 @@ async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise
     await queuePvpDbMessage(db, session.client_id, {
       type: "match_sync",
       room: room.code,
-      payload: { state: redactPvpStateForViewer(matchState, viewer), matchToken: match.match_token },
+      payload: { state: redactPvpStateForViewer(matchState, viewer), matchToken: match.match_token, format: room.format },
     });
   }
 }
@@ -432,7 +445,7 @@ async function dbLeaveRoom(db: PvpDatabase, session: PvpDbSession): Promise<void
   }
 }
 
-async function dbCreateRoom(db: PvpDatabase, session: PvpDbSession): Promise<void> {
+async function dbCreateRoom(db: PvpDatabase, session: PvpDbSession, format: "ranked" | "casual"): Promise<void> {
   await dbLeaveRoom(db, session);
   let code = "";
   for (let attempt = 0; attempt < 12; attempt += 1) {
@@ -440,11 +453,11 @@ async function dbCreateRoom(db: PvpDatabase, session: PvpDbSession): Promise<voi
     if (!(await getPvpDbRoom(db, code))) break;
   }
   const now = Date.now();
-  await db.prepare(`INSERT INTO pvp_rooms (code, host_client_id, guest_client_id, next_sequence, created_at, updated_at) VALUES (?, ?, NULL, 0, ?, ?)`)
-    .bind(code, session.client_id, now, now).run();
+  await db.prepare(`INSERT INTO pvp_rooms (code, host_client_id, guest_client_id, next_sequence, format, created_at, updated_at) VALUES (?, ?, NULL, 0, ?, ?, ?)`)
+    .bind(code, session.client_id, format, now, now).run();
   await db.prepare(`UPDATE pvp_sessions SET room_code = ?, updated_at = ? WHERE client_id = ?`)
     .bind(code, now, session.client_id).run();
-  await queuePvpDbMessage(db, session.client_id, { type: "room_created", room: code, message: "房间已创建，等待对手加入" });
+  await queuePvpDbMessage(db, session.client_id, { type: "room_created", room: code, format, message: "房间已创建，等待对手加入" });
   const room = await getPvpDbRoom(db, code);
   if (room) await dbRoomState(db, room);
 }
@@ -466,7 +479,7 @@ async function dbJoinRoom(db: PvpDatabase, session: PvpDbSession, code: string):
   const updated = await getPvpDbRoom(db, code);
   if (!updated || updated.guest_client_id !== session.client_id) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "房间刚刚被其他玩家加入" });
   await db.prepare(`UPDATE pvp_sessions SET room_code = ?, updated_at = ? WHERE client_id = ?`).bind(code, now, session.client_id).run();
-  await queuePvpDbMessage(db, session.client_id, { type: "room_joined", room: code, message: "已加入房间" });
+  await queuePvpDbMessage(db, session.client_id, { type: "room_joined", room: code, format: updated.format, message: "已加入房间" });
   const host = await getPvpDbSession(db, updated.host_client_id);
   await queuePvpDbMessage(db, updated.host_client_id, { type: "peer_joined", peerName: session.name, playerId: session.player_id, message: `${session.name} 已加入房间` });
   if (host) {
@@ -595,9 +608,9 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     const now = Date.now();
     const hostIdentity = await getPvpDbIdentity(db, room.host_client_id);
     const guestIdentity = await getPvpDbIdentity(db, room.guest_client_id);
-    await db.prepare(`INSERT INTO pvp_matches (room_code, match_token, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(room_code) DO UPDATE SET match_token = excluded.match_token, state_json = excluded.state_json, updated_at = excluded.updated_at`)
-      .bind(room.code, matchToken, JSON.stringify(state), now, now).run();
+    await db.prepare(`INSERT INTO pvp_matches (room_code, match_token, state_json, format, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(room_code) DO UPDATE SET match_token = excluded.match_token, state_json = excluded.state_json, format = excluded.format, updated_at = excluded.updated_at`)
+      .bind(room.code, matchToken, JSON.stringify(state), room.format, now, now).run();
     await db.prepare(`INSERT INTO pvp_match_participants (match_token, room_code, host_identity, guest_identity, created_at)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(match_token) DO UPDATE SET room_code = excluded.room_code, host_identity = excluded.host_identity,
@@ -607,6 +620,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     const startPayload = (viewer: 0 | 1) => ({
       seed,
       startingPlayer,
+      format: room.format,
       // The client only needs its own deck to open the pre-sync mulligan
       // screen. The authoritative snapshot follows through command sync.
       deck: viewer === 0 ? hostDeck : guestDeck,
@@ -721,7 +735,7 @@ async function handlePvpDbMessage(db: PvpDatabase, session: PvpDbSession, messag
       await db.prepare(`UPDATE pvp_sessions SET name = ?, updated_at = ? WHERE client_id = ?`).bind(name || "旅者", Date.now(), session.client_id).run();
       break;
     }
-    case "create_room": await dbCreateRoom(db, session); break;
+    case "create_room": await dbCreateRoom(db, session, parsePvpFormat(message.format)); break;
     case "join_room": await dbJoinRoom(db, session, typeof message.room === "string" ? message.room.trim().toUpperCase() : ""); break;
     case "action": await dbRelayAction(db, session, message); break;
     case "sync": await dbRestoreSession(db, session); break;
@@ -752,7 +766,8 @@ function pvpRoomState(room: PvpRoom): void {
   room.peers.forEach((peer) => pvpJson(peer, {
     type: "room_state",
     room: room.code,
-    payload: { players },
+    format: room.format,
+    payload: { players, format: room.format },
   }));
 }
 
@@ -788,7 +803,7 @@ function leavePvpPeer(peer: PvpPeer): void {
   leavePvpRoom(peer);
 }
 
-function createPvpRoom(peer: PvpPeer): void {
+function createPvpRoom(peer: PvpPeer, format: "ranked" | "casual"): void {
   leavePvpRoom(peer);
   let code = "";
   do {
@@ -796,13 +811,14 @@ function createPvpRoom(peer: PvpPeer): void {
   } while (pvpRooms.has(code));
   const room: PvpRoom = {
     code,
+    format,
     peers: [peer],
     nextSequence: 0,
     readyDecks: new Map(),
   };
   pvpRooms.set(code, room);
   peer.room = code;
-  pvpJson(peer, { type: "room_created", room: code, message: "房间已创建，等待对手加入" });
+  pvpJson(peer, { type: "room_created", room: code, format, message: "房间已创建，等待对手加入" });
   pvpRoomState(room);
 }
 
@@ -813,7 +829,7 @@ function joinPvpRoom(peer: PvpPeer, code: string): void {
   leavePvpRoom(peer);
   room.peers.push(peer);
   peer.room = room.code;
-  pvpJson(peer, { type: "room_joined", room: room.code, message: "已加入房间" });
+  pvpJson(peer, { type: "room_joined", room: room.code, format: room.format, message: "已加入房间" });
   const recipients = room.peers.filter((other) => other !== peer);
   recipients.forEach((other) => pvpJson(other, {
     type: "peer_joined",
@@ -925,6 +941,7 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
       payload: {
         seed,
         startingPlayer,
+        format: room.format,
         deck: index === 0 ? hostDeck : guestDeck,
         matchToken: room.matchToken,
       },
@@ -1015,7 +1032,7 @@ function handlePvpMessage(peer: PvpPeer, raw: unknown): void {
       break;
     }
     case "create_room":
-      createPvpRoom(peer);
+      createPvpRoom(peer, parsePvpFormat(message.format));
       break;
     case "join_room":
       joinPvpRoom(peer, typeof message.room === "string" ? message.room.trim().toUpperCase() : "");
@@ -1035,6 +1052,7 @@ function handlePvpMessage(peer: PvpPeer, raw: unknown): void {
             payload: {
               state: redactPvpStateForViewer(room.matchState, viewer),
               matchToken: room.matchToken,
+              format: room.format,
             },
           });
         }

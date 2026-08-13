@@ -2,6 +2,7 @@ import { getChatGPTUser } from "../../chatgpt-auth";
 import {
   claimTask,
   claimReward,
+  claimWeeklyPack,
   buyPack,
   craftCard,
   disenchantCard,
@@ -14,7 +15,9 @@ import {
   resetDemoPlayer,
   saveDeck,
   type GameIdentity,
+  type AiMatchProof,
   type MatchMode,
+  type MatchFormat,
   type MatchResult,
 } from "../../../db/game-store";
 
@@ -52,6 +55,10 @@ type GameAction =
       idempotencyKey: string;
     }
   | {
+      action: "claim_weekly_pack";
+      idempotencyKey: string;
+    }
+  | {
       action: "buy_pack";
       idempotencyKey: string;
     }
@@ -78,6 +85,8 @@ type GameAction =
       opponent: string;
       pvpToken?: string;
       pvpPlayer?: 0 | 1;
+      format?: MatchFormat;
+      aiProof?: AiMatchProof;
     }
   | {
       action: "reset_demo";
@@ -148,6 +157,15 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           openedCards: result.openedCards,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "claim_weekly_pack": {
+        const result = await claimWeeklyPack(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -389,6 +407,12 @@ function parseAction(value: unknown): GameAction {
         action: "open_pack",
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
       };
+    case "claim_weekly_pack":
+      assertExactKeys(value, ["action", "idempotencyKey"]);
+      return {
+        action: "claim_weekly_pack",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+      };
     case "buy_pack":
       assertExactKeys(value, ["action", "idempotencyKey"]);
       return {
@@ -412,7 +436,7 @@ function parseAction(value: unknown): GameAction {
       };
     case "claim_reward":
       assertExactKeys(value, ["action", "idempotencyKey", "level"]);
-      if (!Number.isSafeInteger(value.level) || value.level < 1 || value.level > 100) {
+      if (typeof value.level !== "number" || !Number.isSafeInteger(value.level) || value.level < 1 || value.level > 100) {
         throw new PayloadError("level 必须是 1–100 的整数。");
       }
       return {
@@ -427,7 +451,7 @@ function parseAction(value: unknown): GameAction {
         "result",
         "mode",
         "opponent",
-      ], ["action", "idempotencyKey", "result", "mode", "opponent", "pvpToken", "pvpPlayer"]);
+      ], ["action", "idempotencyKey", "result", "mode", "opponent", "pvpToken", "pvpPlayer", "format", "aiProof"]);
       if (value.result !== "win" && value.result !== "loss") {
         throw new PayloadError("result 必须是 win 或 loss。");
       }
@@ -442,8 +466,17 @@ function parseAction(value: unknown): GameAction {
         : value.pvpPlayer === 0 || value.pvpPlayer === 1
           ? value.pvpPlayer
           : (() => { throw new PayloadError("pvpPlayer 必须是 0 或 1。"); })();
+      const format = value.format === undefined
+        ? undefined
+        : value.format === "ranked" || value.format === "casual"
+          ? value.format
+          : (() => { throw new PayloadError("format 必须是 ranked 或 casual。"); })();
       if (value.mode === "pvp" && (!pvpToken || pvpPlayer === undefined)) {
         throw new PayloadError("PVP 对局必须携带服务器对局凭证。");
+      }
+      const aiProof = value.aiProof === undefined ? undefined : parseAiMatchProof(value.aiProof);
+      if (value.mode === "ai" && !aiProof) {
+        throw new PayloadError("AI 对局必须携带服务端重放凭证。");
       }
       return {
         action: "record_match",
@@ -453,6 +486,8 @@ function parseAction(value: unknown): GameAction {
         opponent: parseTrimmedString(value.opponent, "opponent", 1, 40),
         ...(pvpToken ? { pvpToken } : {}),
         ...(pvpPlayer === undefined ? {} : { pvpPlayer }),
+        ...(format ? { format } : {}),
+        ...(aiProof ? { aiProof } : {}),
       };
     case "reset_demo":
       assertExactKeys(value, ["action"]);
@@ -475,6 +510,40 @@ function parseIdempotencyKey(value: unknown): string {
     );
   }
   return value;
+}
+
+function parseAiMatchProof(value: unknown): AiMatchProof {
+  if (!isRecord(value)) throw new PayloadError("aiProof 必须是对象。");
+  assertExactKeys(value, ["seed", "startingPlayer", "playerDeck", "opponentArchetypeId", "commands"]);
+  if (typeof value.seed !== "number" || !Number.isSafeInteger(value.seed) || value.seed < 0 || value.seed > 0x7fffffff) {
+    throw new PayloadError("aiProof.seed 必须是合法整数。");
+  }
+  if (value.startingPlayer !== 0 && value.startingPlayer !== 1) {
+    throw new PayloadError("aiProof.startingPlayer 必须是 0 或 1。");
+  }
+  const playerDeck = parseCardIds(value.playerDeck);
+  const opponentArchetypeId = parseIdentifier(value.opponentArchetypeId, "aiProof.opponentArchetypeId");
+  if (!Array.isArray(value.commands) || value.commands.length < 1 || value.commands.length > 400) {
+    throw new PayloadError("aiProof.commands 必须包含 1–400 条命令。");
+  }
+  const allowedTypes = new Set([
+    "mulligan", "play-card", "trade-card", "attack", "hero-attack",
+    "choose-discover", "choose-one", "hero-power", "use-coin", "end-turn", "concede",
+  ]);
+  const commands = value.commands.map((raw, index) => {
+    if (!isRecord(raw) || typeof raw.type !== "string" || !allowedTypes.has(raw.type)) {
+      throw new PayloadError(`aiProof.commands[${index}] 类型无效。`);
+    }
+    if (raw.player !== 0 && raw.player !== 1) {
+      throw new PayloadError(`aiProof.commands[${index}].player 无效。`);
+    }
+    if (raw.commandId !== undefined) parseIdempotencyKey(raw.commandId);
+    if (raw.expectedVersion !== undefined && (typeof raw.expectedVersion !== "number" || !Number.isSafeInteger(raw.expectedVersion) || raw.expectedVersion < 0)) {
+      throw new PayloadError(`aiProof.commands[${index}].expectedVersion 无效。`);
+    }
+    return raw;
+  }) as unknown as AiMatchProof["commands"];
+  return { seed: value.seed, startingPlayer: value.startingPlayer, playerDeck, opponentArchetypeId, commands };
 }
 
 function parseIdentifier(value: unknown, field: string): string {
