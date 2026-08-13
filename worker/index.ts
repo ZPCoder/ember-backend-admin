@@ -63,6 +63,7 @@ type PvpRoom = {
 const pvpRooms = new Map<string, PvpRoom>();
 const pvpPeers = new Map<WebSocket, PvpPeer>();
 const pvpPollSessions = new Map<string, PvpPeer>();
+const pvpQueues = new Map<"ranked" | "casual", PvpPeer[]>();
 const pvpAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 
 type PvpDbSession = {
@@ -75,6 +76,7 @@ type PvpDbSession = {
 type PvpDbRoom = { code: string; host_client_id: string; guest_client_id: string | null; next_sequence: number; format: "ranked" | "casual" };
 type PvpDbReady = { client_id: string; room_code: string; deck_json: string; updated_at: number };
 type PvpDbMatch = { room_code: string; match_token: string; state_json: string; format: "ranked" | "casual"; created_at: number; updated_at: number };
+type PvpDbQueue = { client_id: string; player_id: string; name: string; format: "ranked" | "casual"; joined_at: number; updated_at: number };
 
 const PVP_SESSION_TTL_MS = 30 * 60 * 1000;
 const PVP_MAX_BODY_BYTES = 32 * 1024;
@@ -254,6 +256,15 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         created_at INTEGER NOT NULL
       )`),
       db.prepare(`CREATE INDEX IF NOT EXISTS pvp_match_participants_created_idx ON pvp_match_participants (created_at)`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS pvp_queue (
+        client_id TEXT PRIMARY KEY NOT NULL,
+        player_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        format TEXT NOT NULL CHECK (format IN ('ranked', 'casual')),
+        joined_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS pvp_queue_format_joined_idx ON pvp_queue (format, joined_at)`),
     ]).then(async () => {
       // Existing D1 rooms/matches predate the format split. Migrations are
       // intentionally idempotent so rolling deploys keep old rooms playable.
@@ -309,6 +320,15 @@ async function getPvpDbMatch(db: PvpDatabase, roomCode: string): Promise<PvpDbMa
     .bind(roomCode).first<PvpDbMatch>();
 }
 
+async function getPvpDbQueue(db: PvpDatabase, clientId: string): Promise<PvpDbQueue | null> {
+  return db.prepare(`SELECT client_id, player_id, name, format, joined_at, updated_at FROM pvp_queue WHERE client_id = ?`)
+    .bind(clientId).first<PvpDbQueue>();
+}
+
+async function dbLeaveQueue(db: PvpDatabase, session: PvpDbSession): Promise<void> {
+  await db.prepare(`DELETE FROM pvp_queue WHERE client_id = ?`).bind(session.client_id).run();
+}
+
 async function prunePvpDb(db: PvpDatabase): Promise<void> {
   const cutoff = Date.now() - PVP_SESSION_TTL_MS;
   const stale = await db.prepare(`SELECT client_id, player_id, name, room_code, updated_at FROM pvp_sessions WHERE updated_at < ? LIMIT 50`)
@@ -324,6 +344,7 @@ async function prunePvpDb(db: PvpDatabase): Promise<void> {
     db.prepare(`DELETE FROM pvp_ready WHERE updated_at < ?`).bind(cutoff),
     db.prepare(`DELETE FROM pvp_matches WHERE updated_at < ?`).bind(cutoff),
     db.prepare(`DELETE FROM pvp_match_participants WHERE created_at < ?`).bind(cutoff),
+    db.prepare(`DELETE FROM pvp_queue WHERE updated_at < ?`).bind(cutoff),
   ]);
 }
 
@@ -376,7 +397,11 @@ async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise
   const now = Date.now();
   await db.prepare(`DELETE FROM pvp_messages WHERE client_id = ?`).bind(session.client_id).run();
   await queuePvpDbMessage(db, session.client_id, { type: "welcome", playerId: session.player_id, message: "连接成功" });
-  if (!session.room_code) return;
+  if (!session.room_code) {
+    const queued = await getPvpDbQueue(db, session.client_id);
+    if (queued) await queuePvpDbMessage(db, session.client_id, { type: "queue_joined", format: queued.format, joinedAt: queued.joined_at, message: `${queued.format === "ranked" ? "天梯" : "休闲"}匹配中，正在寻找同模式对手…` });
+    return;
+  }
   const room = await getPvpDbRoom(db, session.room_code);
   if (!room) {
     await db.prepare(`UPDATE pvp_sessions SET room_code = NULL, updated_at = ? WHERE client_id = ?`)
@@ -446,6 +471,7 @@ async function dbLeaveRoom(db: PvpDatabase, session: PvpDbSession): Promise<void
 }
 
 async function dbCreateRoom(db: PvpDatabase, session: PvpDbSession, format: "ranked" | "casual"): Promise<void> {
+  await dbLeaveQueue(db, session);
   await dbLeaveRoom(db, session);
   let code = "";
   for (let attempt = 0; attempt < 12; attempt += 1) {
@@ -472,6 +498,7 @@ async function dbJoinRoom(db: PvpDatabase, session: PvpDbSession, code: string):
     return;
   }
   if (room.guest_client_id) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "房间已满" });
+  await dbLeaveQueue(db, session);
   await dbLeaveRoom(db, session);
   const now = Date.now();
   await db.prepare(`UPDATE pvp_rooms SET guest_client_id = ?, updated_at = ? WHERE code = ? AND guest_client_id IS NULL`)
@@ -492,6 +519,46 @@ async function dbJoinRoom(db: PvpDatabase, session: PvpDbSession, code: string):
   }
   if (host) await db.prepare(`UPDATE pvp_sessions SET updated_at = ? WHERE client_id = ?`).bind(now, host.client_id).run();
   await dbRoomState(db, updated);
+}
+
+async function dbJoinQueue(db: PvpDatabase, session: PvpDbSession, format: "ranked" | "casual"): Promise<void> {
+  await dbLeaveQueue(db, session);
+  await dbLeaveRoom(db, session);
+  const now = Date.now();
+  const cutoff = now - PVP_SESSION_TTL_MS;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const candidate = await db.prepare(`SELECT q.client_id, q.player_id, q.name, q.format, q.joined_at, q.updated_at
+      FROM pvp_queue q JOIN pvp_sessions s ON s.client_id = q.client_id
+      WHERE q.format = ? AND q.client_id <> ? AND q.player_id <> ? AND q.updated_at >= ? AND s.room_code IS NULL
+      ORDER BY q.joined_at ASC LIMIT 1`)
+      .bind(format, session.client_id, session.player_id, cutoff).first<PvpDbQueue>();
+    if (!candidate) break;
+    const removed = await db.prepare(`DELETE FROM pvp_queue WHERE client_id = ? AND updated_at = ?`)
+      .bind(candidate.client_id, candidate.updated_at).run();
+    if ((removed.meta?.changes ?? 0) !== 1) continue;
+    let code = "";
+    for (let codeAttempt = 0; codeAttempt < 12; codeAttempt += 1) {
+      code = Array.from({ length: 4 }, () => pvpAlphabet[Math.floor(Math.random() * pvpAlphabet.length)]).join("");
+      if (!(await getPvpDbRoom(db, code))) break;
+    }
+    await db.prepare(`INSERT INTO pvp_rooms (code, host_client_id, guest_client_id, next_sequence, format, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)`)
+      .bind(code, session.client_id, candidate.client_id, format, now, now).run();
+    await db.batch([
+      db.prepare(`UPDATE pvp_sessions SET room_code = ?, updated_at = ? WHERE client_id = ?`).bind(code, now, session.client_id),
+      db.prepare(`UPDATE pvp_sessions SET room_code = ?, updated_at = ? WHERE client_id = ?`).bind(code, now, candidate.client_id),
+    ]);
+    await queuePvpDbMessage(db, session.client_id, { type: "room_created", room: code, format, message: "已匹配到对手，房间已建立。" });
+    await queuePvpDbMessage(db, candidate.client_id, { type: "room_joined", room: code, format, message: "已匹配到对手，房间已建立。" });
+    await queuePvpDbMessage(db, session.client_id, { type: "peer_joined", peerName: candidate.name, playerId: candidate.player_id, message: `${candidate.name} 已加入房间` });
+    await queuePvpDbMessage(db, candidate.client_id, { type: "peer_joined", peerName: session.name, playerId: session.player_id, message: `${session.name} 已加入房间` });
+    const room = await getPvpDbRoom(db, code);
+    if (room) await dbRoomState(db, room);
+    return;
+  }
+  await db.prepare(`INSERT INTO pvp_queue (client_id, player_id, name, format, joined_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(client_id) DO UPDATE SET player_id = excluded.player_id, name = excluded.name, format = excluded.format, updated_at = excluded.updated_at`)
+    .bind(session.client_id, session.player_id, session.name, format, now, now).run();
+  await queuePvpDbMessage(db, session.client_id, { type: "queue_joined", format, joinedAt: now, message: `${format === "ranked" ? "天梯" : "休闲"}匹配中，正在寻找同模式对手…` });
 }
 
 async function nextPvpSequence(db: PvpDatabase, room: PvpDbRoom): Promise<number> {
@@ -737,6 +804,8 @@ async function handlePvpDbMessage(db: PvpDatabase, session: PvpDbSession, messag
     }
     case "create_room": await dbCreateRoom(db, session, parsePvpFormat(message.format)); break;
     case "join_room": await dbJoinRoom(db, session, typeof message.room === "string" ? message.room.trim().toUpperCase() : ""); break;
+    case "queue_join": await dbJoinQueue(db, session, parsePvpFormat(message.format)); break;
+    case "queue_leave": await dbLeaveQueue(db, session); await queuePvpDbMessage(db, session.client_id, { type: "queue_left", message: "已取消匹配。" }); break;
     case "action": await dbRelayAction(db, session, message); break;
     case "sync": await dbRestoreSession(db, session); break;
     case "leave_room": await dbLeaveRoom(db, session); break;
@@ -771,7 +840,16 @@ function pvpRoomState(room: PvpRoom): void {
   }));
 }
 
+function removeMemoryQueue(peer: PvpPeer): void {
+  for (const [format, peers] of pvpQueues) {
+    const remaining = peers.filter((candidate) => candidate !== peer);
+    if (remaining.length) pvpQueues.set(format, remaining);
+    else pvpQueues.delete(format);
+  }
+}
+
 function leavePvpRoom(peer: PvpPeer): void {
+  removeMemoryQueue(peer);
   const code = peer.room;
   if (!code) return;
   peer.room = null;
@@ -795,6 +873,41 @@ function leavePvpRoom(peer: PvpPeer): void {
     room.matchUpdatedAt = undefined;
     pvpRoomState(room);
   }
+}
+
+function queuePvpPeer(peer: PvpPeer, format: "ranked" | "casual"): void {
+  removeMemoryQueue(peer);
+  leavePvpRoom(peer);
+  const waiting = pvpQueues.get(format) ?? [];
+  const opponent = waiting.shift();
+  if (opponent && opponent !== peer) {
+    if (waiting.length) pvpQueues.set(format, waiting); else pvpQueues.delete(format);
+    const room: PvpRoom = {
+      code: "",
+      format,
+      peers: [opponent, peer],
+      nextSequence: 0,
+      readyDecks: new Map(),
+    };
+    let code = "";
+    do {
+      code = Array.from({ length: 4 }, () => pvpAlphabet[Math.floor(Math.random() * pvpAlphabet.length)]).join("");
+    } while (pvpRooms.has(code));
+    room.code = code;
+    pvpRooms.set(code, room);
+    opponent.room = code;
+    peer.room = code;
+    pvpJson(opponent, { type: "room_created", room: code, format, message: "已匹配到对手，房间已建立。" });
+    pvpJson(peer, { type: "room_joined", room: code, format, message: "已匹配到对手，房间已建立。" });
+    pvpJson(opponent, { type: "peer_joined", peerName: peer.name, playerId: peer.id, message: `${peer.name} 已加入房间` });
+    pvpJson(peer, { type: "peer_joined", peerName: opponent.name, playerId: opponent.id, message: `${opponent.name} 已加入房间` });
+    pvpRoomState(room);
+    return;
+  }
+  const next = waiting.filter((candidate) => candidate.id !== peer.id);
+  next.push(peer);
+  pvpQueues.set(format, next);
+  pvpJson(peer, { type: "queue_joined", format, joinedAt: Date.now(), message: `${format === "ranked" ? "天梯" : "休闲"}匹配中，正在寻找同模式对手…` });
 }
 
 function leavePvpPeer(peer: PvpPeer): void {
@@ -1037,6 +1150,13 @@ function handlePvpMessage(peer: PvpPeer, raw: unknown): void {
     case "join_room":
       joinPvpRoom(peer, typeof message.room === "string" ? message.room.trim().toUpperCase() : "");
       break;
+    case "queue_join":
+      queuePvpPeer(peer, parsePvpFormat(message.format));
+      break;
+    case "queue_leave":
+      removeMemoryQueue(peer);
+      pvpJson(peer, { type: "queue_left", message: "已取消匹配。" });
+      break;
     case "action":
       relayPvpAction(peer, message);
       break;
@@ -1187,7 +1307,10 @@ async function handlePvpPoll(request: Request, env: Env): Promise<Response> {
     if (request.method === "DELETE") {
       const clientId = url.searchParams.get("clientId") ?? "";
       const session = await getPvpDbSession(db, clientId);
-      if (session) await dbLeaveRoom(db, session);
+      if (session) {
+        await dbLeaveQueue(db, session);
+        await dbLeaveRoom(db, session);
+      }
       await db.prepare(`DELETE FROM pvp_messages WHERE client_id = ?`).bind(clientId).run();
       await db.prepare(`DELETE FROM pvp_session_identities WHERE client_id = ?`).bind(clientId).run();
       await db.prepare(`DELETE FROM pvp_sessions WHERE client_id = ?`).bind(clientId).run();

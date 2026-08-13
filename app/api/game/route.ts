@@ -4,6 +4,7 @@ import {
   claimReward,
   claimWeeklyPack,
   acceptFriendRequest,
+  blockPlayer,
   buyPack,
   craftCard,
   disenchantCard,
@@ -14,8 +15,11 @@ import {
   recordMatch,
   rerollTask,
   resetDemoPlayer,
+  reportPlayer,
   saveDeck,
+  sendChatMessage,
   sendFriendRequest,
+  unblockPlayer,
   updateProfile,
   type GameIdentity,
   type AiMatchProof,
@@ -106,6 +110,23 @@ type GameAction =
       action: "send_friend_request" | "accept_friend_request";
       idempotencyKey: string;
       friendId: string;
+    }
+  | {
+      action: "send_chat";
+      idempotencyKey: string;
+      friendId: string;
+      text: string;
+    }
+  | {
+      action: "block_player" | "unblock_player";
+      idempotencyKey: string;
+      targetId: string;
+    }
+  | {
+      action: "report_player";
+      idempotencyKey: string;
+      targetId: string;
+      reason: string;
     };
 
 class PayloadError extends Error {
@@ -259,6 +280,36 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           friendId: result.friendId,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "send_chat": {
+        const result = await sendChatMessage(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          message: result.message,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "block_player":
+      case "unblock_player":
+      case "report_player": {
+        const result = action.action === "block_player"
+          ? await blockPlayer(identity, { idempotencyKey: action.idempotencyKey, targetId: action.targetId })
+          : action.action === "unblock_player"
+            ? await unblockPlayer(identity, { idempotencyKey: action.idempotencyKey, targetId: action.targetId })
+            : await reportPlayer(identity, {
+              idempotencyKey: action.idempotencyKey,
+              targetId: action.targetId,
+              reason: action.reason,
+            });
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          targetId: result.targetId,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -545,6 +596,30 @@ function parseAction(value: unknown): GameAction {
         action: value.action,
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
         friendId: parseIdentifier(value.friendId, "friendId"),
+      };
+    case "send_chat":
+      assertExactKeys(value, ["action", "idempotencyKey", "friendId", "text"]);
+      return {
+        action: "send_chat",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        friendId: parseIdentifier(value.friendId, "friendId"),
+        text: parseTrimmedString(value.text, "text", 1, 240),
+      };
+    case "block_player":
+    case "unblock_player":
+      assertExactKeys(value, ["action", "idempotencyKey", "targetId"]);
+      return {
+        action: value.action,
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        targetId: parseIdentifier(value.targetId, "targetId"),
+      };
+    case "report_player":
+      assertExactKeys(value, ["action", "idempotencyKey", "targetId", "reason"]);
+      return {
+        action: "report_player",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        targetId: parseIdentifier(value.targetId, "targetId"),
+        reason: parseTrimmedString(value.reason, "reason", 2, 200),
       };
     default:
       throw new PayloadError("不支持的 action。");

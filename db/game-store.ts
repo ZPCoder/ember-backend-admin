@@ -82,6 +82,14 @@ export type FriendSummary = {
   direction: "incoming" | "outgoing";
 };
 
+export type SocialMessage = {
+  id: string;
+  senderId: string;
+  recipientId: string;
+  text: string;
+  createdAt: string;
+};
+
 export type MatchRecord = {
   id: string;
   result: MatchResult;
@@ -120,6 +128,8 @@ export type PlayerState = {
   rewardTrack: RewardTrackState;
   ladder: PlayerLadder;
   friends?: FriendSummary[];
+  chatMessages?: SocialMessage[];
+  blockedPlayerIds?: string[];
   recentMatches: MatchRecord[];
   stats: {
     wins: number;
@@ -162,6 +172,18 @@ export type UpdateProfileResult = {
 export type FriendMutationResult = {
   player: PlayerState;
   friendId: string;
+  replayed: boolean;
+};
+
+export type ChatMutationResult = {
+  player: PlayerState;
+  message: SocialMessage;
+  replayed: boolean;
+};
+
+export type SocialActionResult = {
+  player: PlayerState;
+  targetId: string;
   replayed: boolean;
 };
 
@@ -237,6 +259,14 @@ type FriendLinkRow = {
   playerB: string;
   status: "pending" | "accepted";
   requestedBy: string;
+};
+
+type SocialMessageRow = {
+  id: string;
+  senderId: string;
+  recipientId: string;
+  text: string;
+  createdAt: string;
 };
 
 type PvpMatchRow = {
@@ -731,6 +761,150 @@ async function mutateFriendLink(
     return { player: await loadPublicPlayer(db, player), friendId: parseFriendAudit(replay.resultJson), replayed: true };
   }
   return { player: await loadPublicPlayer(db, player), friendId: friend.id, replayed: false };
+}
+
+/** Send a private message only after the two players have accepted each other. */
+export async function sendChatMessage(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; friendId: string; text: string },
+): Promise<ChatMutationResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const friend = await getPlayerRow(db, input.friendId.trim());
+  if (friend.id === player.id) throw new GameStoreError("CHAT_SELF_TARGET", "不能给自己发送聊天消息。", 400);
+  await assertAcceptedFriend(db, player.id, friend.id);
+  if (await isSocialBlocked(db, player.id, friend.id)) {
+    throw new GameStoreError("CHAT_BLOCKED", "该玩家已被屏蔽，无法发送消息。", 403);
+  }
+  const text = normalizeChatText(input.text);
+  const existingAudit = await findAudit(db, player.id, input.idempotencyKey);
+  if (existingAudit) {
+    if (existingAudit.action !== "send_chat") throw new GameStoreError("IDEMPOTENCY_KEY_REUSED", "该幂等键已经用于其他操作。", 409);
+    const message = parseChatAudit(existingAudit.resultJson);
+    return { player: await loadPublicPlayer(db, player), message, replayed: true };
+  }
+  const now = new Date().toISOString();
+  const message: SocialMessage = {
+    id: `chat-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 24)}`,
+    senderId: player.id,
+    recipientId: friend.id,
+    text,
+    createdAt: now,
+  };
+  const auditId = `audit-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 24)}`;
+  const resultJson = JSON.stringify({ message });
+  const results = await db.batch([
+    db.prepare(
+      `INSERT OR IGNORE INTO audit_events
+         (id, player_id, action, idempotency_key, payload_json, result_json, created_at)
+       VALUES (?, ?, 'send_chat', ?, ?, ?, ?)`,
+    ).bind(auditId, player.id, input.idempotencyKey, JSON.stringify({ friendId: friend.id, text }), resultJson, now),
+    db.prepare(
+      `INSERT INTO social_messages (id, sender_id, recipient_id, body, created_at)
+       SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM audit_events WHERE id = ?)`,
+    ).bind(message.id, player.id, friend.id, text, now, auditId),
+  ]);
+  if ((results[0]?.meta?.changes ?? 0) === 0) {
+    const replay = await findAudit(db, player.id, input.idempotencyKey);
+    if (!replay || replay.action !== "send_chat") throw new GameStoreError("STATE_CONFLICT", "聊天记录刚刚发生变化，请重试。", 409);
+    const replayMessage = parseChatAudit(replay.resultJson);
+    return { player: await loadPublicPlayer(db, player), message: replayMessage, replayed: true };
+  }
+  return { player: await loadPublicPlayer(db, player), message, replayed: false };
+}
+
+export async function blockPlayer(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; targetId: string },
+): Promise<SocialActionResult> {
+  return mutateSocialBlock(identity, input, "block");
+}
+
+export async function unblockPlayer(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; targetId: string },
+): Promise<SocialActionResult> {
+  return mutateSocialBlock(identity, input, "unblock");
+}
+
+async function mutateSocialBlock(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; targetId: string },
+  operation: "block" | "unblock",
+): Promise<SocialActionResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const target = await getPlayerRow(db, input.targetId.trim());
+  if (target.id === player.id) throw new GameStoreError("SOCIAL_SELF_TARGET", "不能对自己执行社交操作。", 400);
+  const action = `social_${operation}`;
+  const existingAudit = await findAudit(db, player.id, input.idempotencyKey);
+  if (existingAudit) {
+    if (existingAudit.action !== action) throw new GameStoreError("IDEMPOTENCY_KEY_REUSED", "该幂等键已经用于其他操作。", 409);
+    return { player: await loadPublicPlayer(db, player), targetId: parseSocialAudit(existingAudit.resultJson), replayed: true };
+  }
+  const currentlyBlocked = await isSocialBlocked(db, player.id, target.id);
+  if (operation === "block" && currentlyBlocked) throw new GameStoreError("PLAYER_ALREADY_BLOCKED", "该玩家已经被屏蔽。", 409);
+  if (operation === "unblock" && !currentlyBlocked) throw new GameStoreError("PLAYER_NOT_BLOCKED", "该玩家当前没有被屏蔽。", 409);
+  const now = new Date().toISOString();
+  const auditId = `audit-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 24)}`;
+  const resultJson = JSON.stringify({ targetId: target.id });
+  const statement = operation === "block"
+    ? db.prepare(`INSERT INTO social_blocks (blocker_id, blocked_id, created_at) VALUES (?, ?, ?)`).bind(player.id, target.id, now)
+    : db.prepare(`DELETE FROM social_blocks WHERE blocker_id = ? AND blocked_id = ?`).bind(player.id, target.id);
+  const results = await db.batch([
+    db.prepare(
+      `INSERT OR IGNORE INTO audit_events
+         (id, player_id, action, idempotency_key, payload_json, result_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(auditId, player.id, action, input.idempotencyKey, JSON.stringify({ targetId: target.id }), resultJson, now),
+    statement,
+  ]);
+  if ((results[0]?.meta?.changes ?? 0) === 0) {
+    const replay = await findAudit(db, player.id, input.idempotencyKey);
+    if (!replay || replay.action !== action) throw new GameStoreError("STATE_CONFLICT", "屏蔽状态刚刚发生变化，请重试。", 409);
+    return { player: await loadPublicPlayer(db, player), targetId: parseSocialAudit(replay.resultJson), replayed: true };
+  }
+  return { player: await loadPublicPlayer(db, player), targetId: target.id, replayed: false };
+}
+
+export async function reportPlayer(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; targetId: string; reason: string },
+): Promise<SocialActionResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const target = await getPlayerRow(db, input.targetId.trim());
+  if (target.id === player.id) throw new GameStoreError("SOCIAL_SELF_TARGET", "不能举报自己。", 400);
+  const reason = normalizeReportReason(input.reason);
+  const existingAudit = await findAudit(db, player.id, input.idempotencyKey);
+  if (existingAudit) {
+    if (existingAudit.action !== "social_report") throw new GameStoreError("IDEMPOTENCY_KEY_REUSED", "该幂等键已经用于其他操作。", 409);
+    return { player: await loadPublicPlayer(db, player), targetId: parseSocialAudit(existingAudit.resultJson), replayed: true };
+  }
+  const now = new Date().toISOString();
+  const reportId = `report-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 24)}`;
+  const auditId = `audit-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 24)}`;
+  const resultJson = JSON.stringify({ targetId: target.id });
+  const results = await db.batch([
+    db.prepare(
+      `INSERT OR IGNORE INTO audit_events
+         (id, player_id, action, idempotency_key, payload_json, result_json, created_at)
+       VALUES (?, ?, 'social_report', ?, ?, ?, ?)`,
+    ).bind(auditId, player.id, input.idempotencyKey, JSON.stringify({ targetId: target.id, reason }), resultJson, now),
+    db.prepare(
+      `INSERT INTO social_reports (id, reporter_id, target_id, reason, created_at)
+       SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM audit_events WHERE id = ?)`,
+    ).bind(reportId, player.id, target.id, reason, now, auditId),
+  ]);
+  if ((results[0]?.meta?.changes ?? 0) === 0) {
+    const replay = await findAudit(db, player.id, input.idempotencyKey);
+    if (!replay || replay.action !== "social_report") throw new GameStoreError("STATE_CONFLICT", "举报记录刚刚发生变化，请重试。", 409);
+    return { player: await loadPublicPlayer(db, player), targetId: parseSocialAudit(replay.resultJson), replayed: true };
+  }
+  return { player: await loadPublicPlayer(db, player), targetId: target.id, replayed: false };
 }
 
 export async function buyPack(
@@ -1427,6 +1601,28 @@ async function getFriendLink(db: D1DatabaseLike, playerA: string, playerB: strin
     .first<FriendLinkRow>();
 }
 
+async function assertAcceptedFriend(db: D1DatabaseLike, playerId: string, friendId: string): Promise<void> {
+  const [playerA, playerB] = [playerId, friendId].sort();
+  const link = await getFriendLink(db, playerA, playerB);
+  if (!link || link.status !== "accepted") {
+    throw new GameStoreError("CHAT_FRIEND_REQUIRED", "只有已互相接受的好友才能聊天。", 403);
+  }
+}
+
+async function isSocialBlocked(db: D1DatabaseLike, blockerId: string, blockedId: string): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT 1 AS blocked
+       FROM social_blocks
+       WHERE (blocker_id = ? AND blocked_id = ?)
+          OR (blocker_id = ? AND blocked_id = ?)
+       LIMIT 1`,
+    )
+    .bind(blockerId, blockedId, blockedId, blockerId)
+    .first<{ blocked: number }>();
+  return Boolean(row);
+}
+
 function normalizeDisplayName(value: string): string {
   const displayName = value.trim().replace(/\s+/g, " ");
   if (displayName.length < 1 || displayName.length > 24 || /[\u0000-\u001f\u007f]/.test(displayName)) {
@@ -1453,6 +1649,42 @@ function parseFriendAudit(resultJson: string): string {
   } catch {
     throw new GameStoreError("CORRUPT_AUDIT_EVENT", "无法读取已完成的好友操作。", 500);
   }
+}
+
+function parseSocialAudit(resultJson: string): string {
+  try {
+    const parsed = JSON.parse(resultJson) as { targetId?: unknown };
+    if (typeof parsed.targetId !== "string") throw new Error("invalid");
+    return parsed.targetId;
+  } catch {
+    throw new GameStoreError("CORRUPT_AUDIT_EVENT", "无法读取已完成的社交操作。", 500);
+  }
+}
+
+function parseChatAudit(resultJson: string): SocialMessage {
+  try {
+    const parsed = JSON.parse(resultJson) as { message?: SocialMessage };
+    if (!parsed.message || typeof parsed.message.id !== "string" || typeof parsed.message.text !== "string") throw new Error("invalid");
+    return parsed.message;
+  } catch {
+    throw new GameStoreError("CORRUPT_AUDIT_EVENT", "无法读取已完成的聊天操作。", 500);
+  }
+}
+
+function normalizeChatText(value: string): string {
+  const text = value.trim().replace(/\s+/g, " ");
+  if (text.length < 1 || text.length > 240 || /[\u0000-\u001f\u007f]/.test(text)) {
+    throw new GameStoreError("INVALID_CHAT_TEXT", "聊天消息必须为 1–240 个字符。", 400);
+  }
+  return text;
+}
+
+function normalizeReportReason(value: string): string {
+  const reason = value.trim().replace(/\s+/g, " ");
+  if (reason.length < 2 || reason.length > 200 || /[\u0000-\u001f\u007f]/.test(reason)) {
+    throw new GameStoreError("INVALID_REPORT_REASON", "举报原因必须为 2–200 个字符。", 400);
+  }
+  return reason;
 }
 
 async function loadPublicPlayer(
@@ -1488,6 +1720,27 @@ async function loadPublicPlayer(
     )
     .bind(player.id, player.id, player.id, player.id)
     .all<{ status: "pending" | "accepted"; requestedBy: string; friendId: string; displayName: string }>();
+  const chatResult = await db
+    .prepare(
+      `SELECT id, sender_id AS senderId, recipient_id AS recipientId,
+              body AS text, created_at AS createdAt
+       FROM social_messages
+       WHERE sender_id = ? OR recipient_id = ?
+       ORDER BY created_at DESC, id DESC
+       LIMIT 100`,
+    )
+    .bind(player.id, player.id)
+    .all<SocialMessageRow>();
+  const blockedResult = await db
+    .prepare(
+      `SELECT blocked_id AS blockedId
+       FROM social_blocks
+       WHERE blocker_id = ?
+       ORDER BY created_at DESC
+       LIMIT 100`,
+    )
+    .bind(player.id)
+    .all<{ blockedId: string }>();
 
   return {
     id: player.id,
@@ -1500,6 +1753,14 @@ async function loadPublicPlayer(
       status: friend.status,
       direction: friend.status === "accepted" || friend.requestedBy === player.id ? "outgoing" : "incoming",
     })),
+    chatMessages: chatResult.results.map((message) => ({
+      id: message.id,
+      senderId: message.senderId,
+      recipientId: message.recipientId,
+      text: message.text,
+      createdAt: message.createdAt,
+    })),
+    blockedPlayerIds: blockedResult.results.map((row) => row.blockedId),
     recentMatches: matchResult.results.map((match) => {
       const safeMatch: MatchRecord = {
         id: match.id,
@@ -1650,6 +1911,42 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
     ),
     db.prepare(
       `CREATE INDEX IF NOT EXISTS friend_links_player_b_idx ON friend_links (player_b, status)`,
+    ),
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS social_messages (
+        id TEXT PRIMARY KEY NOT NULL,
+        sender_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        recipient_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        body TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS social_messages_pair_idx
+       ON social_messages (sender_id, recipient_id, created_at)`,
+    ),
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS social_blocks (
+        blocker_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        blocked_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (blocker_id, blocked_id)
+      )`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS social_blocks_blocked_idx ON social_blocks (blocked_id)`,
+    ),
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS social_reports (
+        id TEXT PRIMARY KEY NOT NULL,
+        reporter_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        target_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        reason TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS social_reports_created_idx ON social_reports (created_at)`,
     ),
     // PVP match snapshots are written by the polling worker and verified here
     // before a client can turn a result into ranked/profile rewards.
