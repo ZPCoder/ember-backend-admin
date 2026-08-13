@@ -75,6 +75,13 @@ export type PlayerLadder = {
   highestRating: number;
 };
 
+export type FriendSummary = {
+  id: string;
+  displayName: string;
+  status: "pending" | "accepted";
+  direction: "incoming" | "outgoing";
+};
+
 export type MatchRecord = {
   id: string;
   result: MatchResult;
@@ -112,6 +119,7 @@ export type PlayerState = {
   progression: PlayerProgression;
   rewardTrack: RewardTrackState;
   ladder: PlayerLadder;
+  friends?: FriendSummary[];
   recentMatches: MatchRecord[];
   stats: {
     wins: number;
@@ -142,6 +150,18 @@ export type OpenPackResult = {
 
 export type ClaimWeeklyPackResult = {
   player: PlayerState;
+  replayed: boolean;
+};
+
+export type UpdateProfileResult = {
+  player: PlayerState;
+  displayName: string;
+  replayed: boolean;
+};
+
+export type FriendMutationResult = {
+  player: PlayerState;
+  friendId: string;
   replayed: boolean;
 };
 
@@ -209,6 +229,14 @@ type MatchRow = {
 type AuditRow = {
   action: string;
   resultJson: string;
+};
+
+type FriendLinkRow = {
+  id: string;
+  playerA: string;
+  playerB: string;
+  status: "pending" | "accepted";
+  requestedBy: string;
 };
 
 type PvpMatchRow = {
@@ -557,6 +585,152 @@ export async function claimWeeklyPack(
       };
     },
   ).then(({ player: nextPlayer, replayed }) => ({ player: nextPlayer, replayed }));
+}
+
+/**
+ * Update the public player name without changing the platform identity.
+ * Hearthstone/Battle.net separates the account subject from the visible
+ * profile name; keeping that distinction here prevents a later auth refresh
+ * from silently overwriting a player's chosen name.
+ */
+export async function updateProfile(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; displayName: string },
+): Promise<UpdateProfileResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const displayName = normalizeDisplayName(input.displayName);
+  const existingAudit = await findAudit(db, player.id, input.idempotencyKey);
+  if (existingAudit) {
+    if (existingAudit.action !== "update_profile") {
+      throw new GameStoreError("IDEMPOTENCY_KEY_REUSED", "该幂等键已经用于其他操作。", 409);
+    }
+    const replay = parseProfileAudit(existingAudit.resultJson);
+    return {
+      player: await loadPublicPlayer(db, player),
+      displayName: replay.displayName,
+      replayed: true,
+    };
+  }
+
+  const now = new Date().toISOString();
+  const auditId = `audit-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 24)}`;
+  const resultJson = JSON.stringify({ displayName });
+  const results = await db.batch([
+    db.prepare(
+      `INSERT OR IGNORE INTO audit_events
+         (id, player_id, action, idempotency_key, payload_json, result_json, created_at)
+       VALUES (?, ?, 'update_profile', ?, ?, ?, ?)`,
+    ).bind(auditId, player.id, input.idempotencyKey, JSON.stringify({ displayName }), resultJson, now),
+    db.prepare(
+      `UPDATE players
+       SET display_name = ?, updated_at = ?
+       WHERE id = ? AND EXISTS (SELECT 1 FROM audit_events WHERE id = ?)`,
+    ).bind(displayName, now, player.id, auditId),
+  ]);
+  if ((results[0]?.meta?.changes ?? 0) === 0) {
+    const replay = await findAudit(db, player.id, input.idempotencyKey);
+    if (!replay) throw new GameStoreError("STATE_CONFLICT", "玩家档案刚刚发生变化，请重试。", 409);
+    if (replay.action !== "update_profile") {
+      throw new GameStoreError("IDEMPOTENCY_KEY_REUSED", "该幂等键已经用于其他操作。", 409);
+    }
+    const parsed = parseProfileAudit(replay.resultJson);
+    const latest = await getPlayerRow(db, player.id);
+    return { player: await loadPublicPlayer(db, latest), displayName: parsed.displayName, replayed: true };
+  }
+  const latest = await getPlayerRow(db, player.id);
+  return { player: await loadPublicPlayer(db, latest), displayName, replayed: false };
+}
+
+/** Send a Hearthstone-style friend request using the public player UID. */
+export async function sendFriendRequest(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; friendId: string },
+): Promise<FriendMutationResult> {
+  return mutateFriendLink(identity, input, "send");
+}
+
+/** Accept an incoming request; the caller must be the requested recipient. */
+export async function acceptFriendRequest(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; friendId: string },
+): Promise<FriendMutationResult> {
+  return mutateFriendLink(identity, input, "accept");
+}
+
+async function mutateFriendLink(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; friendId: string },
+  operation: "send" | "accept",
+): Promise<FriendMutationResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const friendId = input.friendId.trim();
+  if (!/^player-[A-Za-z0-9_-]{6,80}$/.test(friendId)) {
+    throw new GameStoreError("INVALID_FRIEND_ID", "好友 UID 格式无效。", 400);
+  }
+  if (friendId === player.id) {
+    throw new GameStoreError("FRIEND_SELF_REQUEST", "不能添加自己为好友。", 400);
+  }
+  const friend = await getPlayerRow(db, friendId);
+  const existingAudit = await findAudit(db, player.id, input.idempotencyKey);
+  if (existingAudit) {
+    if (existingAudit.action !== `friend_${operation}`) {
+      throw new GameStoreError("IDEMPOTENCY_KEY_REUSED", "该幂等键已经用于其他操作。", 409);
+    }
+    return { player: await loadPublicPlayer(db, player), friendId: parseFriendAudit(existingAudit.resultJson), replayed: true };
+  }
+
+  const [playerA, playerB] = [player.id, friend.id].sort();
+  const linkId = `friend-${(await stableId(`${playerA}|${playerB}`)).slice(0, 24)}`;
+  const link = await getFriendLink(db, playerA, playerB);
+  const now = new Date().toISOString();
+  if (operation === "send" && link?.status === "accepted") {
+    throw new GameStoreError("FRIEND_ALREADY_EXISTS", "该玩家已经在好友列表中。", 409);
+  }
+  if (operation === "send" && link?.status === "pending" && link.requestedBy === player.id) {
+    throw new GameStoreError("FRIEND_REQUEST_PENDING", "好友请求已发送，等待对方确认。", 409);
+  }
+  if (operation === "accept" && (!link || link.status !== "pending" || link.requestedBy === player.id)) {
+    throw new GameStoreError("FRIEND_REQUEST_INVALID", "没有可接受的入站好友请求。", 409);
+  }
+
+  const action = `friend_${operation}`;
+  const auditId = `audit-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 24)}`;
+  const resultJson = JSON.stringify({ friendId: friend.id });
+  const socialStatement = operation === "accept"
+    ? db.prepare(
+        `UPDATE friend_links
+         SET status = 'accepted', updated_at = ?
+         WHERE player_a = ? AND player_b = ? AND status = 'pending' AND requested_by <> ?`,
+      ).bind(now, playerA, playerB, player.id)
+    : link?.status === "pending"
+      ? db.prepare(
+          `UPDATE friend_links
+           SET status = 'accepted', updated_at = ?
+           WHERE player_a = ? AND player_b = ? AND status = 'pending' AND requested_by <> ?`,
+        ).bind(now, playerA, playerB, player.id)
+      : db.prepare(
+          `INSERT INTO friend_links
+             (id, player_a, player_b, status, requested_by, created_at, updated_at)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?)`,
+        ).bind(linkId, playerA, playerB, player.id, now, now);
+  const results = await db.batch([
+    db.prepare(
+      `INSERT OR IGNORE INTO audit_events
+         (id, player_id, action, idempotency_key, payload_json, result_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(auditId, player.id, action, input.idempotencyKey, JSON.stringify({ friendId: friend.id }), resultJson, now),
+    socialStatement,
+  ]);
+  if ((results[0]?.meta?.changes ?? 0) === 0) {
+    const replay = await findAudit(db, player.id, input.idempotencyKey);
+    if (!replay || replay.action !== action) throw new GameStoreError("STATE_CONFLICT", "好友关系刚刚发生变化，请重试。", 409);
+    return { player: await loadPublicPlayer(db, player), friendId: parseFriendAudit(replay.resultJson), replayed: true };
+  }
+  return { player: await loadPublicPlayer(db, player), friendId: friend.id, replayed: false };
 }
 
 export async function buyPack(
@@ -1174,17 +1348,18 @@ async function ensurePlayer(
   const existing = byIdentity ?? legacyByEmail;
 
   if (existing) {
-    // Backfill legacy email-based rows on first access. If the authenticated
-    // email changes, keep the old row and update its display metadata.
+    // Backfill legacy email-based rows on first access. The platform identity
+    // may change its auth display name, but a player-chosen public name must
+    // survive refreshes; profile changes go through updateProfile instead.
     await db
       .prepare(
         `UPDATE players
-         SET email = ?, identity_key = ?, display_name = ?, updated_at = ?
+         SET email = ?, identity_key = ?, updated_at = ?
          WHERE id = ?`,
       )
-      .bind(normalizedEmail, identityKey, displayName, now, existing.id)
+      .bind(normalizedEmail, identityKey, now, existing.id)
       .run();
-    return { ...existing, email: normalizedEmail, displayName };
+    return { ...existing, email: normalizedEmail };
   }
 
   const playerId = `player-${(await stableId(identityKey)).slice(0, 24)}`;
@@ -1226,6 +1401,60 @@ async function ensurePlayer(
   return row;
 }
 
+async function getPlayerRow(db: D1DatabaseLike, playerId: string): Promise<PlayerRow> {
+  const row = await db
+    .prepare(
+      `SELECT id, email, display_name AS displayName
+       FROM players
+       WHERE id = ?
+       LIMIT 1`,
+    )
+    .bind(playerId)
+    .first<PlayerRow>();
+  if (!row) throw new GameStoreError("PLAYER_NOT_FOUND", "玩家档案不存在。", 404);
+  return row;
+}
+
+async function getFriendLink(db: D1DatabaseLike, playerA: string, playerB: string): Promise<FriendLinkRow | null> {
+  return db
+    .prepare(
+      `SELECT id, player_a AS playerA, player_b AS playerB, status, requested_by AS requestedBy
+       FROM friend_links
+       WHERE player_a = ? AND player_b = ?
+       LIMIT 1`,
+    )
+    .bind(playerA, playerB)
+    .first<FriendLinkRow>();
+}
+
+function normalizeDisplayName(value: string): string {
+  const displayName = value.trim().replace(/\s+/g, " ");
+  if (displayName.length < 1 || displayName.length > 24 || /[\u0000-\u001f\u007f]/.test(displayName)) {
+    throw new GameStoreError("INVALID_DISPLAY_NAME", "公开昵称必须为 1–24 个字符。", 400);
+  }
+  return displayName;
+}
+
+function parseProfileAudit(resultJson: string): { displayName: string } {
+  try {
+    const parsed = JSON.parse(resultJson) as { displayName?: unknown };
+    if (typeof parsed.displayName !== "string") throw new Error("invalid");
+    return { displayName: parsed.displayName };
+  } catch {
+    throw new GameStoreError("CORRUPT_AUDIT_EVENT", "无法读取已完成的档案操作。", 500);
+  }
+}
+
+function parseFriendAudit(resultJson: string): string {
+  try {
+    const parsed = JSON.parse(resultJson) as { friendId?: unknown };
+    if (typeof parsed.friendId !== "string") throw new Error("invalid");
+    return parsed.friendId;
+  } catch {
+    throw new GameStoreError("CORRUPT_AUDIT_EVENT", "无法读取已完成的好友操作。", 500);
+  }
+}
+
 async function loadPublicPlayer(
   db: D1DatabaseLike,
   player: PlayerRow,
@@ -1245,12 +1474,32 @@ async function loadPublicPlayer(
     )
     .bind(player.id)
     .all<MatchRow>();
+  const friendResult = await db
+    .prepare(
+      `SELECT fl.status,
+              fl.requested_by AS requestedBy,
+              CASE WHEN fl.player_a = ? THEN fl.player_b ELSE fl.player_a END AS friendId,
+              p.display_name AS displayName
+       FROM friend_links fl
+       JOIN players p ON p.id = CASE WHEN fl.player_a = ? THEN fl.player_b ELSE fl.player_a END
+       WHERE (fl.player_a = ? OR fl.player_b = ?)
+       ORDER BY fl.updated_at DESC, fl.id DESC
+       LIMIT 100`,
+    )
+    .bind(player.id, player.id, player.id, player.id)
+    .all<{ status: "pending" | "accepted"; requestedBy: string; friendId: string; displayName: string }>();
 
   return {
     id: player.id,
     email: player.email,
     displayName: player.displayName,
     ...cloneState(stored),
+    friends: friendResult.results.map((friend) => ({
+      id: friend.friendId,
+      displayName: friend.displayName,
+      status: friend.status,
+      direction: friend.status === "accepted" || friend.requestedBy === player.id ? "outgoing" : "incoming",
+    })),
     recentMatches: matchResult.results.map((match) => {
       const safeMatch: MatchRecord = {
         ...match,
@@ -1376,6 +1625,26 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
     db.prepare(
       `CREATE INDEX IF NOT EXISTS audit_events_player_created_idx
        ON audit_events (player_id, created_at)`,
+    ),
+    // Social graph: one canonical row per pair keeps friend requests,
+    // accepts and retries deterministic across devices.
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS friend_links (
+        id TEXT PRIMARY KEY NOT NULL,
+        player_a TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        player_b TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'accepted')),
+        requested_by TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(player_a, player_b)
+      )`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS friend_links_player_a_idx ON friend_links (player_a, status)`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS friend_links_player_b_idx ON friend_links (player_b, status)`,
     ),
     // PVP match snapshots are written by the polling worker and verified here
     // before a client can turn a result into ranked/profile rewards.

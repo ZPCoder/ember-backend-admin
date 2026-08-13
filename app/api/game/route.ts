@@ -3,6 +3,7 @@ import {
   claimTask,
   claimReward,
   claimWeeklyPack,
+  acceptFriendRequest,
   buyPack,
   craftCard,
   disenchantCard,
@@ -14,6 +15,8 @@ import {
   rerollTask,
   resetDemoPlayer,
   saveDeck,
+  sendFriendRequest,
+  updateProfile,
   type GameIdentity,
   type AiMatchProof,
   type MatchMode,
@@ -93,6 +96,16 @@ type GameAction =
     }
   | {
       action: "link_device";
+    }
+  | {
+      action: "update_profile";
+      idempotencyKey: string;
+      displayName: string;
+    }
+  | {
+      action: "send_friend_request" | "accept_friend_request";
+      idempotencyKey: string;
+      friendId: string;
     };
 
 class PayloadError extends Error {
@@ -223,6 +236,29 @@ export async function POST(request: Request): Promise<Response> {
           player: result.player,
           match: result.match,
           rewardGold: result.match.rewardGold,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "update_profile": {
+        const result = await updateProfile(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          displayName: result.displayName,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "send_friend_request":
+      case "accept_friend_request": {
+        const result = action.action === "send_friend_request"
+          ? await sendFriendRequest(identity, action)
+          : await acceptFriendRequest(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          friendId: result.friendId,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -495,6 +531,21 @@ function parseAction(value: unknown): GameAction {
     case "link_device":
       assertExactKeys(value, ["action"]);
       return { action: "link_device" };
+    case "update_profile":
+      assertExactKeys(value, ["action", "idempotencyKey", "displayName"]);
+      return {
+        action: "update_profile",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        displayName: parseTrimmedString(value.displayName, "displayName", 1, 24),
+      };
+    case "send_friend_request":
+    case "accept_friend_request":
+      assertExactKeys(value, ["action", "idempotencyKey", "friendId"]);
+      return {
+        action: value.action,
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        friendId: parseIdentifier(value.friendId, "friendId"),
+      };
     default:
       throw new PayloadError("不支持的 action。");
   }
