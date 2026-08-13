@@ -1,10 +1,13 @@
 import { getChatGPTUser } from "../../chatgpt-auth";
 import {
   claimTask,
+  buyPack,
   GameStoreError,
   getPlayerState,
+  linkAnonymousAccount,
   openPack,
   recordMatch,
+  rerollTask,
   resetDemoPlayer,
   saveDeck,
   type GameIdentity,
@@ -46,6 +49,15 @@ type GameAction =
       idempotencyKey: string;
     }
   | {
+      action: "buy_pack";
+      idempotencyKey: string;
+    }
+  | {
+      action: "reroll_task";
+      idempotencyKey: string;
+      taskId: string;
+    }
+  | {
       action: "record_match";
       idempotencyKey: string;
       result: MatchResult;
@@ -56,6 +68,9 @@ type GameAction =
     }
   | {
       action: "reset_demo";
+    }
+  | {
+      action: "link_device";
     };
 
 class PayloadError extends Error {
@@ -75,6 +90,7 @@ export async function GET(request: Request): Promise<Response> {
         displayName: resolved.identity.displayName,
         isDemo: resolved.identity.isDemo,
         isAnonymous: resolved.identity.isAnonymous,
+        canLinkDevice: Boolean(resolved.anonymousIdentity),
       },
       player,
     }, 200, resolved.setCookie);
@@ -122,6 +138,26 @@ export async function POST(request: Request): Promise<Response> {
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
+      case "buy_pack": {
+        const result = await buyPack(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          costGold: result.costGold,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "reroll_task": {
+        const result = await rerollTask(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          task: result.task,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
       case "record_match": {
         const result = await recordMatch(identity, action);
         return json({
@@ -141,6 +177,19 @@ export async function POST(request: Request): Promise<Response> {
           replayed: false,
         }, 200, resolved.setCookie);
       }
+      case "link_device": {
+        if (!resolved.anonymousIdentity) {
+          throw new GameStoreError("ACCOUNT_LINK_INVALID", "没有可绑定的本机访客档案。", 400);
+        }
+        const player = await linkAnonymousAccount(identity, resolved.anonymousIdentity);
+        return json({
+          ok: true,
+          action: action.action,
+          player,
+          linked: true,
+          replayed: false,
+        }, 200, clearDeviceCookie());
+      }
     }
   } catch (error) {
     return handleError(error);
@@ -149,9 +198,10 @@ export async function POST(request: Request): Promise<Response> {
 
 async function resolveIdentity(
   request: Request,
-): Promise<{ identity: GameIdentity; setCookie?: string } | null> {
+): Promise<{ identity: GameIdentity; setCookie?: string; anonymousIdentity?: GameIdentity } | null> {
   const authenticated = await getChatGPTUser();
   if (authenticated) {
+    const existingDeviceId = readCookie(request.headers.get("cookie"), ANONYMOUS_COOKIE);
     return {
       identity: {
         email: authenticated.email,
@@ -162,6 +212,17 @@ async function resolveIdentity(
           ? `oai-id:${authenticated.id}`
           : `oai-email:${authenticated.email.trim().toLowerCase()}`,
       },
+      ...(isDeviceId(existingDeviceId)
+        ? {
+            anonymousIdentity: {
+              email: `device-${existingDeviceId}@anonymous.ember.local`,
+              displayName: "本机指挥官",
+              isDemo: false,
+              isAnonymous: true,
+              identityKey: `device:${existingDeviceId}`,
+            },
+          }
+        : {}),
     };
   }
 
@@ -202,6 +263,10 @@ function isDeviceId(value: string | null): value is string {
 
 function makeDeviceCookie(deviceId: string): string {
   return `${ANONYMOUS_COOKIE}=${encodeURIComponent(deviceId)}; Max-Age=${ANONYMOUS_COOKIE_MAX_AGE}; Path=/; SameSite=Lax; Secure; HttpOnly`;
+}
+
+function clearDeviceCookie(): string {
+  return `${ANONYMOUS_COOKIE}=; Max-Age=0; Path=/; SameSite=Lax; Secure; HttpOnly`;
 }
 
 function isLocalRequest(request: Request): boolean {
@@ -284,6 +349,19 @@ function parseAction(value: unknown): GameAction {
         action: "open_pack",
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
       };
+    case "buy_pack":
+      assertExactKeys(value, ["action", "idempotencyKey"]);
+      return {
+        action: "buy_pack",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+      };
+    case "reroll_task":
+      assertExactKeys(value, ["action", "idempotencyKey", "taskId"]);
+      return {
+        action: "reroll_task",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        taskId: parseIdentifier(value.taskId, "taskId"),
+      };
     case "record_match":
       assertExactKeys(value, [
         "action",
@@ -321,6 +399,9 @@ function parseAction(value: unknown): GameAction {
     case "reset_demo":
       assertExactKeys(value, ["action"]);
       return { action: "reset_demo" };
+    case "link_device":
+      assertExactKeys(value, ["action"]);
+      return { action: "link_device" };
     default:
       throw new PayloadError("不支持的 action。");
   }

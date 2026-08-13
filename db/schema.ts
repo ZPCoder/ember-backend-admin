@@ -40,6 +40,7 @@ export const matchRecords = sqliteTable(
       .notNull()
       .references(() => players.id, { onDelete: "cascade" }),
     idempotencyKey: text("idempotency_key").notNull(),
+    pvpToken: text("pvp_token"),
     result: text("result", { enum: ["win", "loss"] }).notNull(),
     mode: text("mode", { enum: ["ai", "pvp"] }).notNull(),
     opponent: text("opponent").notNull(),
@@ -50,6 +51,10 @@ export const matchRecords = sqliteTable(
     uniqueIndex("match_records_player_idempotency_uidx").on(
       table.playerId,
       table.idempotencyKey,
+    ),
+    uniqueIndex("match_records_player_pvp_token_uidx").on(
+      table.playerId,
+      table.pvpToken,
     ),
     index("match_records_player_created_idx").on(
       table.playerId,
