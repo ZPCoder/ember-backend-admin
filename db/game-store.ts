@@ -705,6 +705,9 @@ async function mutateFriendLink(
     throw new GameStoreError("FRIEND_SELF_REQUEST", "不能添加自己为好友。", 400);
   }
   const friend = await getPlayerRow(db, friendId);
+  if (await isSocialBlocked(db, player.id, friend.id)) {
+    throw new GameStoreError("FRIEND_BLOCKED", "该玩家已被屏蔽，无法建立好友关系。", 403);
+  }
   const existingAudit = await findAudit(db, player.id, input.idempotencyKey);
   if (existingAudit) {
     if (existingAudit.action !== `friend_${operation}`) {
