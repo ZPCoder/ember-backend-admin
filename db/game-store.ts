@@ -1502,7 +1502,12 @@ async function loadPublicPlayer(
     })),
     recentMatches: matchResult.results.map((match) => {
       const safeMatch: MatchRecord = {
-        ...match,
+        id: match.id,
+        result: match.result,
+        mode: match.mode,
+        opponent: match.opponent,
+        rewardGold: match.rewardGold,
+        createdAt: match.createdAt,
         format: match.format === "casual" ? "casual" : "ranked",
       };
       delete safeMatch.pvpToken;
