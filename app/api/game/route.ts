@@ -1,7 +1,10 @@
 import { getChatGPTUser } from "../../chatgpt-auth";
 import {
   claimTask,
+  claimReward,
   buyPack,
+  craftCard,
+  disenchantCard,
   GameStoreError,
   getPlayerState,
   linkAnonymousAccount,
@@ -56,6 +59,16 @@ type GameAction =
       action: "reroll_task";
       idempotencyKey: string;
       taskId: string;
+    }
+  | {
+      action: "craft_card" | "disenchant_card";
+      idempotencyKey: string;
+      cardId: string;
+    }
+  | {
+      action: "claim_reward";
+      idempotencyKey: string;
+      level: number;
     }
   | {
       action: "record_match";
@@ -158,6 +171,32 @@ export async function POST(request: Request): Promise<Response> {
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
+      case "craft_card":
+      case "disenchant_card": {
+        const result = action.action === "craft_card"
+          ? await craftCard(identity, action)
+          : await disenchantCard(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          cardId: result.cardId,
+          amount: result.amount,
+          kind: result.kind,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "claim_reward": {
+        const result = await claimReward(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          level: result.level,
+          reward: result.reward,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
       case "record_match": {
         const result = await recordMatch(identity, action);
         return json({
@@ -165,6 +204,7 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           match: result.match,
+          rewardGold: result.match.rewardGold,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -361,6 +401,24 @@ function parseAction(value: unknown): GameAction {
         action: "reroll_task",
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
         taskId: parseIdentifier(value.taskId, "taskId"),
+      };
+    case "craft_card":
+    case "disenchant_card":
+      assertExactKeys(value, ["action", "idempotencyKey", "cardId"]);
+      return {
+        action: value.action,
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        cardId: parseIdentifier(value.cardId, "cardId"),
+      };
+    case "claim_reward":
+      assertExactKeys(value, ["action", "idempotencyKey", "level"]);
+      if (!Number.isSafeInteger(value.level) || value.level < 1 || value.level > 100) {
+        throw new PayloadError("level 必须是 1–100 的整数。");
+      }
+      return {
+        action: "claim_reward",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        level: value.level,
       };
     case "record_match":
       assertExactKeys(value, [

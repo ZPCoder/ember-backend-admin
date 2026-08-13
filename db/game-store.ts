@@ -5,6 +5,11 @@ import {
   validateDeck,
 } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
+import {
+  REWARD_TRACK,
+  craftCost,
+  disenchantValue,
+} from "../lib/game/economy.ts";
 
 export type MatchResult = "win" | "loss";
 export type MatchMode = "ai" | "pvp";
@@ -42,11 +47,16 @@ export type TaskCycle = {
   weekKey: string;
   dailyRerollsRemaining: number;
   packsBoughtToday: number;
+  aiRewardsToday: number;
 };
 
 export type PlayerProgression = {
   xp: number;
   level: number;
+};
+
+export type RewardTrackState = {
+  claimedLevels: number[];
 };
 
 export type PlayerLadder = {
@@ -82,6 +92,7 @@ export type PlayerState = {
   tasks: PlayerTask[];
   taskCycle: TaskCycle;
   progression: PlayerProgression;
+  rewardTrack: RewardTrackState;
   ladder: PlayerLadder;
   recentMatches: MatchRecord[];
   stats: {
@@ -120,6 +131,21 @@ export type BuyPackResult = {
 export type RerollTaskResult = {
   player: PlayerState;
   task: PlayerTask;
+  replayed: boolean;
+};
+
+export type CardEconomyResult = {
+  player: PlayerState;
+  cardId: string;
+  amount: number;
+  kind: "craft" | "disenchant";
+  replayed: boolean;
+};
+
+export type ClaimRewardResult = {
+  player: PlayerState;
+  level: number;
+  reward: { title: string; kind: "gold" | "pack" | "dust"; amount: number };
   replayed: boolean;
 };
 
@@ -208,6 +234,7 @@ const WIN_REWARD_GOLD = 60;
 const LOSS_REWARD_GOLD = 20;
 const PACK_PRICE_GOLD = 100;
 const DAILY_PACK_PURCHASE_LIMIT = 10;
+const DAILY_AI_REWARD_LIMIT = 20;
 const MATCH_REWARD_XP = 100;
 const PACK_REWARD_XP = 50;
 const TASK_REWARD_XP = 150;
@@ -567,6 +594,136 @@ export async function rerollTask(
   }));
 }
 
+export async function craftCard(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; cardId: string },
+): Promise<CardEconomyResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const card = CARD_CATALOG.find((candidate) => candidate.id === input.cardId);
+  if (!card) throw new GameStoreError("CARD_NOT_FOUND", "卡牌不存在。", 404);
+  const cost = craftCost(card.rarity);
+  return commitMutation(
+    db,
+    player,
+    "craft_card",
+    input.idempotencyKey,
+    { cardId: input.cardId, costDust: cost },
+    (current) => {
+      if (current.currencies.dust < cost) {
+        throw new GameStoreError("INSUFFICIENT_DUST", "星尘不足，无法制作这张卡。", 409);
+      }
+      return {
+        nextState: {
+          ...current,
+          currencies: { ...current.currencies, dust: current.currencies.dust - cost },
+          collection: {
+            ...current.collection,
+            [input.cardId]: (current.collection[input.cardId] ?? 0) + 1,
+          },
+        },
+        result: { cardId: input.cardId, amount: cost, kind: "craft" as const },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    cardId: result.cardId,
+    amount: result.amount,
+    kind: result.kind,
+    replayed,
+  }));
+}
+
+export async function disenchantCard(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; cardId: string },
+): Promise<CardEconomyResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const card = CARD_CATALOG.find((candidate) => candidate.id === input.cardId);
+  if (!card) throw new GameStoreError("CARD_NOT_FOUND", "卡牌不存在。", 404);
+  const value = disenchantValue(card.rarity);
+  return commitMutation(
+    db,
+    player,
+    "disenchant_card",
+    input.idempotencyKey,
+    { cardId: input.cardId, dust: value },
+    (current) => {
+      const owned = current.collection[input.cardId] ?? 0;
+      const deckUse = current.decks.reduce(
+        (count, deck) => count + deck.cardIds.filter((cardId) => cardId === input.cardId).length,
+        0,
+      );
+      if (owned < 1 || owned <= deckUse) {
+        throw new GameStoreError("CARD_IN_USE", "卡牌正在卡组中使用，至少保留卡组所需数量。", 409);
+      }
+      return {
+        nextState: {
+          ...current,
+          currencies: { ...current.currencies, dust: current.currencies.dust + value },
+          collection: { ...current.collection, [input.cardId]: owned - 1 },
+        },
+        result: { cardId: input.cardId, amount: value, kind: "disenchant" as const },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    cardId: result.cardId,
+    amount: result.amount,
+    kind: result.kind,
+    replayed,
+  }));
+}
+
+export async function claimReward(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; level: number },
+): Promise<ClaimRewardResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const reward = REWARD_TRACK.find((candidate) => candidate.level === input.level);
+  if (!reward) throw new GameStoreError("REWARD_NOT_FOUND", "奖励等级不存在。", 404);
+  return commitMutation(
+    db,
+    player,
+    "claim_reward",
+    input.idempotencyKey,
+    { level: input.level },
+    (current) => {
+      if (current.progression.level < reward.level) {
+        throw new GameStoreError("REWARD_LOCKED", "奖励等级尚未解锁。", 409);
+      }
+      if (current.rewardTrack.claimedLevels.includes(reward.level)) {
+        throw new GameStoreError("REWARD_ALREADY_CLAIMED", "该奖励已经领取。", 409);
+      }
+      const claimedLevels = [...current.rewardTrack.claimedLevels, reward.level].sort((a, b) => a - b);
+      const nextState = {
+        ...current,
+        rewardTrack: { claimedLevels },
+        currencies: {
+          ...current.currencies,
+          gold: current.currencies.gold + (reward.kind === "gold" ? reward.amount : 0),
+          dust: current.currencies.dust + (reward.kind === "dust" ? reward.amount : 0),
+        },
+        packsAvailable: current.packsAvailable + (reward.kind === "pack" ? reward.amount : 0),
+      };
+      return {
+        nextState,
+        result: { level: reward.level, reward: { title: reward.title, kind: reward.kind, amount: reward.amount } },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    level: result.level,
+    reward: result.reward,
+    replayed,
+  }));
+}
+
 export async function recordMatch(
   identity: GameIdentity,
   input: {
@@ -624,17 +781,8 @@ export async function recordMatch(
       throw new GameStoreError("PVP_ALREADY_SETTLED", "该联机对局已经结算过。", 409);
     }
   }
-  const rewardGold =
-    input.result === "win" ? WIN_REWARD_GOLD : LOSS_REWARD_GOLD;
-  const match: MatchRecord = {
-    id: `match-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 20)}`,
-    result: input.result,
-    mode: input.mode,
-    opponent: input.opponent,
-    rewardGold,
-    ...(input.pvpToken ? { pvpToken: input.pvpToken } : {}),
-    createdAt: new Date().toISOString(),
-  };
+  const matchId = `match-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 20)}`;
+  const matchCreatedAt = new Date().toISOString();
 
   return commitMutation(
     db,
@@ -648,8 +796,21 @@ export async function recordMatch(
       ...(input.pvpToken ? { pvpToken: input.pvpToken } : {}),
       ...(input.pvpPlayer === undefined ? {} : { pvpPlayer: input.pvpPlayer }),
     },
-    (current) => ({
-      nextState: {
+    (current) => {
+      const aiRewardEligible = input.mode !== "ai" || current.taskCycle.aiRewardsToday < DAILY_AI_REWARD_LIMIT;
+      const rewardGold = aiRewardEligible
+        ? input.result === "win" ? WIN_REWARD_GOLD : LOSS_REWARD_GOLD
+        : 0;
+      const match: MatchRecord = {
+        id: matchId,
+        result: input.result,
+        mode: input.mode,
+        opponent: input.opponent,
+        rewardGold,
+        ...(input.pvpToken ? { pvpToken: input.pvpToken } : {}),
+        createdAt: matchCreatedAt,
+      };
+      const nextState: StoredPlayerState = {
         ...current,
         currencies: {
           ...current.currencies,
@@ -661,12 +822,21 @@ export async function recordMatch(
           matchesPlayed: current.stats.matchesPlayed + 1,
         },
         tasks: advanceMatchTasks(current.tasks, input.result),
-        progression: awardXp(current.progression, MATCH_REWARD_XP),
+        progression: aiRewardEligible ? awardXp(current.progression, MATCH_REWARD_XP) : current.progression,
+        taskCycle: {
+          ...current.taskCycle,
+          aiRewardsToday: input.mode === "ai"
+            ? Math.min(DAILY_AI_REWARD_LIMIT, current.taskCycle.aiRewardsToday + 1)
+            : current.taskCycle.aiRewardsToday,
+        },
         ladder: input.mode === "pvp" ? updateLadder(current.ladder, input.result) : current.ladder,
-      },
-      result: { match },
-      match,
-    }),
+      };
+      return {
+        nextState,
+        result: { match },
+        match,
+      };
+    },
   ).then(({ player: nextPlayer, result, replayed }) => ({
     player: nextPlayer,
     match: result.match,
@@ -1002,7 +1172,11 @@ async function loadPublicPlayer(
     email: player.email,
     displayName: player.displayName,
     ...cloneState(stored),
-    recentMatches: matchResult.results.map(({ pvpToken: _pvpToken, ...match }) => ({ ...match })),
+    recentMatches: matchResult.results.map((match) => {
+      const safeMatch = { ...match };
+      delete safeMatch.pvpToken;
+      return safeMatch;
+    }),
     updatedAt: row.updatedAt,
   };
 }
@@ -1254,8 +1428,10 @@ function createDefaultState(now: string): StoredPlayerState {
       weekKey,
       dailyRerollsRemaining: DAILY_REROLL_LIMIT,
       packsBoughtToday: 0,
+      aiRewardsToday: 0,
     },
     progression: { xp: 0, level: 1 },
+    rewardTrack: { claimedLevels: [] },
     ladder: { rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0 },
     stats: {
       wins: 0,
@@ -1310,16 +1486,32 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
         packsBoughtToday: isFiniteNonNegativeInteger(value.taskCycle.packsBoughtToday)
           ? value.taskCycle.packsBoughtToday
           : 0,
+        aiRewardsToday: isFiniteNonNegativeInteger(value.taskCycle.aiRewardsToday)
+          ? Math.min(value.taskCycle.aiRewardsToday, DAILY_AI_REWARD_LIMIT)
+          : 0,
       }
-    : { dayKey: "", weekKey: "", dailyRerollsRemaining: DAILY_REROLL_LIMIT, packsBoughtToday: 0 };
-  const progression = isRecord(value.progression)
-    ? {
-        xp: isFiniteNonNegativeInteger(value.progression.xp) ? value.progression.xp : 0,
-        level: isFiniteNonNegativeInteger(value.progression.level) && value.progression.level > 0
-          ? value.progression.level
-          : 1,
-      }
-    : { xp: 0, level: 1 };
+    : { dayKey: "", weekKey: "", dailyRerollsRemaining: DAILY_REROLL_LIMIT, packsBoughtToday: 0, aiRewardsToday: 0 };
+  const legacyMatches = isRecord(value.stats) && isFiniteNonNegativeInteger(value.stats.matchesPlayed)
+    ? value.stats.matchesPlayed
+    : 0;
+  const hasRewardTrack = isRecord(value.rewardTrack) && Array.isArray(value.rewardTrack.claimedLevels);
+  const storedXp = isRecord(value.progression) && isFiniteNonNegativeInteger(value.progression.xp)
+    ? value.progression.xp
+    : 0;
+  // Accounts created before the progression system stored match totals but no XP.
+  // Backfill those accounts once, while preserving a deliberately reset 0-XP account
+  // after the new reward-track state has been persisted.
+  const shouldBackfillXp = legacyMatches > 0 && !hasRewardTrack && storedXp === 0;
+  const progressionXp = shouldBackfillXp ? legacyMatches * MATCH_REWARD_XP : storedXp;
+  const progression = {
+    xp: progressionXp,
+    level: isRecord(value.progression) && !shouldBackfillXp && isFiniteNonNegativeInteger(value.progression.level) && value.progression.level > 0
+      ? value.progression.level
+      : Math.floor(progressionXp / 1000) + 1,
+  };
+  const rewardTrack = isRecord(value.rewardTrack) && Array.isArray(value.rewardTrack.claimedLevels)
+    ? { claimedLevels: value.rewardTrack.claimedLevels.filter(isFiniteNonNegativeInteger) }
+    : { claimedLevels: [] };
   const ladder = isRecord(value.ladder)
     ? {
         rating: isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : 1000,
@@ -1329,7 +1521,7 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
         losses: isFiniteNonNegativeInteger(value.ladder.losses) ? value.ladder.losses : 0,
       }
     : { rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0 };
-  return { ...value, tasks, taskCycle, progression, ladder } as StoredPlayerState;
+  return { ...value, tasks, taskCycle, progression, rewardTrack, ladder } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -1351,6 +1543,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     typeof value.activeDeckId === "string" &&
     isTaskCycle(value.taskCycle) &&
     isProgression(value.progression) &&
+    isRewardTrack(value.rewardTrack) &&
     isLadder(value.ladder) &&
     value.decks.every(isDeck) &&
     value.tasks.every(isTask) &&
@@ -1370,12 +1563,18 @@ function isTaskCycle(value: unknown): value is TaskCycle {
     typeof value.dayKey === "string" &&
     typeof value.weekKey === "string" &&
     isFiniteNonNegativeInteger(value.dailyRerollsRemaining) &&
-    isFiniteNonNegativeInteger(value.packsBoughtToday)
+    isFiniteNonNegativeInteger(value.packsBoughtToday) &&
+    isFiniteNonNegativeInteger(value.aiRewardsToday) &&
+    value.aiRewardsToday <= DAILY_AI_REWARD_LIMIT
   );
 }
 
 function isProgression(value: unknown): value is PlayerProgression {
   return isRecord(value) && isFiniteNonNegativeInteger(value.xp) && isFiniteNonNegativeInteger(value.level) && value.level > 0;
+}
+
+function isRewardTrack(value: unknown): value is RewardTrackState {
+  return isRecord(value) && Array.isArray(value.claimedLevels) && value.claimedLevels.every(isFiniteNonNegativeInteger);
 }
 
 function isLadder(value: unknown): value is PlayerLadder {
@@ -1425,6 +1624,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     tasks: state.tasks.map(cloneTask),
     taskCycle: { ...state.taskCycle },
     progression: { ...state.progression },
+    rewardTrack: { claimedLevels: [...state.rewardTrack.claimedLevels] },
     ladder: { ...state.ladder },
     stats: { ...state.stats },
   };
@@ -1454,6 +1654,7 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.stats.losses === 0 &&
     state.stats.matchesPlayed === 0 &&
     state.progression.xp === 0 &&
+    state.rewardTrack.claimedLevels.length === 0 &&
     state.ladder.rating === 1000 &&
     state.tasks.every((task) => task.progress === 0 && !task.claimed)
   );
@@ -1524,6 +1725,7 @@ function refreshTaskCycle(state: StoredPlayerState, now: string): StoredPlayerSt
       weekKey,
       dailyRerollsRemaining: dayChanged || firstLoad ? DAILY_REROLL_LIMIT : state.taskCycle.dailyRerollsRemaining,
       packsBoughtToday: dayChanged || firstLoad ? 0 : state.taskCycle.packsBoughtToday,
+      aiRewardsToday: dayChanged || firstLoad ? 0 : state.taskCycle.aiRewardsToday,
     },
   };
 }
