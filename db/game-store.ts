@@ -56,6 +56,11 @@ export type TaskCycle = {
   weeklyFreePackClaimed: boolean;
 };
 
+export type PackPityState = {
+  packsOpened: number;
+  packsSinceLegendary: number;
+};
+
 export type PlayerProgression = {
   xp: number;
   level: number;
@@ -119,6 +124,7 @@ export type PlayerState = {
     dust: number;
   };
   packsAvailable: number;
+  packPity: PackPityState;
   collection: Record<string, number>;
   decks: PlayerDeck[];
   activeDeckId: string;
@@ -322,6 +328,7 @@ const MATCH_REWARD_XP = 100;
 const PACK_REWARD_XP = 50;
 const TASK_REWARD_XP = 150;
 const DAILY_REROLL_LIMIT = 1;
+const LEGENDARY_PITY_LIMIT = 40;
 const MAX_MUTATION_ATTEMPTS = 4;
 
 let schemaReady: Promise<void> | null = null;
@@ -561,7 +568,9 @@ export async function openPack(
           503,
         );
       }
-      openedCards = drawPack(current.collection);
+      const guaranteeLegendary = current.packPity.packsSinceLegendary >= LEGENDARY_PITY_LIMIT - 1;
+      openedCards = drawPack(current.collection, undefined, { guaranteeLegendary });
+      const openedLegendary = openedCards.some((opened) => CARD_CATALOG.find((card) => card.id === opened.cardId)?.rarity === "传说");
 
       const collection = { ...current.collection };
       for (const opened of openedCards) {
@@ -573,6 +582,10 @@ export async function openPack(
         nextState: {
           ...current,
           packsAvailable: current.packsAvailable - 1,
+          packPity: {
+            packsOpened: current.packPity.packsOpened + 1,
+            packsSinceLegendary: openedLegendary ? 0 : current.packPity.packsSinceLegendary + 1,
+          },
           collection,
           tasks: advanceTasksMatching(current.tasks, (task) => task.description.includes("卡包"), 1),
           progression: awardXp(current.progression, PACK_REWARD_XP),
@@ -2029,6 +2042,7 @@ function createDefaultState(now: string): StoredPlayerState {
       dust: 0,
     },
     packsAvailable: STARTING_PACKS,
+    packPity: { packsOpened: 0, packsSinceLegendary: 0 },
     collection,
     decks: [
       {
@@ -2155,6 +2169,14 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
         weeklyFreePackClaimed: value.taskCycle.weeklyFreePackClaimed === true,
       }
     : { dayKey: "", weekKey: "", dailyRerollsRemaining: DAILY_REROLL_LIMIT, packsBoughtToday: 0, aiRewardsToday: 0, weeklyFreePackClaimed: false };
+  const packPity = isRecord(value.packPity)
+    ? {
+        packsOpened: isFiniteNonNegativeInteger(value.packPity.packsOpened) ? value.packPity.packsOpened : 0,
+        packsSinceLegendary: isFiniteNonNegativeInteger(value.packPity.packsSinceLegendary)
+          ? Math.min(value.packPity.packsSinceLegendary, LEGENDARY_PITY_LIMIT - 1)
+          : 0,
+      }
+    : { packsOpened: 0, packsSinceLegendary: 0 };
   const legacyMatches = isRecord(value.stats) && isFiniteNonNegativeInteger(value.stats.matchesPlayed)
     ? value.stats.matchesPlayed
     : 0;
@@ -2189,7 +2211,7 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
           : (isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : 1000),
       }
     : { seasonKey: utcSeasonKey(new Date().toISOString()), rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0, highestRating: 1000 };
-  return { ...value, tasks, taskCycle, progression, rewardTrack, ladder } as StoredPlayerState;
+  return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, ladder } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -2199,6 +2221,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     !isFiniteNonNegativeInteger(value.currencies.gold) ||
     !isFiniteNonNegativeInteger(value.currencies.dust) ||
     !isFiniteNonNegativeInteger(value.packsAvailable) ||
+    !isPackPity(value.packPity) ||
     !isRecord(value.collection) ||
     !Array.isArray(value.decks) ||
     !Array.isArray(value.tasks) ||
@@ -2236,6 +2259,13 @@ function isTaskCycle(value: unknown): value is TaskCycle {
     typeof value.weeklyFreePackClaimed === "boolean" &&
     value.aiRewardsToday <= DAILY_AI_REWARD_LIMIT
   );
+}
+
+function isPackPity(value: unknown): value is PackPityState {
+  return isRecord(value)
+    && isFiniteNonNegativeInteger(value.packsOpened)
+    && isFiniteNonNegativeInteger(value.packsSinceLegendary)
+    && value.packsSinceLegendary < LEGENDARY_PITY_LIMIT;
 }
 
 function isProgression(value: unknown): value is PlayerProgression {
@@ -2289,6 +2319,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
   return {
     currencies: { ...state.currencies },
     packsAvailable: state.packsAvailable,
+    packPity: { ...state.packPity },
     collection: { ...state.collection },
     decks: state.decks.map(cloneDeck),
     activeDeckId: state.activeDeckId,
@@ -2317,6 +2348,8 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.currencies.gold === STARTING_GOLD &&
     state.currencies.dust === 0 &&
     state.packsAvailable === STARTING_PACKS &&
+    state.packPity.packsOpened === 0 &&
+    state.packPity.packsSinceLegendary === 0 &&
     collectionKeys.length === starter.size &&
     collectionKeys.every((cardId) => state.collection[cardId] === starter.get(cardId)) &&
     state.decks.length === 1 &&

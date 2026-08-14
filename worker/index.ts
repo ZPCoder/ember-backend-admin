@@ -76,7 +76,7 @@ type PvpDbSession = {
 type PvpDbRoom = { code: string; host_client_id: string; guest_client_id: string | null; next_sequence: number; format: "ranked" | "casual" };
 type PvpDbReady = { client_id: string; room_code: string; deck_json: string; updated_at: number };
 type PvpDbMatch = { room_code: string; match_token: string; state_json: string; format: "ranked" | "casual"; created_at: number; updated_at: number };
-type PvpDbQueue = { client_id: string; player_id: string; name: string; format: "ranked" | "casual"; joined_at: number; updated_at: number };
+type PvpDbQueue = { client_id: string; player_id: string; name: string; format: "ranked" | "casual"; rating: number; joined_at: number; updated_at: number };
 
 const PVP_SESSION_TTL_MS = 30 * 60 * 1000;
 const PVP_MAX_BODY_BYTES = 32 * 1024;
@@ -261,6 +261,7 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         player_id TEXT NOT NULL,
         name TEXT NOT NULL,
         format TEXT NOT NULL CHECK (format IN ('ranked', 'casual')),
+        rating INTEGER NOT NULL DEFAULT 1000,
         joined_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )`),
@@ -270,6 +271,7 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
       // intentionally idempotent so rolling deploys keep old rooms playable.
       try { await db.prepare(`ALTER TABLE pvp_rooms ADD COLUMN format TEXT NOT NULL DEFAULT 'ranked'`).run(); } catch { /* already present */ }
       try { await db.prepare(`ALTER TABLE pvp_matches ADD COLUMN format TEXT NOT NULL DEFAULT 'ranked'`).run(); } catch { /* already present */ }
+      try { await db.prepare(`ALTER TABLE pvp_queue ADD COLUMN rating INTEGER NOT NULL DEFAULT 1000`).run(); } catch { /* already present */ }
     }).catch((error) => {
       pvpSchemaReady = null;
       throw error;
@@ -321,8 +323,22 @@ async function getPvpDbMatch(db: PvpDatabase, roomCode: string): Promise<PvpDbMa
 }
 
 async function getPvpDbQueue(db: PvpDatabase, clientId: string): Promise<PvpDbQueue | null> {
-  return db.prepare(`SELECT client_id, player_id, name, format, joined_at, updated_at FROM pvp_queue WHERE client_id = ?`)
+  return db.prepare(`SELECT client_id, player_id, name, format, COALESCE(rating, 1000) AS rating, joined_at, updated_at FROM pvp_queue WHERE client_id = ?`)
     .bind(clientId).first<PvpDbQueue>();
+}
+
+async function getPvpPlayerRating(db: PvpDatabase, clientId: string): Promise<number> {
+  const identity = await getPvpDbIdentity(db, clientId);
+  if (!identity) return 1000;
+  const row = await db.prepare(`
+    SELECT COALESCE(json_extract(ps.state_json, '$.ladder.rating'), 1000) AS rating
+    FROM players p
+    JOIN player_states ps ON ps.player_id = p.id
+    WHERE p.identity_key = ?
+    LIMIT 1
+  `).bind(identity).first<{ rating: number | string | null }>();
+  const rating = Number(row?.rating);
+  return Number.isFinite(rating) && rating >= 0 ? Math.min(5000, Math.floor(rating)) : 1000;
 }
 
 async function dbLeaveQueue(db: PvpDatabase, session: PvpDbSession): Promise<void> {
@@ -526,12 +542,14 @@ async function dbJoinQueue(db: PvpDatabase, session: PvpDbSession, format: "rank
   await dbLeaveRoom(db, session);
   const now = Date.now();
   const cutoff = now - PVP_SESSION_TTL_MS;
+  const playerRating = await getPvpPlayerRating(db, session.client_id);
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const candidate = await db.prepare(`SELECT q.client_id, q.player_id, q.name, q.format, q.joined_at, q.updated_at
+    const candidate = await db.prepare(`SELECT q.client_id, q.player_id, q.name, q.format, COALESCE(q.rating, 1000) AS rating, q.joined_at, q.updated_at
       FROM pvp_queue q JOIN pvp_sessions s ON s.client_id = q.client_id
       WHERE q.format = ? AND q.client_id <> ? AND q.player_id <> ? AND q.updated_at >= ? AND s.room_code IS NULL
-      ORDER BY q.joined_at ASC LIMIT 1`)
-      .bind(format, session.client_id, session.player_id, cutoff).first<PvpDbQueue>();
+        AND (? = 'casual' OR ABS(COALESCE(q.rating, 1000) - ?) <= MIN(800, 200 + CAST(MAX(0, (? - q.joined_at) / 10000) AS INTEGER) * 100))
+      ORDER BY CASE WHEN ? = 'casual' THEN 0 ELSE ABS(COALESCE(q.rating, 1000) - ?) END ASC, q.joined_at ASC LIMIT 1`)
+      .bind(format, session.client_id, session.player_id, cutoff, format, playerRating, now, format, playerRating).first<PvpDbQueue>();
     if (!candidate) break;
     const removed = await db.prepare(`DELETE FROM pvp_queue WHERE client_id = ? AND updated_at = ?`)
       .bind(candidate.client_id, candidate.updated_at).run();
@@ -555,10 +573,10 @@ async function dbJoinQueue(db: PvpDatabase, session: PvpDbSession, format: "rank
     if (room) await dbRoomState(db, room);
     return;
   }
-  await db.prepare(`INSERT INTO pvp_queue (client_id, player_id, name, format, joined_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(client_id) DO UPDATE SET player_id = excluded.player_id, name = excluded.name, format = excluded.format, updated_at = excluded.updated_at`)
-    .bind(session.client_id, session.player_id, session.name, format, now, now).run();
-  await queuePvpDbMessage(db, session.client_id, { type: "queue_joined", format, joinedAt: now, message: `${format === "ranked" ? "天梯" : "休闲"}匹配中，正在寻找同模式对手…` });
+  await db.prepare(`INSERT INTO pvp_queue (client_id, player_id, name, format, rating, joined_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(client_id) DO UPDATE SET player_id = excluded.player_id, name = excluded.name, format = excluded.format, rating = excluded.rating, updated_at = excluded.updated_at`)
+    .bind(session.client_id, session.player_id, session.name, format, playerRating, now, now).run();
+  await queuePvpDbMessage(db, session.client_id, { type: "queue_joined", format, rating: playerRating, joinedAt: now, message: `${format === "ranked" ? "天梯" : "休闲"}匹配中，${format === "ranked" ? "优先寻找相近段位" : "正在寻找同模式对手"}…` });
 }
 
 async function nextPvpSequence(db: PvpDatabase, room: PvpDbRoom): Promise<number> {
