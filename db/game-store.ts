@@ -14,6 +14,12 @@ import {
   craftCost,
   disenchantValue,
 } from "../lib/game/economy.ts";
+import {
+  LADDER_START_RATING,
+  ladderStarsForRating,
+  ladderTierForRating,
+  updateRankedSnapshot,
+} from "../lib/game/ranked.ts";
 
 export type MatchResult = "win" | "loss";
 export type MatchMode = "ai" | "pvp";
@@ -78,6 +84,7 @@ export type PlayerLadder = {
   wins: number;
   losses: number;
   highestRating: number;
+  winStreak?: number;
 };
 
 export type FriendSummary = {
@@ -746,6 +753,20 @@ async function mutateFriendLink(
   const action = `friend_${operation}`;
   const auditId = `audit-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 24)}`;
   const resultJson = JSON.stringify({ friendId: friend.id });
+  if (operation === "send") {
+    const recentSince = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const recentRequests = await db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM friend_links
+         WHERE requested_by = ? AND created_at >= ?`,
+      )
+      .bind(player.id, recentSince)
+      .first<{ count: number | string }>();
+    if (Number(recentRequests?.count ?? 0) >= 20) {
+      throw new GameStoreError("FRIEND_REQUEST_RATE_LIMIT", "今日好友请求已达到上限，请明天再试。", 429);
+    }
+  }
   const socialStatement = operation === "accept"
     ? db.prepare(
         `UPDATE friend_links
@@ -799,6 +820,18 @@ export async function sendChatMessage(
     if (existingAudit.action !== "send_chat") throw new GameStoreError("IDEMPOTENCY_KEY_REUSED", "该幂等键已经用于其他操作。", 409);
     const message = parseChatAudit(existingAudit.resultJson);
     return { player: await loadPublicPlayer(db, player), message, replayed: true };
+  }
+  const recentSince = new Date(Date.now() - 60 * 1000).toISOString();
+  const recentMessages = await db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM social_messages
+       WHERE sender_id = ? AND created_at >= ?`,
+    )
+    .bind(player.id, recentSince)
+    .first<{ count: number | string }>();
+  if (Number(recentMessages?.count ?? 0) >= 20) {
+    throw new GameStoreError("CHAT_RATE_LIMIT", "消息发送过于频繁，请稍后再试。", 429);
   }
   const now = new Date().toISOString();
   const message: SocialMessage = {
@@ -1929,6 +1962,10 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
       `CREATE INDEX IF NOT EXISTS friend_links_player_b_idx ON friend_links (player_b, status)`,
     ),
     db.prepare(
+      `CREATE INDEX IF NOT EXISTS friend_links_requested_created_idx
+       ON friend_links (requested_by, created_at)`,
+    ),
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS social_messages (
         id TEXT PRIMARY KEY NOT NULL,
         sender_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
@@ -1940,6 +1977,10 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
     db.prepare(
       `CREATE INDEX IF NOT EXISTS social_messages_pair_idx
        ON social_messages (sender_id, recipient_id, created_at)`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS social_messages_sender_created_idx
+       ON social_messages (sender_id, created_at)`,
     ),
     db.prepare(
       `CREATE TABLE IF NOT EXISTS social_blocks (
@@ -2109,7 +2150,7 @@ function createDefaultState(now: string): StoredPlayerState {
     },
     progression: { xp: 0, level: 1 },
     rewardTrack: { claimedLevels: [] },
-    ladder: { seasonKey: utcSeasonKey(now), rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0, highestRating: 1000 },
+    ladder: { seasonKey: utcSeasonKey(now), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 },
     stats: {
       wins: 0,
       losses: 0,
@@ -2201,16 +2242,19 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
   const ladder = isRecord(value.ladder)
     ? {
         seasonKey: typeof value.ladder.seasonKey === "string" ? value.ladder.seasonKey : utcSeasonKey(new Date().toISOString()),
-        rating: isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : 1000,
-        tier: typeof value.ladder.tier === "string" ? value.ladder.tier : "青铜",
-        stars: isFiniteNonNegativeInteger(value.ladder.stars) ? value.ladder.stars : 0,
+        rating: isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : LADDER_START_RATING,
+        tier: typeof value.ladder.tier === "string" ? value.ladder.tier : ladderTierForRating(LADDER_START_RATING),
+        stars: isFiniteNonNegativeInteger(value.ladder.stars) ? value.ladder.stars : ladderStarsForRating(LADDER_START_RATING),
         wins: isFiniteNonNegativeInteger(value.ladder.wins) ? value.ladder.wins : 0,
         losses: isFiniteNonNegativeInteger(value.ladder.losses) ? value.ladder.losses : 0,
         highestRating: isFiniteNonNegativeInteger(value.ladder.highestRating)
           ? value.ladder.highestRating
-          : (isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : 1000),
+          : (isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : LADDER_START_RATING),
+        winStreak: isFiniteNonNegativeInteger(value.ladder.winStreak) ? value.ladder.winStreak : 0,
       }
-    : { seasonKey: utcSeasonKey(new Date().toISOString()), rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0, highestRating: 1000 };
+    : { seasonKey: utcSeasonKey(new Date().toISOString()), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 };
+  ladder.tier = ladderTierForRating(ladder.rating);
+  ladder.stars = ladderStarsForRating(ladder.rating);
   return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, ladder } as StoredPlayerState;
 }
 
@@ -2285,7 +2329,8 @@ function isLadder(value: unknown): value is PlayerLadder {
     isFiniteNonNegativeInteger(value.stars) &&
     isFiniteNonNegativeInteger(value.wins) &&
     isFiniteNonNegativeInteger(value.losses) &&
-    isFiniteNonNegativeInteger(value.highestRating)
+    isFiniteNonNegativeInteger(value.highestRating) &&
+    (value.winStreak === undefined || isFiniteNonNegativeInteger(value.winStreak))
   );
 }
 
@@ -2370,17 +2415,7 @@ function awardXp(progression: PlayerProgression, amount: number): PlayerProgress
 }
 
 function updateLadder(ladder: PlayerLadder, result: MatchResult): PlayerLadder {
-  const rating = Math.max(0, ladder.rating + (result === "win" ? 25 : -20));
-  const tier = rating >= 1800 ? "传说" : rating >= 1600 ? "钻石" : rating >= 1400 ? "白金" : rating >= 1200 ? "黄金" : rating >= 1000 ? "白银" : "青铜";
-  return {
-    seasonKey: ladder.seasonKey,
-    rating,
-    tier,
-    stars: Math.floor((rating % 200) / 50),
-    wins: ladder.wins + (result === "win" ? 1 : 0),
-    losses: ladder.losses + (result === "loss" ? 1 : 0),
-    highestRating: Math.max(ladder.highestRating, rating),
-  };
+  return updateRankedSnapshot(ladder, result);
 }
 
 function advanceMatchTasks(
@@ -2437,7 +2472,7 @@ function refreshTaskCycle(state: StoredPlayerState, now: string): StoredPlayerSt
       weeklyFreePackClaimed: weekChanged || firstLoad ? false : state.taskCycle.weeklyFreePackClaimed,
     },
     ladder: seasonChanged || firstLoad
-      ? { ...state.ladder, seasonKey, rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0 }
+      ? { ...state.ladder, seasonKey, rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, winStreak: 0 }
       : state.ladder,
   };
 }
