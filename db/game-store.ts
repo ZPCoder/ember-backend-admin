@@ -5,6 +5,7 @@ import {
   DEFAULT_STARTER_DECK,
   DEFAULT_CARD_BACK_ID,
   LADDER_READY_TRIAL_MS,
+  LADDER_READY_DECK_PRICE_GOLD,
   MAX_SAVED_DECKS,
   removeSavedDeck,
   aiMatchTicketMatchesProof,
@@ -40,8 +41,9 @@ import {
   isCardBackId,
   normalizeOwnedCardBackId,
   normalizeFavoriteCardBackIds,
+  normalizePurchasedLadderReadyDeckIds,
 } from "../lib/game";
-import type { BattleCommand, CatchUpPackProgress, LadderReadyCatalogVersionId, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrainingCampaignState, TrainingChapterId, TrialCardAccess } from "../lib/game";
+import type { BattleCommand, CatchUpPackProgress, LadderReadyCatalogVersionId, LadderReadyDeck, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrainingCampaignState, TrainingChapterId, TrialCardAccess } from "../lib/game";
 import {
   BULK_PACK_MAX_COUNT,
   BULK_PACK_MIN_COUNT,
@@ -165,6 +167,7 @@ export type LadderReadyState = {
   expiresAt: string | null;
   claimedDeckId: LadderReadyDeckId | null;
   catalogVersionId: LadderReadyCatalogVersionId | null;
+  purchasedDeckIds: LadderReadyDeckId[];
 };
 
 export type CatchUpPackState = CatchUpPackProgress & {
@@ -382,6 +385,13 @@ export type ActivateLadderReadyResult = {
 export type ClaimLadderReadyDeckResult = {
   player: PlayerState;
   claimedLadderReadyDeck: PlayerDeck;
+  replayed: boolean;
+};
+
+export type PurchaseLadderReadyDeckResult = {
+  player: PlayerState;
+  purchasedLadderReadyDeck: PlayerDeck;
+  costGold: number;
   replayed: boolean;
 };
 
@@ -2081,6 +2091,7 @@ export async function activateLadderReady(
             expiresAt: new Date(activatedAt.getTime() + LADDER_READY_TRIAL_MS).toISOString(),
             claimedDeckId: null,
             catalogVersionId,
+            purchasedDeckIds: [],
           },
           trialCards: {
             activatedAt: activatedAt.toISOString(),
@@ -2095,6 +2106,50 @@ export async function activateLadderReady(
       };
     },
   ).then(({ player: nextPlayer, replayed }) => ({ player: nextPlayer, replayed }));
+}
+
+function acquireLadderReadyDeck(
+  current: StoredPlayerState,
+  offer: LadderReadyDeck,
+): {
+  deck: PlayerDeck;
+  state: Pick<StoredPlayerState, "collection" | "catchUpPack" | "decks" | "activeDeckId">;
+} {
+  const validation = validateDeck(offer.deck);
+  if (!validation.valid) {
+    throw new GameStoreError("INVALID_DECK", "天梯预备套牌当前不可用。", 500, validation.errors);
+  }
+  const deck: PlayerDeck = {
+    id: `ladder-ready-${offer.id}`,
+    name: `${offer.faction} · ${offer.name}`,
+    format: "standard",
+    cardIds: [...offer.deck],
+    cardBackId: DEFAULT_CARD_BACK_ID,
+    updatedAt: new Date().toISOString(),
+  };
+  if (!current.decks.some((candidate) => candidate.id === deck.id) && current.decks.length >= MAX_SAVED_DECKS) {
+    throw new GameStoreError("DECK_LIMIT_REACHED", `已保存卡组已达 ${MAX_SAVED_DECKS} 套上限，请先整理卡组。`, 409);
+  }
+  const required = cardCounts(offer.deck);
+  const collection = { ...current.collection };
+  const grantedCardIds: string[] = [];
+  for (const [cardId, count] of required) {
+    const granted = Math.max(0, count - (collection[cardId] ?? 0));
+    for (let index = 0; index < granted; index += 1) grantedCardIds.push(cardId);
+    collection[cardId] = Math.max(collection[cardId] ?? 0, count);
+  }
+  return {
+    deck,
+    state: {
+      collection,
+      catchUpPack: {
+        ...current.catchUpPack,
+        ...recordCatchUpCards(current.catchUpPack, grantedCardIds),
+      },
+      decks: [...current.decks.filter((candidate) => candidate.id !== deck.id), deck],
+      activeDeckId: deck.id,
+    },
+  };
 }
 
 export async function claimLadderReadyDeck(
@@ -2121,51 +2176,72 @@ export async function claimLadderReadyDeck(
       const catalog = ladderReadyCatalogForTrial(current.ladderReady);
       const offer = getLadderReadyDeck(input.deckId, catalog.id);
       if (!offer) throw new GameStoreError("LADDER_READY_DECK_NOT_FOUND", "天梯预备套牌不存在。", 404);
-      const validation = validateDeck(offer.deck);
-      if (!validation.valid) {
-        throw new GameStoreError("INVALID_DECK", "天梯预备套牌当前不可用。", 500, validation.errors);
-      }
-      const claimedDeck: PlayerDeck = {
-        id: `ladder-ready-${offer.id}`,
-        name: `${offer.faction} · ${offer.name}`,
-        format: "standard",
-        cardIds: [...offer.deck],
-        cardBackId: DEFAULT_CARD_BACK_ID,
-        updatedAt: new Date().toISOString(),
-      };
-      if (!current.decks.some((deck) => deck.id === claimedDeck.id) && current.decks.length >= MAX_SAVED_DECKS) {
-        throw new GameStoreError("DECK_LIMIT_REACHED", `已保存卡组已达 ${MAX_SAVED_DECKS} 套上限，请先整理卡组。`, 409);
-      }
-      const required = cardCounts(offer.deck);
-      const collection = { ...current.collection };
-      const grantedCardIds: string[] = [];
-      for (const [cardId, count] of required) {
-        const granted = Math.max(0, count - (collection[cardId] ?? 0));
-        for (let index = 0; index < granted; index += 1) grantedCardIds.push(cardId);
-        collection[cardId] = Math.max(collection[cardId] ?? 0, count);
-      }
-      const decks = [
-        ...current.decks.filter((deck) => deck.id !== claimedDeck.id),
-        claimedDeck,
-      ];
+      const acquired = acquireLadderReadyDeck(current, offer);
       return {
         nextState: {
           ...current,
-          collection,
-          catchUpPack: {
-            ...current.catchUpPack,
-            ...recordCatchUpCards(current.catchUpPack, grantedCardIds),
-          },
-          decks,
-          activeDeckId: claimedDeck.id,
+          ...acquired.state,
           ladderReady: { ...current.ladderReady, claimedDeckId: offer.id, catalogVersionId: catalog.id },
         },
-        result: { claimedLadderReadyDeck: claimedDeck },
+        result: { claimedLadderReadyDeck: acquired.deck },
       };
     },
   ).then(({ player: nextPlayer, result, replayed }) => ({
     player: nextPlayer,
     claimedLadderReadyDeck: result.claimedLadderReadyDeck,
+    replayed,
+  }));
+}
+
+export async function purchaseLadderReadyDeck(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; deckId: LadderReadyDeckId },
+): Promise<PurchaseLadderReadyDeckResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+
+  return commitMutation(
+    db,
+    player,
+    "purchase_ladder_ready_deck",
+    input.idempotencyKey,
+    { deckId: input.deckId, costGold: LADDER_READY_DECK_PRICE_GOLD },
+    (current) => {
+      if (!current.ladderReady.claimedDeckId) {
+        throw new GameStoreError("LADDER_READY_FREE_CLAIM_REQUIRED", "请先选择并领取一套免费天梯预备套牌。", 409);
+      }
+      if (current.ladderReady.claimedDeckId === input.deckId || current.ladderReady.purchasedDeckIds.includes(input.deckId)) {
+        throw new GameStoreError("LADDER_READY_DECK_ALREADY_OWNED", "这套天梯预备套牌已经拥有。", 409);
+      }
+      if (current.currencies.gold < LADDER_READY_DECK_PRICE_GOLD) {
+        throw new GameStoreError("INSUFFICIENT_GOLD", "金币不足，无法购买这套天梯预备套牌。", 409);
+      }
+      const catalog = ladderReadyCatalogForTrial(current.ladderReady);
+      const offer = getLadderReadyDeck(input.deckId, catalog.id);
+      if (!offer) throw new GameStoreError("LADDER_READY_DECK_NOT_FOUND", "天梯预备套牌不存在。", 404);
+      const acquired = acquireLadderReadyDeck(current, offer);
+      return {
+        nextState: {
+          ...current,
+          ...acquired.state,
+          currencies: {
+            ...current.currencies,
+            gold: current.currencies.gold - LADDER_READY_DECK_PRICE_GOLD,
+          },
+          ladderReady: {
+            ...current.ladderReady,
+            catalogVersionId: catalog.id,
+            purchasedDeckIds: [...current.ladderReady.purchasedDeckIds, offer.id],
+          },
+        },
+        result: { purchasedLadderReadyDeck: acquired.deck, costGold: LADDER_READY_DECK_PRICE_GOLD },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    purchasedLadderReadyDeck: result.purchasedLadderReadyDeck,
+    costGold: result.costGold,
     replayed,
   }));
 }
@@ -3935,7 +4011,7 @@ function createDefaultState(now: string): StoredPlayerState {
     progression: { xp: 0, level: 1 },
     rewardTrack: { claimedLevels: [] },
     apprenticeTrack: { claimedMilestones: [] },
-    ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null },
+    ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null, purchasedDeckIds: [] },
     catchUpPack: { claimedAt: null, cardsGranted: 0, ...catchUpProgress },
     trialCards: { activatedAt: null, expiresAt: null },
     returnJourney: { claimedStageIds: [], matchesPlayedAtActivation: 0 },
@@ -4113,8 +4189,12 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
           ? value.ladderReady.claimedDeckId as LadderReadyDeckId
           : null,
         catalogVersionId: ladderReadyCatalog?.id ?? null,
+        purchasedDeckIds: normalizePurchasedLadderReadyDeckIds(
+          value.ladderReady.purchasedDeckIds,
+          typeof value.ladderReady.claimedDeckId === "string" ? value.ladderReady.claimedDeckId as LadderReadyDeckId : null,
+        ),
       }
-    : { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null };
+    : { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null, purchasedDeckIds: [] };
   const migratedCatchUpProgress = catchUpProgressFromCollection(
     isRecord(value.collection)
       ? Object.fromEntries(Object.entries(value.collection).filter((entry): entry is [string, number] => typeof entry[1] === "number"))
@@ -4302,6 +4382,7 @@ function isLadderReadyState(value: unknown): value is LadderReadyState {
   const expiresAt = value.expiresAt;
   const claimedDeckId = value.claimedDeckId;
   const catalogVersionId = value.catalogVersionId;
+  const purchasedDeckIds = value.purchasedDeckIds;
   const noTrial = activatedAt === null && expiresAt === null;
   const validTrial = typeof activatedAt === "string" && Number.isFinite(Date.parse(activatedAt))
     && typeof expiresAt === "string" && Number.isFinite(Date.parse(expiresAt))
@@ -4309,7 +4390,9 @@ function isLadderReadyState(value: unknown): value is LadderReadyState {
   return (noTrial || validTrial)
     && (catalogVersionId === null || (typeof catalogVersionId === "string" && Boolean(getLadderReadyCatalog(catalogVersionId))))
     && (activatedAt === null ? catalogVersionId === null : catalogVersionId !== null)
-    && (claimedDeckId === null || (typeof claimedDeckId === "string" && Boolean(getLadderReadyDeck(claimedDeckId, typeof catalogVersionId === "string" ? catalogVersionId : null))));
+    && (claimedDeckId === null || (typeof claimedDeckId === "string" && Boolean(getLadderReadyDeck(claimedDeckId, typeof catalogVersionId === "string" ? catalogVersionId : null))))
+    && Array.isArray(purchasedDeckIds)
+    && normalizePurchasedLadderReadyDeckIds(purchasedDeckIds, typeof claimedDeckId === "string" ? claimedDeckId as LadderReadyDeckId : null).length === purchasedDeckIds.length;
 }
 
 function isCatchUpPackState(value: unknown): value is CatchUpPackState {
@@ -4450,7 +4533,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     progression: { ...state.progression },
     rewardTrack: { claimedLevels: [...state.rewardTrack.claimedLevels] },
     apprenticeTrack: { claimedMilestones: [...state.apprenticeTrack.claimedMilestones] },
-    ladderReady: { ...state.ladderReady },
+    ladderReady: { ...state.ladderReady, purchasedDeckIds: [...state.ladderReady.purchasedDeckIds] },
     catchUpPack: {
       ...state.catchUpPack,
       cardsSeenBySet: { ...state.catchUpPack.cardsSeenBySet },

@@ -2,6 +2,7 @@ import { getChatGPTUser } from "../../chatgpt-auth";
 import {
   claimApprenticeReward,
   claimLadderReadyDeck,
+  purchaseLadderReadyDeck,
   claimCatchUpPack,
   claimReturnQuest,
   claimTask,
@@ -85,6 +86,11 @@ type GameAction =
     }
   | {
       action: "claim_ladder_ready_deck";
+      idempotencyKey: string;
+      deckId: LadderReadyDeckId;
+    }
+  | {
+      action: "purchase_ladder_ready_deck";
       idempotencyKey: string;
       deckId: LadderReadyDeckId;
     }
@@ -293,6 +299,17 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           claimedLadderReadyDeck: result.claimedLadderReadyDeck,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "purchase_ladder_ready_deck": {
+        const result = await purchaseLadderReadyDeck(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          purchasedLadderReadyDeck: result.purchasedLadderReadyDeck,
+          costGold: result.costGold,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -738,6 +755,18 @@ function parseAction(value: unknown): GameAction {
       }
       return {
         action: "claim_ladder_ready_deck",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        deckId: deckId as LadderReadyDeckId,
+      };
+    }
+    case "purchase_ladder_ready_deck": {
+      assertExactKeys(value, ["action", "idempotencyKey", "deckId"]);
+      const deckId = parseIdentifier(value.deckId, "deckId");
+      if (!LADDER_READY_DECKS.some((deck) => deck.id === deckId)) {
+        throw new PayloadError("deckId 不是有效的天梯预备套牌。");
+      }
+      return {
+        action: "purchase_ladder_ready_deck",
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
         deckId: deckId as LadderReadyDeckId,
       };
