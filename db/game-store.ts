@@ -4,6 +4,7 @@ import {
   CARD_CATALOG,
   DEFAULT_STARTER_DECK,
   LADDER_READY_TRIAL_MS,
+  MAX_SAVED_DECKS,
   aiMatchTicketMatchesProof,
   applyCommand,
   chooseAiMulliganIndexes,
@@ -685,10 +686,10 @@ export async function saveDeck(
       if (existingIndex >= 0) {
         decks[existingIndex] = requestedDeck;
       } else {
-        if (decks.length >= 20) {
+        if (decks.length >= MAX_SAVED_DECKS) {
           throw new GameStoreError(
             "DECK_LIMIT_REACHED",
-            "最多只能保存 20 套卡组。",
+            `最多只能保存 ${MAX_SAVED_DECKS} 套卡组。`,
             409,
           );
         }
@@ -1535,8 +1536,8 @@ export async function claimLadderReadyDeck(
         cardIds: [...offer.deck],
         updatedAt: new Date().toISOString(),
       };
-      if (!current.decks.some((deck) => deck.id === claimedDeck.id) && current.decks.length >= 20) {
-        throw new GameStoreError("DECK_LIMIT_REACHED", "已保存卡组已达 20 套上限，请先整理卡组。", 409);
+      if (!current.decks.some((deck) => deck.id === claimedDeck.id) && current.decks.length >= MAX_SAVED_DECKS) {
+        throw new GameStoreError("DECK_LIMIT_REACHED", `已保存卡组已达 ${MAX_SAVED_DECKS} 套上限，请先整理卡组。`, 409);
       }
       const required = cardCounts(offer.deck);
       const collection = { ...current.collection };
