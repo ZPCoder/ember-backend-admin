@@ -2,6 +2,7 @@ import { getChatGPTUser } from "../../chatgpt-auth";
 import {
   claimApprenticeReward,
   claimLadderReadyDeck,
+  claimCatchUpPack,
   claimTask,
   claimReward,
   claimWeeklyPack,
@@ -73,6 +74,10 @@ type GameAction =
       action: "claim_ladder_ready_deck";
       idempotencyKey: string;
       deckId: LadderReadyDeckId;
+    }
+  | {
+      action: "claim_catch_up_pack";
+      idempotencyKey: string;
     }
   | {
       action: "save_deck";
@@ -232,6 +237,16 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           claimedLadderReadyDeck: result.claimedLadderReadyDeck,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "claim_catch_up_pack": {
+        const result = await claimCatchUpPack(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          openedCards: result.openedCards,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -586,6 +601,12 @@ function parseAction(value: unknown): GameAction {
         deckId: deckId as LadderReadyDeckId,
       };
     }
+    case "claim_catch_up_pack":
+      assertExactKeys(value, ["action", "idempotencyKey"]);
+      return {
+        action: "claim_catch_up_pack",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+      };
     case "save_deck": {
       assertExactKeys(value, ["action", "idempotencyKey", "deck"]);
       const idempotencyKey = parseIdempotencyKey(value.idempotencyKey);

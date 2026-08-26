@@ -13,6 +13,7 @@ import {
   derivePvpSettlement,
   runAiTurn,
   getLadderReadyDeck,
+  generateCatchUpPack,
   ladderReadyTrialIsActive,
   validateDeck,
   validateDeckForFormat,
@@ -120,6 +121,11 @@ export type LadderReadyState = {
   claimedDeckId: LadderReadyDeckId | null;
 };
 
+export type CatchUpPackState = {
+  claimedAt: string | null;
+  cardsGranted: number;
+};
+
 export type PlayerLadder = RankedSnapshot;
 
 export type FriendSummary = {
@@ -189,6 +195,7 @@ export type PlayerState = {
   rewardTrack: RewardTrackState;
   apprenticeTrack: ApprenticeTrackState;
   ladderReady: LadderReadyState;
+  catchUpPack: CatchUpPackState;
   rankedLadders: RankedLadders;
   rankedRewards: RankedRewardState;
   friends?: FriendSummary[];
@@ -299,6 +306,12 @@ export type ActivateLadderReadyResult = {
 export type ClaimLadderReadyDeckResult = {
   player: PlayerState;
   claimedLadderReadyDeck: PlayerDeck;
+  replayed: boolean;
+};
+
+export type ClaimCatchUpPackResult = {
+  player: PlayerState;
+  openedCards: Array<{ cardId: string; count: number }>;
   replayed: boolean;
 };
 
@@ -1617,6 +1630,55 @@ export async function claimLadderReadyDeck(
   ).then(({ player: nextPlayer, result, replayed }) => ({
     player: nextPlayer,
     claimedLadderReadyDeck: result.claimedLadderReadyDeck,
+    replayed,
+  }));
+}
+
+export async function claimCatchUpPack(
+  identity: GameIdentity,
+  input: { idempotencyKey: string },
+): Promise<ClaimCatchUpPackResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  return commitMutation(
+    db,
+    player,
+    "claim_catch_up_pack",
+    input.idempotencyKey,
+    {},
+    (current) => {
+      if (!current.ladderReady.activatedAt) {
+        throw new GameStoreError("CATCH_UP_NOT_UNLOCKED", "请先启动回归扶持计划。", 409);
+      }
+      if (current.catchUpPack.claimedAt) {
+        throw new GameStoreError("CATCH_UP_ALREADY_CLAIMED", "本账号已经领取过追赶包。", 409);
+      }
+      const seed = current.stats.matchesPlayed
+        + current.packPity.packsOpened * 31
+        + Object.values(current.collection).reduce((sum, count) => sum + count, 0) * 131;
+      const cards = generateCatchUpPack(current.collection, seed);
+      const collection = { ...current.collection };
+      const counts = new Map<string, number>();
+      for (const cardId of cards) {
+        collection[cardId] = (collection[cardId] ?? 0) + 1;
+        counts.set(cardId, (counts.get(cardId) ?? 0) + 1);
+      }
+      const claimedAt = new Date().toISOString();
+      return {
+        nextState: {
+          ...current,
+          collection,
+          catchUpPack: { claimedAt, cardsGranted: cards.length },
+        },
+        result: {
+          openedCards: [...counts].map(([cardId, count]) => ({ cardId, count })),
+        },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    openedCards: result.openedCards,
     replayed,
   }));
 }
@@ -3246,6 +3308,7 @@ function createDefaultState(now: string): StoredPlayerState {
     rewardTrack: { claimedLevels: [] },
     apprenticeTrack: { claimedMilestones: [] },
     ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null },
+    catchUpPack: { claimedAt: null, cardsGranted: 0 },
     rankedLadders: createRankedLadders(utcSeasonKey(now)),
     rankedRewards: createRankedRewardState(),
     stats: {
@@ -3366,13 +3429,21 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
           : null,
       }
     : { activatedAt: null, expiresAt: null, claimedDeckId: null };
+  const catchUpPack = isRecord(value.catchUpPack)
+    ? {
+        claimedAt: typeof value.catchUpPack.claimedAt === "string" ? value.catchUpPack.claimedAt : null,
+        cardsGranted: isFiniteNonNegativeInteger(value.catchUpPack.cardsGranted)
+          ? value.catchUpPack.cardsGranted
+          : 0,
+      }
+    : { claimedAt: null, cardsGranted: 0 };
   const rankedLadders = normalizeRankedLadders(
     value.rankedLadders,
     value.ladder,
     utcSeasonKey(new Date().toISOString()),
   );
   const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
-  return { ...value, decks, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, rankedLadders, rankedRewards } as StoredPlayerState;
+  return { ...value, decks, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, rankedLadders, rankedRewards } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -3398,6 +3469,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isRewardTrack(value.rewardTrack) &&
     isApprenticeTrack(value.apprenticeTrack) &&
     isLadderReadyState(value.ladderReady) &&
+    isCatchUpPackState(value.catchUpPack) &&
     isRankedLadders(value.rankedLadders) &&
     isRankedRewardState(value.rankedRewards) &&
     value.decks.every(isDeck) &&
@@ -3459,6 +3531,13 @@ function isLadderReadyState(value: unknown): value is LadderReadyState {
     && Date.parse(expiresAt) > Date.parse(activatedAt);
   return (noTrial || validTrial)
     && (claimedDeckId === null || (typeof claimedDeckId === "string" && Boolean(getLadderReadyDeck(claimedDeckId))));
+}
+
+function isCatchUpPackState(value: unknown): value is CatchUpPackState {
+  return isRecord(value)
+    && (value.claimedAt === null
+      || (typeof value.claimedAt === "string" && Number.isFinite(Date.parse(value.claimedAt))))
+    && isFiniteNonNegativeInteger(value.cardsGranted);
 }
 
 function isLadder(value: unknown): value is PlayerLadder {
@@ -3548,6 +3627,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     rewardTrack: { claimedLevels: [...state.rewardTrack.claimedLevels] },
     apprenticeTrack: { claimedMilestones: [...state.apprenticeTrack.claimedMilestones] },
     ladderReady: { ...state.ladderReady },
+    catchUpPack: { ...state.catchUpPack },
     rankedLadders: cloneRankedLadders(state.rankedLadders),
     rankedRewards: {
       claimedFirstTimeFloors: [...state.rankedRewards.claimedFirstTimeFloors],
@@ -3589,6 +3669,7 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.apprenticeTrack.claimedMilestones.length === 0 &&
     state.ladderReady.activatedAt === null &&
     state.ladderReady.claimedDeckId === null &&
+    state.catchUpPack.claimedAt === null &&
     state.rankedLadders.standard.rankProgress === 0 &&
     state.rankedLadders.wild.rankProgress === 0 &&
     state.rankedRewards.claimedFirstTimeFloors.length === 0 &&
