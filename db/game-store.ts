@@ -13,7 +13,10 @@ import {
   derivePvpSettlement,
   runAiTurn,
   getLadderReadyDeck,
-  generateCatchUpPack,
+  generateCatchUpPackReward,
+  catchUpProgressFromCollection,
+  recordCatchUpCards,
+  CATCH_UP_PACK_SETS,
   collectionWithTrialCards,
   TRIAL_CARD_ACCESS_MS,
   RETURN_QUEST_STAGE_IDS,
@@ -22,7 +25,7 @@ import {
   validateDeck,
   validateDeckForFormat,
 } from "../lib/game";
-import type { BattleCommand, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrialCardAccess } from "../lib/game";
+import type { BattleCommand, CatchUpPackProgress, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrialCardAccess } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
 import {
   APPRENTICE_MILESTONES,
@@ -125,7 +128,7 @@ export type LadderReadyState = {
   claimedDeckId: LadderReadyDeckId | null;
 };
 
-export type CatchUpPackState = {
+export type CatchUpPackState = CatchUpPackProgress & {
   claimedAt: string | null;
   cardsGranted: number;
 };
@@ -896,6 +899,10 @@ export async function openPack(
       const guaranteeLegendary = current.packPity.packsSinceLegendary >= LEGENDARY_PITY_LIMIT - 1;
       openedCards = drawPack(current.collection, undefined, { guaranteeLegendary });
       const openedLegendary = openedCards.some((opened) => CARD_CATALOG.find((card) => card.id === opened.cardId)?.rarity === "传说");
+      const catchUpProgress = recordCatchUpCards(
+        current.catchUpPack,
+        openedCards.flatMap((opened) => Array.from({ length: opened.count }, () => opened.cardId)),
+      );
 
       const collection = { ...current.collection };
       for (const opened of openedCards) {
@@ -911,6 +918,7 @@ export async function openPack(
             packsOpened: current.packPity.packsOpened + 1,
             packsSinceLegendary: openedLegendary ? 0 : current.packPity.packsSinceLegendary + 1,
           },
+          catchUpPack: { ...current.catchUpPack, ...catchUpProgress },
           collection,
           tasks: advanceTasksMatching(current.tasks, (task) => task.description.includes("卡包"), 1),
           progression: awardXp(current.progression, PACK_REWARD_XP),
@@ -1384,6 +1392,8 @@ export async function craftCard(
       if (current.currencies.dust < cost) {
         throw new GameStoreError("INSUFFICIENT_DUST", "星尘不足，无法制作这张卡。", 409);
       }
+      // Crafting counts as having received the card even if it is later
+      // disenchanted, matching Catch-Up Pack collection accounting.
       return {
         nextState: {
           ...current,
@@ -1391,6 +1401,10 @@ export async function craftCard(
           collection: {
             ...current.collection,
             [input.cardId]: (current.collection[input.cardId] ?? 0) + 1,
+          },
+          catchUpPack: {
+            ...current.catchUpPack,
+            ...recordCatchUpCards(current.catchUpPack, [input.cardId]),
           },
         },
         result: { cardId: input.cardId, amount: cost, kind: "craft" as const },
@@ -1633,7 +1647,10 @@ export async function claimLadderReadyDeck(
       }
       const required = cardCounts(offer.deck);
       const collection = { ...current.collection };
+      const grantedCardIds: string[] = [];
       for (const [cardId, count] of required) {
+        const granted = Math.max(0, count - (collection[cardId] ?? 0));
+        for (let index = 0; index < granted; index += 1) grantedCardIds.push(cardId);
         collection[cardId] = Math.max(collection[cardId] ?? 0, count);
       }
       const decks = [
@@ -1644,6 +1661,10 @@ export async function claimLadderReadyDeck(
         nextState: {
           ...current,
           collection,
+          catchUpPack: {
+            ...current.catchUpPack,
+            ...recordCatchUpCards(current.catchUpPack, grantedCardIds),
+          },
           decks,
           activeDeckId: claimedDeck.id,
           ladderReady: { ...current.ladderReady, claimedDeckId: offer.id },
@@ -1681,7 +1702,8 @@ export async function claimCatchUpPack(
       const seed = current.stats.matchesPlayed
         + current.packPity.packsOpened * 31
         + Object.values(current.collection).reduce((sum, count) => sum + count, 0) * 131;
-      const cards = generateCatchUpPack(current.collection, seed);
+      const reward = generateCatchUpPackReward(current.collection, seed, current.catchUpPack);
+      const cards = reward.cards;
       const collection = { ...current.collection };
       const counts = new Map<string, number>();
       for (const cardId of cards) {
@@ -1693,7 +1715,11 @@ export async function claimCatchUpPack(
         nextState: {
           ...current,
           collection,
-          catchUpPack: { claimedAt, cardsGranted: cards.length },
+          catchUpPack: {
+            claimedAt,
+            cardsGranted: cards.length,
+            ...reward.progress,
+          },
           returnJourney: {
             ...current.returnJourney,
             claimedStageIds: current.returnJourney.claimedStageIds.includes("reconnect")
@@ -1742,7 +1768,8 @@ export async function claimReturnQuest(
         + current.packPity.packsOpened * 31
         + Object.values(current.collection).reduce((sum, count) => sum + count, 0) * 131
         + (stageIndex + 1) * 7_919;
-      const cards = generateCatchUpPack(current.collection, seed);
+      const reward = generateCatchUpPackReward(current.collection, seed, current.catchUpPack);
+      const cards = reward.cards;
       const collection = { ...current.collection };
       const counts = new Map<string, number>();
       for (const cardId of cards) {
@@ -1757,6 +1784,7 @@ export async function claimReturnQuest(
           catchUpPack: {
             claimedAt: current.catchUpPack.claimedAt ?? claimedAt,
             cardsGranted: current.catchUpPack.cardsGranted + cards.length,
+            ...reward.progress,
           },
           returnJourney: {
             ...current.returnJourney,
@@ -3325,6 +3353,7 @@ function createDefaultState(now: string): StoredPlayerState {
   for (const cardId of DEFAULT_STARTER_DECK) {
     collection[cardId] = (collection[cardId] ?? 0) + 1;
   }
+  const catchUpProgress = catchUpProgressFromCollection(collection);
 
   return {
     currencies: {
@@ -3402,7 +3431,7 @@ function createDefaultState(now: string): StoredPlayerState {
     rewardTrack: { claimedLevels: [] },
     apprenticeTrack: { claimedMilestones: [] },
     ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null },
-    catchUpPack: { claimedAt: null, cardsGranted: 0 },
+    catchUpPack: { claimedAt: null, cardsGranted: 0, ...catchUpProgress },
     trialCards: { activatedAt: null, expiresAt: null },
     returnJourney: { claimedStageIds: [], matchesPlayedAtActivation: 0 },
     rankedLadders: createRankedLadders(utcSeasonKey(now)),
@@ -3525,14 +3554,32 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
           : null,
       }
     : { activatedAt: null, expiresAt: null, claimedDeckId: null };
-  const catchUpPack = isRecord(value.catchUpPack)
-    ? {
-        claimedAt: typeof value.catchUpPack.claimedAt === "string" ? value.catchUpPack.claimedAt : null,
-        cardsGranted: isFiniteNonNegativeInteger(value.catchUpPack.cardsGranted)
-          ? value.catchUpPack.cardsGranted
-          : 0,
-      }
-    : { claimedAt: null, cardsGranted: 0 };
+  const migratedCatchUpProgress = catchUpProgressFromCollection(
+    isRecord(value.collection)
+      ? Object.fromEntries(Object.entries(value.collection).filter((entry): entry is [string, number] => typeof entry[1] === "number"))
+      : {},
+  );
+  const storedCardsSeen = isRecord(value.catchUpPack) && isRecord(value.catchUpPack.cardsSeenBySet)
+    ? Object.fromEntries(CATCH_UP_PACK_SETS.map((set) => [
+        set,
+        isFiniteNonNegativeInteger(value.catchUpPack.cardsSeenBySet[set])
+          ? Math.max(value.catchUpPack.cardsSeenBySet[set], migratedCatchUpProgress.cardsSeenBySet[set] ?? 0)
+          : migratedCatchUpProgress.cardsSeenBySet[set] ?? 0,
+      ]))
+    : migratedCatchUpProgress.cardsSeenBySet;
+  const storedLegendarySets = isRecord(value.catchUpPack) && Array.isArray(value.catchUpPack.legendarySeenSets)
+    ? CATCH_UP_PACK_SETS.filter((set) =>
+        value.catchUpPack.legendarySeenSets.includes(set)
+        || migratedCatchUpProgress.legendarySeenSets.includes(set))
+    : migratedCatchUpProgress.legendarySeenSets;
+  const catchUpPack: CatchUpPackState = {
+    claimedAt: isRecord(value.catchUpPack) && typeof value.catchUpPack.claimedAt === "string" ? value.catchUpPack.claimedAt : null,
+    cardsGranted: isRecord(value.catchUpPack) && isFiniteNonNegativeInteger(value.catchUpPack.cardsGranted)
+      ? value.catchUpPack.cardsGranted
+      : 0,
+    cardsSeenBySet: storedCardsSeen,
+    legendarySeenSets: storedLegendarySets,
+  };
   const trialCards = isTrialCardAccess(value.trialCards)
     ? { activatedAt: value.trialCards.activatedAt, expiresAt: value.trialCards.expiresAt }
     : ladderReady.activatedAt && ladderReady.expiresAt
@@ -3658,7 +3705,13 @@ function isCatchUpPackState(value: unknown): value is CatchUpPackState {
   return isRecord(value)
     && (value.claimedAt === null
       || (typeof value.claimedAt === "string" && Number.isFinite(Date.parse(value.claimedAt))))
-    && isFiniteNonNegativeInteger(value.cardsGranted);
+    && isFiniteNonNegativeInteger(value.cardsGranted)
+    && isRecord(value.cardsSeenBySet)
+    && Object.entries(value.cardsSeenBySet).every(([set, count]) =>
+      CATCH_UP_PACK_SETS.includes(set as (typeof CATCH_UP_PACK_SETS)[number]) && isFiniteNonNegativeInteger(count))
+    && Array.isArray(value.legendarySeenSets)
+    && value.legendarySeenSets.every((set) => typeof set === "string" && CATCH_UP_PACK_SETS.includes(set as (typeof CATCH_UP_PACK_SETS)[number]))
+    && new Set(value.legendarySeenSets).size === value.legendarySeenSets.length;
 }
 
 function isTrialCardAccess(value: unknown): value is TrialCardAccess {
@@ -3767,7 +3820,11 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     rewardTrack: { claimedLevels: [...state.rewardTrack.claimedLevels] },
     apprenticeTrack: { claimedMilestones: [...state.apprenticeTrack.claimedMilestones] },
     ladderReady: { ...state.ladderReady },
-    catchUpPack: { ...state.catchUpPack },
+    catchUpPack: {
+      ...state.catchUpPack,
+      cardsSeenBySet: { ...state.catchUpPack.cardsSeenBySet },
+      legendarySeenSets: [...state.catchUpPack.legendarySeenSets],
+    },
     trialCards: { ...state.trialCards },
     returnJourney: {
       claimedStageIds: [...state.returnJourney.claimedStageIds],
