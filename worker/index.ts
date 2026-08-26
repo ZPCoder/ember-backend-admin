@@ -161,6 +161,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
         // Even the owner must not receive the authoritative future draw order.
         deck: (player.deck ?? []).map(() => "__hidden-card__"),
         deckStartedInDeck: (player.deck ?? []).map(() => true),
+        deckEntityIds: (player.deck ?? []).map((_, deckIndex) => `hidden-deck-${deckIndex}`),
         hand: privateCards,
         handCostReductions: [...(player.handCostReductions ?? player.hand.map(() => 0))],
         handFragments: (player.handFragments ?? player.hand.map(() => null)).map((fragment) =>
@@ -175,6 +176,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       // server-side until a card is publicly played.
       deck: (player.deck ?? []).map(() => "__hidden-card__"),
       deckStartedInDeck: (player.deck ?? []).map(() => true),
+      deckEntityIds: (player.deck ?? []).map((_, deckIndex) => `hidden-deck-${deckIndex}`),
       hand: privateCards,
       handCostReductions: privateCards.map(() => 0),
       handFragments: privateCards.map(() => null),
@@ -286,6 +288,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       delete safeData.fragment;
       delete safeData.groupId;
       delete safeData.handEntityId;
+      delete safeData.entityId;
       return {
         ...safeEvent,
         message: safeEvent.type === "card-traded"
