@@ -13,8 +13,9 @@ import {
   getLadderReadyDeck,
   ladderReadyTrialIsActive,
   validateDeck,
+  validateDeckForFormat,
 } from "../lib/game";
-import type { BattleCommand, LadderReadyDeckId, MatchState } from "../lib/game";
+import type { BattleCommand, LadderReadyDeckId, MatchState, RankedFormat } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
 import {
   APPRENTICE_MILESTONES,
@@ -27,10 +28,15 @@ import {
 import {
   LADDER_LEGEND_PROGRESS,
   LADDER_MAX_STAR_BONUS,
-  createRankedSnapshot,
   normalizeRankedSnapshot,
 } from "../lib/game/ranked.ts";
 import type { RankedSnapshot } from "../lib/game/ranked.ts";
+import {
+  cloneRankedLadders,
+  createRankedLadders,
+  normalizeRankedLadders,
+  type RankedLadders,
+} from "../lib/game/ranked-formats.ts";
 import {
   applyRankedMatchResult,
   createRankedRewardState,
@@ -62,6 +68,7 @@ export type GameIdentity = {
 export type PlayerDeck = {
   id: string;
   name: string;
+  format: RankedFormat;
   cardIds: string[];
   updatedAt: string;
 };
@@ -133,6 +140,7 @@ export type MatchRecord = {
   result: MatchResult;
   mode: MatchMode;
   format?: MatchFormat;
+  rankedFormat?: RankedFormat;
   opponent: string;
   rewardGold: number;
   pvpToken?: string;
@@ -177,7 +185,7 @@ export type PlayerState = {
   rewardTrack: RewardTrackState;
   apprenticeTrack: ApprenticeTrackState;
   ladderReady: LadderReadyState;
-  ladder: PlayerLadder;
+  rankedLadders: RankedLadders;
   rankedRewards: RankedRewardState;
   friends?: FriendSummary[];
   chatMessages?: SocialMessage[];
@@ -318,6 +326,7 @@ type MatchRow = {
   result: MatchResult;
   mode: MatchMode;
   format?: MatchFormat | null;
+  rankedFormat?: RankedFormat | null;
   opponent: string;
   rewardGold: number;
   pvpToken?: string | null;
@@ -349,6 +358,7 @@ type PvpSettlementCandidateRow = {
   matchToken: string;
   stateJson: string;
   format?: MatchFormat | null;
+  rankedFormat?: RankedFormat | null;
   createdAt: number | string;
   updatedAt: number | string;
   hostIdentity: string;
@@ -360,6 +370,7 @@ type DerivedPvpSettlement = {
   player: 0 | 1;
   result: MatchResult;
   format: MatchFormat;
+  rankedFormat: RankedFormat;
   opponentIdentity: string;
   opponent: string;
   createdAt: string;
@@ -453,8 +464,11 @@ export async function getPlayerState(
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
-  await refreshPlayerCycle(db, player);
+  // Reconcile terminal matches before rolling the monthly ladder. A match that
+  // finished just before UTC month-end must count toward that old season's
+  // peak and chest even when the player first reconnects after the reset.
   await reconcilePvpSettlements(db, player, identity);
+  await refreshPlayerCycle(db, player);
   return loadPublicPlayer(db, player);
 }
 
@@ -627,6 +641,7 @@ export async function saveDeck(
     deck: {
       id?: string;
       name: string;
+      format: RankedFormat;
       cardIds: string[];
     };
   },
@@ -640,6 +655,7 @@ export async function saveDeck(
   const requestedDeck: PlayerDeck = {
     id: deckId,
     name: input.deck.name,
+    format: input.deck.format,
     cardIds: [...input.deck.cardIds],
     updatedAt: now,
   };
@@ -651,7 +667,7 @@ export async function saveDeck(
     input.idempotencyKey,
     { deck: requestedDeck },
     (current) => {
-      const validation = validateDeck(requestedDeck.cardIds);
+      const validation = validateDeckForFormat(requestedDeck.cardIds, requestedDeck.format);
       if (!validation.valid) {
         throw new GameStoreError(
           "INVALID_DECK",
@@ -1515,6 +1531,7 @@ export async function claimLadderReadyDeck(
       const claimedDeck: PlayerDeck = {
         id: `ladder-ready-${offer.id}`,
         name: `${offer.faction} · ${offer.name}`,
+        format: "standard",
         cardIds: [...offer.deck],
         updatedAt: new Date().toISOString(),
       };
@@ -1589,6 +1606,7 @@ async function settlePvpMatchByToken(
     result: MatchResult;
     pvpPlayer?: 0 | 1;
     format?: MatchFormat;
+    rankedFormat?: RankedFormat;
   },
 ): Promise<RecordMatchResult> {
   const candidate = await loadPvpCandidateByToken(db, token);
@@ -1615,6 +1633,9 @@ async function settlePvpMatchByToken(
   if (claimed.format !== undefined && claimed.format !== settlement.format) {
     throw new GameStoreError("PVP_FORMAT_MISMATCH", "对战模式与服务器房间不一致。", 409);
   }
+  if (claimed.rankedFormat !== undefined && claimed.rankedFormat !== settlement.rankedFormat) {
+    throw new GameStoreError("PVP_RANKED_FORMAT_MISMATCH", "标准/狂野模式与服务器房间不一致。", 409);
+  }
   return settleDerivedPvpMatch(db, player, settlement);
 }
 
@@ -1639,6 +1660,7 @@ async function settleDerivedPvpMatch(
     result: settlement.result,
     mode: "pvp",
     format: settlement.format,
+    rankedFormat: settlement.rankedFormat,
     opponent: settlement.opponent,
     rewardGold: settlement.result === "draw"
       ? 0
@@ -1661,6 +1683,7 @@ async function settleDerivedPvpMatch(
         player: settlement.player,
         result: settlement.result,
         format: settlement.format,
+        rankedFormat: settlement.rankedFormat,
       },
       (current) => {
         let nextState: StoredPlayerState = {
@@ -1685,13 +1708,14 @@ async function settleDerivedPvpMatch(
         };
         if (
           settlement.format === "ranked"
-          && current.ladder.seasonKey === utcSeasonKey(settlement.createdAt)
+          && current.rankedLadders[settlement.rankedFormat].seasonKey === utcSeasonKey(settlement.createdAt)
         ) {
           nextState = mergeRankedRewardEconomy(
             nextState,
             applyRankedMatchResult(
               rankedRewardEconomy(nextState),
               CARD_CATALOG,
+              settlement.rankedFormat,
               settlement.result,
             ),
           );
@@ -1763,6 +1787,7 @@ async function derivePvpCandidate(
     player: derived.player,
     result: derived.result,
     format: candidate.format === "casual" ? "casual" : "ranked",
+    rankedFormat: candidate.rankedFormat === "wild" ? "wild" : "standard",
     opponentIdentity: derived.opponentIdentity,
     opponent: opponentRow?.displayName?.trim() || "联机对手",
     createdAt: pvpTimestampToIso(candidate.updatedAt),
@@ -1800,6 +1825,7 @@ async function loadPvpCandidatesFrom(
       `SELECT snapshot.match_token AS matchToken,
               snapshot.state_json AS stateJson,
               snapshot.format,
+              COALESCE(snapshot.ranked_format, 'standard') AS rankedFormat,
               snapshot.created_at AS createdAt,
               snapshot.updated_at AS updatedAt,
               participants.host_identity AS hostIdentity,
@@ -1842,6 +1868,7 @@ async function loadPvpCandidateByToken(
         `SELECT snapshot.match_token AS matchToken,
                 snapshot.state_json AS stateJson,
                 snapshot.format,
+                COALESCE(snapshot.ranked_format, 'standard') AS rankedFormat,
                 snapshot.created_at AS createdAt,
                 snapshot.updated_at AS updatedAt,
                 participants.host_identity AS hostIdentity,
@@ -1867,7 +1894,9 @@ async function loadPvpMatchRecord(
   return db
     .prepare(
       `SELECT id, result, mode, opponent, reward_gold AS rewardGold,
-              pvp_token AS pvpToken, format, created_at AS createdAt
+              pvp_token AS pvpToken, format,
+              COALESCE(ranked_format, 'standard') AS rankedFormat,
+              created_at AS createdAt
        FROM match_records
        WHERE player_id = ? AND pvp_token = ?
        LIMIT 1`,
@@ -1882,6 +1911,7 @@ function matchRecordFromRow(row: MatchRow): MatchRecord {
     result: row.result,
     mode: row.mode,
     ...(row.mode === "pvp" ? { format: row.format === "casual" ? "casual" : "ranked" } : {}),
+    ...(row.mode === "pvp" ? { rankedFormat: row.rankedFormat === "wild" ? "wild" : "standard" } : {}),
     opponent: row.opponent,
     rewardGold: row.rewardGold,
     ...(row.pvpToken ? { pvpToken: row.pvpToken } : {}),
@@ -1917,6 +1947,7 @@ export async function recordMatch(
     pvpToken?: string;
     pvpPlayer?: 0 | 1;
     format?: MatchFormat;
+    rankedFormat?: RankedFormat;
     aiProof?: AiMatchProof;
   },
 ): Promise<RecordMatchResult> {
@@ -1953,6 +1984,7 @@ export async function recordMatch(
       result: input.result,
       pvpPlayer: input.pvpPlayer,
       format: input.format,
+      rankedFormat: input.rankedFormat,
     });
   }
   if (!input.aiProof) {
@@ -1987,6 +2019,7 @@ export async function recordMatch(
       ...(input.pvpToken ? { pvpToken: input.pvpToken } : {}),
       ...(input.pvpPlayer === undefined ? {} : { pvpPlayer: input.pvpPlayer }),
       ...(input.format ? { format: input.format } : {}),
+      ...(input.rankedFormat ? { rankedFormat: input.rankedFormat } : {}),
       ...(input.aiProof ? { aiProof: input.aiProof } : {}),
     },
     (current) => {
@@ -2025,7 +2058,6 @@ export async function recordMatch(
           ...current.taskCycle,
           aiRewardsToday: Math.min(DAILY_AI_REWARD_LIMIT, current.taskCycle.aiRewardsToday + 1),
         },
-        ladder: current.ladder,
       };
       return {
         nextState,
@@ -2189,8 +2221,8 @@ async function commitMutation<T extends Record<string, unknown>>(
         db
           .prepare(
             `INSERT INTO match_records
-               (id, player_id, idempotency_key, pvp_token, result, mode, opponent, reward_gold, format, created_at)
-             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+               (id, player_id, idempotency_key, pvp_token, result, mode, opponent, reward_gold, format, ranked_format, created_at)
+             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
              WHERE EXISTS (
                SELECT 1 FROM audit_events WHERE id = ?
              )`,
@@ -2205,6 +2237,7 @@ async function commitMutation<T extends Record<string, unknown>>(
             match.opponent,
             match.rewardGold,
             match.format ?? "ranked",
+            match.rankedFormat ?? "standard",
             match.createdAt,
             auditId,
           ),
@@ -2626,6 +2659,7 @@ async function loadPublicPlayer(
       `SELECT id, result, mode, opponent, reward_gold AS rewardGold,
               pvp_token AS pvpToken,
               format,
+              COALESCE(ranked_format, 'standard') AS rankedFormat,
               created_at AS createdAt
        FROM match_records
        WHERE player_id = ?
@@ -2698,6 +2732,7 @@ async function loadPublicPlayer(
         rewardGold: match.rewardGold,
         createdAt: match.createdAt,
         format: match.format === "casual" ? "casual" : "ranked",
+        rankedFormat: match.rankedFormat === "wild" ? "wild" : "standard",
       };
       delete safeMatch.pvpToken;
       return safeMatch;
@@ -2789,6 +2824,7 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
         opponent TEXT NOT NULL,
         reward_gold INTEGER NOT NULL,
         format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
+        ranked_format TEXT NOT NULL DEFAULT 'standard' CHECK (ranked_format IN ('standard', 'wild')),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`,
     ),
@@ -2920,6 +2956,7 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
         match_token TEXT NOT NULL,
         state_json TEXT NOT NULL,
         format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
+        ranked_format TEXT NOT NULL DEFAULT 'standard' CHECK (ranked_format IN ('standard', 'wild')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )`,
@@ -2933,6 +2970,7 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
         match_token TEXT PRIMARY KEY NOT NULL,
         state_json TEXT NOT NULL,
         format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
+        ranked_format TEXT NOT NULL DEFAULT 'standard' CHECK (ranked_format IN ('standard', 'wild')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )`,
@@ -2988,6 +3026,13 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
   } catch {
     // Column already exists on new installations or a previous migration.
   }
+  for (const table of ["match_records", "pvp_matches", "pvp_match_archives"] as const) {
+    try {
+      await db.prepare(`ALTER TABLE ${table} ADD COLUMN ranked_format TEXT NOT NULL DEFAULT 'standard'`).run();
+    } catch {
+      // Column already exists on new installations or a previous migration.
+    }
+  }
   await migrateMatchRecordsForDraw(db);
   await db.prepare(
     `CREATE UNIQUE INDEX IF NOT EXISTS match_records_player_pvp_token_uidx
@@ -3024,14 +3069,15 @@ async function migrateMatchRecordsForDraw(db: D1DatabaseLike): Promise<void> {
         opponent TEXT NOT NULL,
         reward_gold INTEGER NOT NULL,
         format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
+        ranked_format TEXT NOT NULL DEFAULT 'standard' CHECK (ranked_format IN ('standard', 'wild')),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       )`,
     ),
     db.prepare(
       `INSERT INTO match_records
-         (id, player_id, idempotency_key, pvp_token, result, mode, opponent, reward_gold, format, created_at)
+         (id, player_id, idempotency_key, pvp_token, result, mode, opponent, reward_gold, format, ranked_format, created_at)
        SELECT id, player_id, idempotency_key, pvp_token, result, mode, opponent,
-              reward_gold, COALESCE(format, 'ranked'), created_at
+              reward_gold, COALESCE(format, 'ranked'), 'standard', created_at
        FROM match_records_draw_legacy`,
     ),
     db.prepare("DROP TABLE match_records_draw_legacy"),
@@ -3071,6 +3117,7 @@ function createDefaultState(now: string): StoredPlayerState {
       {
         id: "starter-sun",
         name: "曙光远征队",
+        format: "standard",
         cardIds: [...DEFAULT_STARTER_DECK],
         updatedAt: now,
       },
@@ -3134,7 +3181,7 @@ function createDefaultState(now: string): StoredPlayerState {
     rewardTrack: { claimedLevels: [] },
     apprenticeTrack: { claimedMilestones: [] },
     ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null },
-    ladder: createRankedSnapshot(utcSeasonKey(now)),
+    rankedLadders: createRankedLadders(utcSeasonKey(now)),
     rankedRewards: createRankedRewardState(),
     stats: {
       wins: 0,
@@ -3169,6 +3216,20 @@ function parseStoredState(value: string): StoredPlayerState {
 
 function normalizeStoredState(value: unknown): StoredPlayerState | null {
   if (!isRecord(value)) return null;
+  const decks = Array.isArray(value.decks)
+    ? value.decks.map((deck) => {
+        if (!isRecord(deck)) return deck;
+        const cardIds = Array.isArray(deck.cardIds)
+          ? deck.cardIds.filter((cardId): cardId is string => typeof cardId === "string")
+          : [];
+        const format: RankedFormat = deck.format === "wild"
+          ? "wild"
+          : deck.format === "standard"
+            ? "standard"
+            : validateDeckForFormat(cardIds, "standard").valid ? "standard" : "wild";
+        return { ...deck, cardIds, format };
+      })
+    : value.decks;
   const tasks = Array.isArray(value.tasks)
     ? value.tasks.map((task) => {
         if (!isRecord(task)) return task;
@@ -3240,12 +3301,13 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
           : null,
       }
     : { activatedAt: null, expiresAt: null, claimedDeckId: null };
-  const ladder = normalizeRankedSnapshot(
+  const rankedLadders = normalizeRankedLadders(
+    value.rankedLadders,
     value.ladder,
     utcSeasonKey(new Date().toISOString()),
   );
   const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
-  return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, ladder, rankedRewards } as StoredPlayerState;
+  return { ...value, decks, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, rankedLadders, rankedRewards } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -3271,7 +3333,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isRewardTrack(value.rewardTrack) &&
     isApprenticeTrack(value.apprenticeTrack) &&
     isLadderReadyState(value.ladderReady) &&
-    isLadder(value.ladder) &&
+    isRankedLadders(value.rankedLadders) &&
     isRankedRewardState(value.rankedRewards) &&
     value.decks.every(isDeck) &&
     value.tasks.every(isTask) &&
@@ -3364,6 +3426,10 @@ function isLadder(value: unknown): value is PlayerLadder {
     && normalized.stars === value.stars;
 }
 
+function isRankedLadders(value: unknown): value is RankedLadders {
+  return isRecord(value) && isLadder(value.standard) && isLadder(value.wild);
+}
+
 function isRankedRewardState(value: unknown): value is RankedRewardState {
   if (
     !isRecord(value) ||
@@ -3381,6 +3447,7 @@ function isDeck(value: unknown): value is PlayerDeck {
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
+    (value.format === "standard" || value.format === "wild") &&
     typeof value.updatedAt === "string" &&
     Array.isArray(value.cardIds) &&
     value.cardIds.every(isCardId)
@@ -3416,7 +3483,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     rewardTrack: { claimedLevels: [...state.rewardTrack.claimedLevels] },
     apprenticeTrack: { claimedMilestones: [...state.apprenticeTrack.claimedMilestones] },
     ladderReady: { ...state.ladderReady },
-    ladder: { ...state.ladder },
+    rankedLadders: cloneRankedLadders(state.rankedLadders),
     rankedRewards: {
       claimedFirstTimeFloors: [...state.rankedRewards.claimedFirstTimeFloors],
       earnedCardBackSeasons: [...state.rankedRewards.earnedCardBackSeasons],
@@ -3456,7 +3523,8 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.apprenticeTrack.claimedMilestones.length === 0 &&
     state.ladderReady.activatedAt === null &&
     state.ladderReady.claimedDeckId === null &&
-    state.ladder.rankProgress === 0 &&
+    state.rankedLadders.standard.rankProgress === 0 &&
+    state.rankedLadders.wild.rankProgress === 0 &&
     state.rankedRewards.claimedFirstTimeFloors.length === 0 &&
     state.rankedRewards.earnedCardBackSeasons.length === 0 &&
     state.rankedRewards.seasonChests.length === 0 &&
@@ -3471,7 +3539,7 @@ function awardXp(progression: PlayerProgression, amount: number): PlayerProgress
 
 function rankedRewardEconomy(state: StoredPlayerState): RankedRewardEconomy {
   return {
-    ladder: state.ladder,
+    ladders: state.rankedLadders,
     rankedRewards: state.rankedRewards,
     collection: state.collection,
     packsAvailable: state.packsAvailable,
@@ -3484,7 +3552,7 @@ function mergeRankedRewardEconomy(
 ): StoredPlayerState {
   return {
     ...state,
-    ladder: economy.ladder,
+    rankedLadders: economy.ladders,
     rankedRewards: economy.rankedRewards,
     collection: economy.collection,
     packsAvailable: economy.packsAvailable,
@@ -3556,7 +3624,9 @@ function refreshTaskCycle(state: StoredPlayerState, now: string): StoredPlayerSt
   const firstLoad = !base.taskCycle.dayKey || !base.taskCycle.weekKey;
   const dayChanged = !firstLoad && base.taskCycle.dayKey !== dayKey;
   const weekChanged = !firstLoad && base.taskCycle.weekKey !== weekKey;
-  const seasonChanged = state.ladder.seasonKey !== seasonKey;
+  const seasonChanged = Object.values(state.rankedLadders).some(
+    (ladder) => ladder.seasonKey !== seasonKey,
+  );
   if (!dayChanged && !weekChanged && !seasonChanged && !firstLoad) return base;
 
   let tasks = base.tasks.map(cloneTask);

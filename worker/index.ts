@@ -18,12 +18,13 @@ import {
   matchQualityForGap,
   normalizeHiddenMmr,
   updateHiddenMmrPair,
-  validateDeck,
+  validateDeckForFormat,
   type BattleCommand,
   type BattleTarget,
   type ApprenticeMatchPool,
   type MatchQuality,
   type MatchState,
+  type RankedFormat,
 } from "../lib/game/index.ts";
 
 interface Env {
@@ -68,6 +69,7 @@ type PvpPeer = {
 type PvpRoom = {
   code: string;
   format: "ranked" | "casual";
+  rankedFormat: RankedFormat;
   peers: PvpPeer[];
   nextSequence: number;
   readyDecks: Map<string, string[]>;
@@ -79,7 +81,7 @@ type PvpRoom = {
 const pvpRooms = new Map<string, PvpRoom>();
 const pvpPeers = new Map<WebSocket, PvpPeer>();
 const pvpPollSessions = new Map<string, PvpPeer>();
-const pvpQueues = new Map<"ranked" | "casual", PvpPeer[]>();
+const pvpQueues = new Map<string, PvpPeer[]>();
 const pvpAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 
 type PvpDbSession = {
@@ -89,16 +91,18 @@ type PvpDbSession = {
   room_code: string | null;
   updated_at: number;
 };
-type PvpDbRoom = { code: string; host_client_id: string; guest_client_id: string | null; next_sequence: number; format: "ranked" | "casual" };
+type PvpDbRoom = { code: string; host_client_id: string; guest_client_id: string | null; next_sequence: number; format: "ranked" | "casual"; ranked_format: RankedFormat };
 type PvpDbReady = { client_id: string; room_code: string; deck_json: string; updated_at: number };
-type PvpDbMatch = { room_code: string; match_token: string; state_json: string; format: "ranked" | "casual"; created_at: number; updated_at: number };
+type PvpDbMatch = { room_code: string; match_token: string; state_json: string; format: "ranked" | "casual"; ranked_format: RankedFormat; created_at: number; updated_at: number };
 type PvpDbParticipant = { match_token: string; room_code: string; host_identity: string; guest_identity: string; created_at: number };
-type PvpDbQueue = { client_id: string; player_id: string; name: string; format: "ranked" | "casual"; pool: ApprenticeMatchPool; rating: number; joined_at: number; updated_at: number };
+type PvpDbQueue = { client_id: string; player_id: string; name: string; format: "ranked" | "casual"; ranked_format: RankedFormat; pool: ApprenticeMatchPool; rating: number; joined_at: number; updated_at: number };
 type PvpMatchProfile = { mmr: number; pool: ApprenticeMatchPool };
-type PvpMmrRating = { identity_key: string; format: "ranked" | "casual"; rating: number; games: number; updated_at: number };
+type PvpRatingPool = RankedFormat | "shared";
+type PvpMmrRating = { identity_key: string; mode: "ranked" | "casual"; rating_pool: PvpRatingPool; rating: number; games: number; updated_at: number };
 type PvpMmrSettlement = {
   match_token: string;
-  format: "ranked" | "casual";
+  mode: "ranked" | "casual";
+  rating_pool: PvpRatingPool;
   host_identity: string;
   guest_identity: string;
   winner: 0 | 1 | null;
@@ -319,6 +323,7 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         host_client_id TEXT NOT NULL,
         guest_client_id TEXT,
         format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
+        ranked_format TEXT NOT NULL DEFAULT 'standard' CHECK (ranked_format IN ('standard', 'wild')),
         next_sequence INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
@@ -342,6 +347,7 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         match_token TEXT NOT NULL,
         state_json TEXT NOT NULL,
         format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
+        ranked_format TEXT NOT NULL DEFAULT 'standard' CHECK (ranked_format IN ('standard', 'wild')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )`),
@@ -349,6 +355,7 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         match_token TEXT PRIMARY KEY NOT NULL,
         state_json TEXT NOT NULL,
         format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
+        ranked_format TEXT NOT NULL DEFAULT 'standard' CHECK (ranked_format IN ('standard', 'wild')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )`),
@@ -369,6 +376,7 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         player_id TEXT NOT NULL,
         name TEXT NOT NULL,
         format TEXT NOT NULL CHECK (format IN ('ranked', 'casual')),
+        ranked_format TEXT NOT NULL DEFAULT 'standard' CHECK (ranked_format IN ('standard', 'wild')),
         pool TEXT NOT NULL DEFAULT 'standard' CHECK (pool IN ('apprentice', 'standard')),
         rating INTEGER NOT NULL DEFAULT 1500,
         joined_at INTEGER NOT NULL,
@@ -402,15 +410,54 @@ async function ensurePvpSchema(db: PvpDatabase): Promise<void> {
         created_at INTEGER NOT NULL
       )`),
       db.prepare(`CREATE INDEX IF NOT EXISTS pvp_mmr_settlements_created_idx ON pvp_mmr_settlements (created_at)`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS pvp_format_matchmaking_ratings (
+        identity_key TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('ranked', 'casual')),
+        rating_pool TEXT NOT NULL CHECK (rating_pool IN ('standard', 'wild', 'shared')),
+        rating INTEGER NOT NULL DEFAULT 1500,
+        games INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (identity_key, mode, rating_pool)
+      )`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS pvp_format_ratings_pool_rating_idx ON pvp_format_matchmaking_ratings (mode, rating_pool, rating)`),
+      db.prepare(`CREATE TABLE IF NOT EXISTS pvp_format_mmr_settlements (
+        match_token TEXT PRIMARY KEY NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('ranked', 'casual')),
+        rating_pool TEXT NOT NULL CHECK (rating_pool IN ('standard', 'wild', 'shared')),
+        host_identity TEXT NOT NULL,
+        guest_identity TEXT NOT NULL,
+        winner INTEGER CHECK (winner IN (0, 1) OR winner IS NULL),
+        host_rating_before INTEGER NOT NULL,
+        guest_rating_before INTEGER NOT NULL,
+        host_games_before INTEGER NOT NULL,
+        guest_games_before INTEGER NOT NULL,
+        host_rating_after INTEGER NOT NULL,
+        guest_rating_after INTEGER NOT NULL,
+        host_games_after INTEGER NOT NULL,
+        guest_games_after INTEGER NOT NULL,
+        applied INTEGER NOT NULL DEFAULT 0 CHECK (applied IN (0, 1)),
+        created_at INTEGER NOT NULL
+      )`),
+      db.prepare(`CREATE INDEX IF NOT EXISTS pvp_format_mmr_settlements_created_idx ON pvp_format_mmr_settlements (created_at)`),
     ]).then(async () => {
       // Existing D1 rooms/matches predate the format split. Migrations are
       // intentionally idempotent so rolling deploys keep old rooms playable.
       try { await db.prepare(`ALTER TABLE pvp_rooms ADD COLUMN format TEXT NOT NULL DEFAULT 'ranked'`).run(); } catch { /* already present */ }
       try { await db.prepare(`ALTER TABLE pvp_matches ADD COLUMN format TEXT NOT NULL DEFAULT 'ranked'`).run(); } catch { /* already present */ }
+      for (const table of ["pvp_rooms", "pvp_matches", "pvp_match_archives", "pvp_queue"] as const) {
+        try { await db.prepare(`ALTER TABLE ${table} ADD COLUMN ranked_format TEXT NOT NULL DEFAULT 'standard'`).run(); } catch { /* already present */ }
+      }
       try { await db.prepare(`ALTER TABLE pvp_queue ADD COLUMN rating INTEGER NOT NULL DEFAULT 1500`).run(); } catch { /* already present */ }
       try { await db.prepare(`ALTER TABLE pvp_queue ADD COLUMN pool TEXT NOT NULL DEFAULT 'standard' CHECK (pool IN ('apprentice', 'standard'))`).run(); } catch { /* already present */ }
       await db.prepare(`CREATE INDEX IF NOT EXISTS pvp_queue_format_pool_joined_idx ON pvp_queue (format, pool, joined_at)`).run();
       await db.prepare(`CREATE INDEX IF NOT EXISTS pvp_queue_format_pool_rating_joined_idx ON pvp_queue (format, pool, rating, joined_at)`).run();
+      await db.prepare(`CREATE INDEX IF NOT EXISTS pvp_queue_mode_ranked_pool_rating_idx ON pvp_queue (format, ranked_format, pool, rating, joined_at)`).run();
+      await db.prepare(`INSERT OR IGNORE INTO pvp_format_matchmaking_ratings
+          (identity_key, mode, rating_pool, rating, games, updated_at)
+        SELECT identity_key, format,
+               CASE WHEN format = 'casual' THEN 'shared' ELSE 'standard' END,
+               rating, games, updated_at
+        FROM pvp_matchmaking_ratings`).run();
       try { await db.prepare(`PRAGMA optimize`).run(); } catch { /* optional planner maintenance */ }
     }).catch((error) => {
       pvpSchemaReady = null;
@@ -448,7 +495,10 @@ async function getPvpDbIdentity(db: PvpDatabase, clientId: string): Promise<stri
 }
 
 async function getPvpDbRoom(db: PvpDatabase, code: string): Promise<PvpDbRoom | null> {
-  return db.prepare(`SELECT code, host_client_id, guest_client_id, next_sequence, COALESCE(format, 'ranked') AS format FROM pvp_rooms WHERE code = ?`)
+  return db.prepare(`SELECT code, host_client_id, guest_client_id, next_sequence,
+      COALESCE(format, 'ranked') AS format,
+      COALESCE(ranked_format, 'standard') AS ranked_format
+    FROM pvp_rooms WHERE code = ?`)
     .bind(code).first<PvpDbRoom>();
 }
 
@@ -458,7 +508,10 @@ async function getPvpDbReady(db: PvpDatabase, clientId: string): Promise<PvpDbRe
 }
 
 async function getPvpDbMatch(db: PvpDatabase, roomCode: string): Promise<PvpDbMatch | null> {
-  return db.prepare(`SELECT room_code, match_token, state_json, COALESCE(format, 'ranked') AS format, created_at, updated_at FROM pvp_matches WHERE room_code = ?`)
+  return db.prepare(`SELECT room_code, match_token, state_json,
+      COALESCE(format, 'ranked') AS format,
+      COALESCE(ranked_format, 'standard') AS ranked_format,
+      created_at, updated_at FROM pvp_matches WHERE room_code = ?`)
     .bind(roomCode).first<PvpDbMatch>();
 }
 
@@ -483,11 +536,13 @@ async function getPvpHiddenMmr(
   db: PvpDatabase,
   identityKey: string,
   format: "ranked" | "casual",
+  rankedFormat: RankedFormat,
   visibleRating = 1000,
 ): Promise<PvpMmrRating> {
-  const load = () => db.prepare(`SELECT identity_key, format, rating, games, updated_at
-      FROM pvp_matchmaking_ratings WHERE identity_key = ? AND format = ?`)
-    .bind(identityKey, format).first<PvpMmrRating>();
+  const ratingPool: PvpRatingPool = format === "casual" ? "shared" : rankedFormat;
+  const load = () => db.prepare(`SELECT identity_key, mode, rating_pool, rating, games, updated_at
+      FROM pvp_format_matchmaking_ratings WHERE identity_key = ? AND mode = ? AND rating_pool = ?`)
+    .bind(identityKey, format, ratingPool).first<PvpMmrRating>();
   const existing = await load();
   if (existing) {
     return {
@@ -498,12 +553,13 @@ async function getPvpHiddenMmr(
   }
   const now = Date.now();
   const initialRating = initialHiddenMmrForVisibleRating(visibleRating);
-  await db.prepare(`INSERT INTO pvp_matchmaking_ratings (identity_key, format, rating, games, updated_at)
-      VALUES (?, ?, ?, 0, ?) ON CONFLICT(identity_key, format) DO NOTHING`)
-    .bind(identityKey, format, initialRating, now).run();
+  await db.prepare(`INSERT INTO pvp_format_matchmaking_ratings (identity_key, mode, rating_pool, rating, games, updated_at)
+      VALUES (?, ?, ?, ?, 0, ?) ON CONFLICT(identity_key, mode, rating_pool) DO NOTHING`)
+    .bind(identityKey, format, ratingPool, initialRating, now).run();
   return await load() ?? {
     identity_key: identityKey,
-    format,
+    mode: format,
+    rating_pool: ratingPool,
     rating: initialRating,
     games: 0,
     updated_at: now,
@@ -517,54 +573,121 @@ async function applyPvpMmrSettlement(
 ): Promise<void> {
   if (settlement.applied === 1) return;
   await db.batch([
-    db.prepare(`UPDATE pvp_matchmaking_ratings SET rating = ?, games = ?, updated_at = ?
-      WHERE identity_key = ? AND format = ? AND rating = ? AND games = ?
-        AND EXISTS (SELECT 1 FROM pvp_mmr_settlements WHERE match_token = ? AND applied = 0)`)
+    db.prepare(`UPDATE pvp_format_matchmaking_ratings SET rating = ?, games = ?, updated_at = ?
+      WHERE identity_key = ? AND mode = ? AND rating_pool = ? AND rating = ? AND games = ?
+        AND EXISTS (SELECT 1 FROM pvp_format_mmr_settlements WHERE match_token = ? AND applied = 0)
+        AND EXISTS (
+          SELECT 1 FROM pvp_format_matchmaking_ratings
+          WHERE identity_key = ? AND mode = ? AND rating_pool = ? AND rating = ? AND games = ?
+        )`)
       .bind(
         settlement.host_rating_after,
         settlement.host_games_after,
         now,
         settlement.host_identity,
-        settlement.format,
+        settlement.mode,
+        settlement.rating_pool,
         settlement.host_rating_before,
         settlement.host_games_before,
         settlement.match_token,
+        settlement.guest_identity,
+        settlement.mode,
+        settlement.rating_pool,
+        settlement.guest_rating_before,
+        settlement.guest_games_before,
       ),
-    db.prepare(`UPDATE pvp_matchmaking_ratings SET rating = ?, games = ?, updated_at = ?
-      WHERE identity_key = ? AND format = ? AND rating = ? AND games = ?
-        AND EXISTS (SELECT 1 FROM pvp_mmr_settlements WHERE match_token = ? AND applied = 0)`)
+    db.prepare(`UPDATE pvp_format_matchmaking_ratings SET rating = ?, games = ?, updated_at = ?
+      WHERE identity_key = ? AND mode = ? AND rating_pool = ? AND rating = ? AND games = ?
+        AND EXISTS (SELECT 1 FROM pvp_format_mmr_settlements WHERE match_token = ? AND applied = 0)
+        AND EXISTS (
+          SELECT 1 FROM pvp_format_matchmaking_ratings
+          WHERE identity_key = ? AND mode = ? AND rating_pool = ? AND rating = ? AND games = ?
+        )`)
       .bind(
         settlement.guest_rating_after,
         settlement.guest_games_after,
         now,
         settlement.guest_identity,
-        settlement.format,
+        settlement.mode,
+        settlement.rating_pool,
         settlement.guest_rating_before,
         settlement.guest_games_before,
         settlement.match_token,
+        settlement.host_identity,
+        settlement.mode,
+        settlement.rating_pool,
+        settlement.host_rating_after,
+        settlement.host_games_after,
       ),
-    db.prepare(`UPDATE pvp_mmr_settlements SET applied = 1
+    db.prepare(`UPDATE pvp_format_mmr_settlements SET applied = 1
       WHERE match_token = ? AND applied = 0
         AND EXISTS (
-          SELECT 1 FROM pvp_matchmaking_ratings
-          WHERE identity_key = ? AND format = ? AND rating = ? AND games = ?
+          SELECT 1 FROM pvp_format_matchmaking_ratings
+          WHERE identity_key = ? AND mode = ? AND rating_pool = ? AND rating = ? AND games = ?
         )
         AND EXISTS (
-          SELECT 1 FROM pvp_matchmaking_ratings
-          WHERE identity_key = ? AND format = ? AND rating = ? AND games = ?
+          SELECT 1 FROM pvp_format_matchmaking_ratings
+          WHERE identity_key = ? AND mode = ? AND rating_pool = ? AND rating = ? AND games = ?
         )`)
       .bind(
         settlement.match_token,
         settlement.host_identity,
-        settlement.format,
+        settlement.mode,
+        settlement.rating_pool,
         settlement.host_rating_after,
         settlement.host_games_after,
         settlement.guest_identity,
-        settlement.format,
+        settlement.mode,
+        settlement.rating_pool,
         settlement.guest_rating_after,
         settlement.guest_games_after,
       ),
   ]);
+}
+
+async function applyOrRebasePvpMmrSettlement(
+  db: PvpDatabase,
+  settlement: PvpMmrSettlement,
+  now = Date.now(),
+): Promise<void> {
+  await applyPvpMmrSettlement(db, settlement, now);
+  let pending = await db.prepare(`SELECT * FROM pvp_format_mmr_settlements WHERE match_token = ?`)
+    .bind(settlement.match_token).first<PvpMmrSettlement>();
+  if (!pending || pending.applied === 1) return;
+
+  // Another match in the same pool may have settled after this immutable row
+  // captured its before-values. Rebase an entirely unapplied row onto the
+  // latest pair so concurrent finishes cannot leave a match's MMR stranded.
+  const rankedFormat: RankedFormat = pending.rating_pool === "wild" ? "wild" : "standard";
+  const [host, guest] = await Promise.all([
+    getPvpHiddenMmr(db, pending.host_identity, pending.mode, rankedFormat),
+    getPvpHiddenMmr(db, pending.guest_identity, pending.mode, rankedFormat),
+  ]);
+  const [hostAfter, guestAfter] = updateHiddenMmrPair(host, guest, pending.winner);
+  await db.prepare(`UPDATE pvp_format_mmr_settlements SET
+      host_rating_before = ?, guest_rating_before = ?, host_games_before = ?, guest_games_before = ?,
+      host_rating_after = ?, guest_rating_after = ?, host_games_after = ?, guest_games_after = ?
+    WHERE match_token = ? AND applied = 0
+      AND host_rating_before = ? AND guest_rating_before = ?
+      AND host_games_before = ? AND guest_games_before = ?`)
+    .bind(
+      host.rating,
+      guest.rating,
+      host.games,
+      guest.games,
+      hostAfter.rating,
+      guestAfter.rating,
+      hostAfter.games,
+      guestAfter.games,
+      pending.match_token,
+      pending.host_rating_before,
+      pending.guest_rating_before,
+      pending.host_games_before,
+      pending.guest_games_before,
+    ).run();
+  pending = await db.prepare(`SELECT * FROM pvp_format_mmr_settlements WHERE match_token = ?`)
+    .bind(settlement.match_token).first<PvpMmrSettlement>();
+  if (pending) await applyPvpMmrSettlement(db, pending, now);
 }
 
 async function settlePvpHiddenMmr(
@@ -576,35 +699,38 @@ async function settlePvpHiddenMmr(
   if (state.phase !== "game-over" || !state.result) return;
   const participant = await getPvpDbParticipant(db, match.match_token);
   if (!pvpParticipantIsValid(participant, match)) return;
-  const existing = await db.prepare(`SELECT * FROM pvp_mmr_settlements WHERE match_token = ?`)
+  const ratingPool: PvpRatingPool = match.format === "casual" ? "shared" : match.ranked_format;
+  const existing = await db.prepare(`SELECT * FROM pvp_format_mmr_settlements WHERE match_token = ?`)
     .bind(match.match_token).first<PvpMmrSettlement>();
   if (existing) {
     if (
-      existing.format === match.format &&
+      existing.mode === match.format &&
+      existing.rating_pool === ratingPool &&
       existing.host_identity === participant.host_identity &&
       existing.guest_identity === participant.guest_identity
     ) {
-      await applyPvpMmrSettlement(db, existing, now);
+      await applyOrRebasePvpMmrSettlement(db, existing, now);
     }
     return;
   }
 
   const [host, guest] = await Promise.all([
-    getPvpHiddenMmr(db, participant.host_identity, match.format),
-    getPvpHiddenMmr(db, participant.guest_identity, match.format),
+    getPvpHiddenMmr(db, participant.host_identity, match.format, match.ranked_format),
+    getPvpHiddenMmr(db, participant.guest_identity, match.format, match.ranked_format),
   ]);
   const winner = state.result.winner;
   const [hostAfter, guestAfter] = updateHiddenMmrPair(host, guest, winner);
-  await db.prepare(`INSERT INTO pvp_mmr_settlements (
-      match_token, format, host_identity, guest_identity, winner,
+  await db.prepare(`INSERT INTO pvp_format_mmr_settlements (
+      match_token, mode, rating_pool, host_identity, guest_identity, winner,
       host_rating_before, guest_rating_before, host_games_before, guest_games_before,
       host_rating_after, guest_rating_after, host_games_after, guest_games_after,
       applied, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
     ON CONFLICT(match_token) DO NOTHING`)
     .bind(
       match.match_token,
       match.format,
+      ratingPool,
       participant.host_identity,
       participant.guest_identity,
       winner,
@@ -618,15 +744,16 @@ async function settlePvpHiddenMmr(
       guestAfter.games,
       now,
     ).run();
-  const settlement = await db.prepare(`SELECT * FROM pvp_mmr_settlements WHERE match_token = ?`)
+  const settlement = await db.prepare(`SELECT * FROM pvp_format_mmr_settlements WHERE match_token = ?`)
     .bind(match.match_token).first<PvpMmrSettlement>();
   if (
     settlement &&
-    settlement.format === match.format &&
+    settlement.mode === match.format &&
+    settlement.rating_pool === ratingPool &&
     settlement.host_identity === participant.host_identity &&
     settlement.guest_identity === participant.guest_identity
   ) {
-    await applyPvpMmrSettlement(db, settlement, now);
+    await applyOrRebasePvpMmrSettlement(db, settlement, now);
   }
 }
 
@@ -638,19 +765,23 @@ async function archiveFinishedPvpMatch(
 ): Promise<void> {
   if (state.phase !== "game-over" || !state.result) return;
   await db.prepare(`INSERT INTO pvp_match_archives
-      (match_token, state_json, format, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?)
+      (match_token, state_json, format, ranked_format, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(match_token) DO UPDATE SET
       state_json = excluded.state_json,
       format = excluded.format,
+      ranked_format = excluded.ranked_format,
       updated_at = excluded.updated_at`)
-    .bind(match.match_token, JSON.stringify(state), match.format, match.created_at, now)
+    .bind(match.match_token, JSON.stringify(state), match.format, match.ranked_format, match.created_at, now)
     .run();
   await settlePvpHiddenMmr(db, match, state, now);
 }
 
 async function getPvpDbQueue(db: PvpDatabase, clientId: string): Promise<PvpDbQueue | null> {
-  return db.prepare(`SELECT client_id, player_id, name, format, COALESCE(pool, 'standard') AS pool, COALESCE(rating, 1500) AS rating, joined_at, updated_at FROM pvp_queue WHERE client_id = ?`)
+  return db.prepare(`SELECT client_id, player_id, name, format,
+      COALESCE(ranked_format, 'standard') AS ranked_format,
+      COALESCE(pool, 'standard') AS pool, COALESCE(rating, 1500) AS rating,
+      joined_at, updated_at FROM pvp_queue WHERE client_id = ?`)
     .bind(clientId).first<PvpDbQueue>();
 }
 
@@ -658,12 +789,17 @@ async function getPvpMatchProfile(
   db: PvpDatabase,
   clientId: string,
   format: "ranked" | "casual",
+  rankedFormat: RankedFormat,
 ): Promise<PvpMatchProfile> {
   const identity = await getPvpDbIdentity(db, clientId);
   if (!identity) return { mmr: HIDDEN_MMR_START, pool: "standard" };
   const row = await db.prepare(`
     SELECT
-      COALESCE(json_extract(ps.state_json, '$.ladder.rating'), 1000) AS rating,
+      COALESCE(
+        json_extract(ps.state_json, '$.rankedLadders.${rankedFormat}.rating'),
+        json_extract(ps.state_json, '$.ladder.rating'),
+        1000
+      ) AS rating,
       COALESCE(json_extract(ps.state_json, '$.packPity.packsOpened'), 0) AS packs_opened,
       COALESCE(json_extract(ps.state_json, '$.stats.matchesPlayed'), 0) AS matches_played,
       COALESCE(json_extract(ps.state_json, '$.stats.wins'), 0) AS wins,
@@ -685,6 +821,7 @@ async function getPvpMatchProfile(
     db,
     identity,
     format,
+    rankedFormat,
     Number.isFinite(visibleRating) && visibleRating >= 0 ? visibleRating : 1000,
   );
   const fact = (value: number | string | null, fallback: number) => {
@@ -708,7 +845,12 @@ function pvpCardCounts(cardIds: readonly string[]): Map<string, number> {
   return counts;
 }
 
-function pvpAccountStateAllowsDeck(stateJson: string, deckIds: readonly string[]): boolean {
+function pvpAccountStateAllowsDeck(
+  stateJson: string,
+  deckIds: readonly string[],
+  rankedFormat: RankedFormat,
+): boolean {
+  if (!validateDeckForFormat(deckIds, rankedFormat).valid) return false;
   let state: unknown;
   try {
     state = JSON.parse(stateJson);
@@ -756,6 +898,7 @@ async function pvpAccountOwnsSavedDeck(
   db: PvpDatabase,
   clientId: string,
   deckIds: readonly string[],
+  rankedFormat: RankedFormat,
 ): Promise<boolean> {
   // Resolve through the immutable session identity binding rather than any
   // client-supplied player id or email.
@@ -767,7 +910,7 @@ async function pvpAccountOwnsSavedDeck(
     WHERE psi.client_id = ? AND psi.identity_key <> ''
     LIMIT 1
   `).bind(clientId).first<{ state_json: string }>();
-  return Boolean(row && pvpAccountStateAllowsDeck(row.state_json, deckIds));
+  return Boolean(row && pvpAccountStateAllowsDeck(row.state_json, deckIds, rankedFormat));
 }
 
 async function dbLeaveQueue(db: PvpDatabase, session: PvpDbSession): Promise<void> {
@@ -791,6 +934,7 @@ async function prunePvpDb(db: PvpDatabase): Promise<void> {
     db.prepare(`DELETE FROM pvp_ready WHERE updated_at < ?`).bind(cutoff),
     db.prepare(`DELETE FROM pvp_queue WHERE updated_at < ?`).bind(cutoff),
     db.prepare(`DELETE FROM pvp_mmr_settlements WHERE applied = 1 AND created_at < ?`).bind(mmrSettlementCutoff),
+    db.prepare(`DELETE FROM pvp_format_mmr_settlements WHERE applied = 1 AND created_at < ?`).bind(mmrSettlementCutoff),
   ]);
   try {
     await db.batch([
@@ -837,14 +981,18 @@ async function prunePvpDb(db: PvpDatabase): Promise<void> {
   }
 }
 
-function parsePvpDeck(value: unknown): string[] | null {
+function parsePvpDeck(value: unknown, rankedFormat: RankedFormat = "wild"): string[] | null {
   if (!Array.isArray(value) || value.length !== 30 || value.some((cardId) => typeof cardId !== "string")) return null;
   const deck = value.map(String);
-  return validateDeck(deck).valid ? deck : null;
+  return validateDeckForFormat(deck, rankedFormat).valid ? deck : null;
 }
 
 function parsePvpFormat(value: unknown): "ranked" | "casual" {
   return value === "casual" ? "casual" : "ranked";
+}
+
+function parseRankedFormat(value: unknown): RankedFormat {
+  return value === "wild" ? "wild" : "standard";
 }
 
 function parsePvpState(value: string): MatchState | null {
@@ -869,7 +1017,13 @@ async function dbRoomPlayers(db: PvpDatabase, room: PvpDbRoom): Promise<Array<{ 
 
 async function dbRoomState(db: PvpDatabase, room: PvpDbRoom): Promise<void> {
   const players = await dbRoomPlayers(db, room);
-  const payload = { type: "room_state", room: room.code, format: room.format, payload: { players, format: room.format } };
+  const payload = {
+    type: "room_state",
+    room: room.code,
+    format: room.format,
+    rankedFormat: room.ranked_format,
+    payload: { players, format: room.format, rankedFormat: room.ranked_format },
+  };
   await Promise.all([room.host_client_id, room.guest_client_id].filter(Boolean).map((clientId) => queuePvpDbMessage(db, clientId as string, payload)));
 }
 
@@ -994,6 +1148,7 @@ async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise
     if (queued) await queuePvpDbMessage(db, session.client_id, {
       type: "queue_joined",
       format: queued.format,
+      rankedFormat: queued.ranked_format,
       pool: queued.pool,
       joinedAt: queued.joined_at,
       message: queued.pool === "apprentice"
@@ -1013,6 +1168,7 @@ async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise
     type: isHost ? "room_created" : "room_joined",
     room: room.code,
     format: room.format,
+    rankedFormat: room.ranked_format,
     message: "已恢复房间连接，请双方重新准备。",
   });
   const peerId = isHost ? room.guest_client_id : room.host_client_id;
@@ -1030,7 +1186,7 @@ async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise
     await queuePvpDbMessage(db, session.client_id, {
       type: "match_sync",
       room: room.code,
-      payload: { state: redactPvpStateForViewer(matchState, viewer), matchToken: match.match_token, format: room.format },
+      payload: { state: redactPvpStateForViewer(matchState, viewer), matchToken: match.match_token, format: room.format, rankedFormat: room.ranked_format },
     });
   }
 }
@@ -1094,6 +1250,7 @@ async function dbLeaveRoom(db: PvpDatabase, session: PvpDbSession): Promise<bool
         type: "room_created",
         room: room.code,
         format: room.format,
+        rankedFormat: room.ranked_format,
         message: "原房主已离开，你现在是房主。",
       });
     }
@@ -1107,7 +1264,12 @@ async function dbLeaveRoom(db: PvpDatabase, session: PvpDbSession): Promise<bool
   return true;
 }
 
-async function dbCreateRoom(db: PvpDatabase, session: PvpDbSession, format: "ranked" | "casual"): Promise<void> {
+async function dbCreateRoom(
+  db: PvpDatabase,
+  session: PvpDbSession,
+  format: "ranked" | "casual",
+  rankedFormat: RankedFormat,
+): Promise<void> {
   await dbLeaveQueue(db, session);
   if (!await dbLeaveRoom(db, session)) {
     await queuePvpDbMessage(db, session.client_id, { type: "error", message: "当前对局尚未安全结算，暂时不能创建新房间。" });
@@ -1119,11 +1281,11 @@ async function dbCreateRoom(db: PvpDatabase, session: PvpDbSession, format: "ran
     if (!(await getPvpDbRoom(db, code))) break;
   }
   const now = Date.now();
-  await db.prepare(`INSERT INTO pvp_rooms (code, host_client_id, guest_client_id, next_sequence, format, created_at, updated_at) VALUES (?, ?, NULL, 0, ?, ?, ?)`)
-    .bind(code, session.client_id, format, now, now).run();
+  await db.prepare(`INSERT INTO pvp_rooms (code, host_client_id, guest_client_id, next_sequence, format, ranked_format, created_at, updated_at) VALUES (?, ?, NULL, 0, ?, ?, ?, ?)`)
+    .bind(code, session.client_id, format, rankedFormat, now, now).run();
   await db.prepare(`UPDATE pvp_sessions SET room_code = ?, updated_at = ? WHERE client_id = ?`)
     .bind(code, now, session.client_id).run();
-  await queuePvpDbMessage(db, session.client_id, { type: "room_created", room: code, format, message: "房间已创建，等待对手加入" });
+  await queuePvpDbMessage(db, session.client_id, { type: "room_created", room: code, format, rankedFormat, message: "房间已创建，等待对手加入" });
   const room = await getPvpDbRoom(db, code);
   if (room) await dbRoomState(db, room);
 }
@@ -1169,7 +1331,7 @@ async function dbJoinRoom(db: PvpDatabase, session: PvpDbSession, code: string):
   const updated = await getPvpDbRoom(db, code);
   if (!updated || updated.guest_client_id !== session.client_id) return queuePvpDbMessage(db, session.client_id, { type: "error", message: "房间刚刚被其他玩家加入" });
   await db.prepare(`UPDATE pvp_sessions SET room_code = ?, updated_at = ? WHERE client_id = ?`).bind(code, now, session.client_id).run();
-  await queuePvpDbMessage(db, session.client_id, { type: "room_joined", room: code, format: updated.format, message: "已加入房间" });
+  await queuePvpDbMessage(db, session.client_id, { type: "room_joined", room: code, format: updated.format, rankedFormat: updated.ranked_format, message: "已加入房间" });
   const host = await getPvpDbSession(db, updated.host_client_id);
   await queuePvpDbMessage(db, updated.host_client_id, { type: "peer_joined", peerName: session.name, playerId: session.player_id, message: `${session.name} 已加入房间` });
   if (host) {
@@ -1184,7 +1346,12 @@ async function dbJoinRoom(db: PvpDatabase, session: PvpDbSession, code: string):
   await dbRoomState(db, updated);
 }
 
-async function dbJoinQueue(db: PvpDatabase, session: PvpDbSession, format: "ranked" | "casual"): Promise<void> {
+async function dbJoinQueue(
+  db: PvpDatabase,
+  session: PvpDbSession,
+  format: "ranked" | "casual",
+  rankedFormat: RankedFormat,
+): Promise<void> {
   await dbLeaveQueue(db, session);
   if (!await dbLeaveRoom(db, session)) {
     await queuePvpDbMessage(db, session.client_id, { type: "error", message: "当前对局尚未安全结算，暂时不能加入匹配队列。" });
@@ -1192,7 +1359,7 @@ async function dbJoinQueue(db: PvpDatabase, session: PvpDbSession, format: "rank
   }
   const now = Date.now();
   const cutoff = now - PVP_SESSION_TTL_MS;
-  const profile = await getPvpMatchProfile(db, session.client_id, format);
+  const profile = await getPvpMatchProfile(db, session.client_id, format, rankedFormat);
   const playerMmr = profile.mmr;
   const playerPool = profile.pool;
   const playerIdentity = await getPvpDbIdentity(db, session.client_id);
@@ -1200,22 +1367,24 @@ async function dbJoinQueue(db: PvpDatabase, session: PvpDbSession, format: "rank
     return queuePvpDbMessage(db, session.client_id, { type: "error", message: "需要有效账号身份才能加入匹配队列。" });
   }
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const candidate = await db.prepare(`SELECT q.client_id, q.player_id, q.name, q.format, COALESCE(q.pool, 'standard') AS pool, COALESCE(q.rating, 1500) AS rating, q.joined_at, q.updated_at
+    const candidate = await db.prepare(`SELECT q.client_id, q.player_id, q.name, q.format,
+      COALESCE(q.ranked_format, 'standard') AS ranked_format,
+      COALESCE(q.pool, 'standard') AS pool, COALESCE(q.rating, 1500) AS rating, q.joined_at, q.updated_at
       FROM pvp_queue q
       JOIN pvp_sessions s ON s.client_id = q.client_id
       JOIN pvp_session_identities candidate_identity
         ON candidate_identity.client_id = q.client_id AND candidate_identity.identity_key <> ''
-      WHERE q.format = ? AND q.pool = ? AND q.client_id <> ? AND q.player_id <> ? AND q.updated_at >= ? AND s.room_code IS NULL
+      WHERE q.format = ? AND q.ranked_format = ? AND q.pool = ? AND q.client_id <> ? AND q.player_id <> ? AND q.updated_at >= ? AND s.room_code IS NULL
         AND candidate_identity.identity_key <> ?
         AND q.rating BETWEEN ? - ${MATCHMAKING_WINDOW_MAX} AND ? + ${MATCHMAKING_WINDOW_MAX}
         AND ABS(COALESCE(q.rating, 1500) - ?) <= MIN(${MATCHMAKING_WINDOW_MAX}, ${MATCHMAKING_WINDOW_INITIAL} + CAST(MAX(0, (? - q.joined_at) / ${MATCHMAKING_WINDOW_STEP_MS}) AS INTEGER) * ${MATCHMAKING_WINDOW_STEP})
       ORDER BY ABS(COALESCE(q.rating, 1500) - ?) ASC, q.joined_at ASC LIMIT 1`)
-      .bind(format, playerPool, session.client_id, session.player_id, cutoff, playerIdentity, playerMmr, playerMmr, playerMmr, now, playerMmr).first<PvpDbQueue>();
+      .bind(format, rankedFormat, playerPool, session.client_id, session.player_id, cutoff, playerIdentity, playerMmr, playerMmr, playerMmr, now, playerMmr).first<PvpDbQueue>();
     if (!candidate) break;
     // A second tab may finish the apprentice objectives while this tab waits.
     // Refresh the candidate's server-derived profile before committing a pair
     // so a stale queue row can never bridge the protected and standard pools.
-    const candidateProfile = await getPvpMatchProfile(db, candidate.client_id, format);
+    const candidateProfile = await getPvpMatchProfile(db, candidate.client_id, format, rankedFormat);
     if (candidateProfile.pool !== candidate.pool || candidateProfile.mmr !== candidate.rating) {
       const refreshedAt = Date.now();
       const refreshed = await db.prepare(`UPDATE pvp_queue SET pool = ?, rating = ?, updated_at = ? WHERE client_id = ? AND updated_at = ?`)
@@ -1224,6 +1393,7 @@ async function dbJoinQueue(db: PvpDatabase, session: PvpDbSession, format: "rank
         await queuePvpDbMessage(db, candidate.client_id, {
           type: "queue_joined",
           format: candidate.format,
+          rankedFormat: candidate.ranked_format,
           pool: candidateProfile.pool,
           joinedAt: candidate.joined_at,
           message: candidateProfile.pool === "apprentice"
@@ -1242,26 +1412,27 @@ async function dbJoinQueue(db: PvpDatabase, session: PvpDbSession, format: "rank
       code = Array.from({ length: 4 }, () => pvpAlphabet[Math.floor(Math.random() * pvpAlphabet.length)]).join("");
       if (!(await getPvpDbRoom(db, code))) break;
     }
-    await db.prepare(`INSERT INTO pvp_rooms (code, host_client_id, guest_client_id, next_sequence, format, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)`)
-      .bind(code, session.client_id, candidate.client_id, format, now, now).run();
+    await db.prepare(`INSERT INTO pvp_rooms (code, host_client_id, guest_client_id, next_sequence, format, ranked_format, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?, ?)`)
+      .bind(code, session.client_id, candidate.client_id, format, rankedFormat, now, now).run();
     await db.batch([
       db.prepare(`UPDATE pvp_sessions SET room_code = ?, updated_at = ? WHERE client_id = ?`).bind(code, now, session.client_id),
       db.prepare(`UPDATE pvp_sessions SET room_code = ?, updated_at = ? WHERE client_id = ?`).bind(code, now, candidate.client_id),
     ]);
-    await queuePvpDbMessage(db, session.client_id, { type: "room_created", room: code, format, pool: playerPool, matchQuality, message: "已按隐藏水平匹配到对手，房间已建立。" });
-    await queuePvpDbMessage(db, candidate.client_id, { type: "room_joined", room: code, format, pool: playerPool, matchQuality, message: "已按隐藏水平匹配到对手，房间已建立。" });
+    await queuePvpDbMessage(db, session.client_id, { type: "room_created", room: code, format, rankedFormat, pool: playerPool, matchQuality, message: "已按隐藏水平匹配到对手，房间已建立。" });
+    await queuePvpDbMessage(db, candidate.client_id, { type: "room_joined", room: code, format, rankedFormat, pool: playerPool, matchQuality, message: "已按隐藏水平匹配到对手，房间已建立。" });
     await queuePvpDbMessage(db, session.client_id, { type: "peer_joined", peerName: candidate.name, playerId: candidate.player_id, message: `${candidate.name} 已加入房间` });
     await queuePvpDbMessage(db, candidate.client_id, { type: "peer_joined", peerName: session.name, playerId: session.player_id, message: `${session.name} 已加入房间` });
     const room = await getPvpDbRoom(db, code);
     if (room) await dbRoomState(db, room);
     return;
   }
-  await db.prepare(`INSERT INTO pvp_queue (client_id, player_id, name, format, pool, rating, joined_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(client_id) DO UPDATE SET player_id = excluded.player_id, name = excluded.name, format = excluded.format, pool = excluded.pool, rating = excluded.rating, updated_at = excluded.updated_at`)
-    .bind(session.client_id, session.player_id, session.name, format, playerPool, playerMmr, now, now).run();
+  await db.prepare(`INSERT INTO pvp_queue (client_id, player_id, name, format, ranked_format, pool, rating, joined_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(client_id) DO UPDATE SET player_id = excluded.player_id, name = excluded.name, format = excluded.format, ranked_format = excluded.ranked_format, pool = excluded.pool, rating = excluded.rating, updated_at = excluded.updated_at`)
+    .bind(session.client_id, session.player_id, session.name, format, rankedFormat, playerPool, playerMmr, now, now).run();
   await queuePvpDbMessage(db, session.client_id, {
     type: "queue_joined",
     format,
+    rankedFormat,
     pool: playerPool,
     joinedAt: now,
     message: playerPool === "apprentice"
@@ -1576,9 +1747,9 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     : {};
 
   if (action === "ready") {
-    const deckIds = parsePvpDeck(payload.deckIds);
+    const deckIds = parsePvpDeck(payload.deckIds, room.ranked_format);
     const accountOwnsDeck = deckIds
-      ? await pvpAccountOwnsSavedDeck(db, session.client_id, deckIds)
+      ? await pvpAccountOwnsSavedDeck(db, session.client_id, deckIds, room.ranked_format)
       : false;
     if (!deckIds || !accountOwnsDeck) {
       // Keep ownership, saved-deck and structural failures indistinguishable
@@ -1616,16 +1787,16 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     let hostDeck: string[] | null = null;
     let guestDeck: string[] | null = null;
     try {
-      hostDeck = hostReady ? parsePvpDeck(JSON.parse(hostReady.deck_json)) : null;
-      guestDeck = guestReady ? parsePvpDeck(JSON.parse(guestReady.deck_json)) : null;
+      hostDeck = hostReady ? parsePvpDeck(JSON.parse(hostReady.deck_json), room.ranked_format) : null;
+      guestDeck = guestReady ? parsePvpDeck(JSON.parse(guestReady.deck_json), room.ranked_format) : null;
     } catch {
       hostDeck = null;
       guestDeck = null;
     }
     const decksStillAuthorized = hostDeck && guestDeck && hostReady?.room_code === room.code && guestReady?.room_code === room.code
       ? await Promise.all([
-          pvpAccountOwnsSavedDeck(db, room.host_client_id, hostDeck),
-          pvpAccountOwnsSavedDeck(db, room.guest_client_id, guestDeck),
+          pvpAccountOwnsSavedDeck(db, room.host_client_id, hostDeck, room.ranked_format),
+          pvpAccountOwnsSavedDeck(db, room.guest_client_id, guestDeck, room.ranked_format),
         ])
       : [false, false];
     if (!hostDeck || !guestDeck || !decksStillAuthorized[0] || !decksStillAuthorized[1]) {
@@ -1651,10 +1822,10 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     // bindings observed above; the second creates immutable ownership proof
     // only when that exact token won the race.
     await db.batch([
-      db.prepare(`INSERT INTO pvp_matches (room_code, match_token, state_json, format, created_at, updated_at)
-        SELECT r.code, ?, ?, r.format, ?, ?
+      db.prepare(`INSERT INTO pvp_matches (room_code, match_token, state_json, format, ranked_format, created_at, updated_at)
+        SELECT r.code, ?, ?, r.format, r.ranked_format, ?, ?
         FROM pvp_rooms r
-        WHERE r.code = ? AND r.host_client_id = ? AND r.guest_client_id = ? AND r.format = ?
+        WHERE r.code = ? AND r.host_client_id = ? AND r.guest_client_id = ? AND r.format = ? AND r.ranked_format = ?
           AND EXISTS (SELECT 1 FROM pvp_sessions WHERE client_id = r.host_client_id AND room_code = r.code)
           AND EXISTS (SELECT 1 FROM pvp_sessions WHERE client_id = r.guest_client_id AND room_code = r.code)
           AND EXISTS (SELECT 1 FROM pvp_ready WHERE client_id = ? AND room_code = ? AND deck_json = ?)
@@ -1665,7 +1836,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
         ON CONFLICT(room_code) DO NOTHING`)
         .bind(
           matchToken, stateJson, now, now,
-          room.code, room.host_client_id, room.guest_client_id, room.format,
+          room.code, room.host_client_id, room.guest_client_id, room.format, room.ranked_format,
           room.host_client_id, room.code, hostReady?.deck_json ?? "",
           room.guest_client_id, room.code, guestReady?.deck_json ?? "",
           room.host_client_id, hostIdentity,
@@ -1695,6 +1866,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
       seed: 0,
       startingPlayer,
       format: room.format,
+      rankedFormat: room.ranked_format,
       // The client only needs its own deck to open the pre-sync mulligan
       // screen. The authoritative snapshot follows through command sync.
       deck: viewer === 0 ? hostDeck : guestDeck,
@@ -1723,6 +1895,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
         state: redactPvpStateForViewer(state, 0),
         matchToken,
         format: room.format,
+        rankedFormat: room.ranked_format,
       },
     });
     await queuePvpDbMessage(db, room.guest_client_id, {
@@ -1732,6 +1905,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
         state: redactPvpStateForViewer(state, 1),
         matchToken,
         format: room.format,
+        rankedFormat: room.ranked_format,
       },
     });
     return;
@@ -1832,9 +2006,9 @@ async function handlePvpDbMessage(db: PvpDatabase, session: PvpDbSession, messag
       await db.prepare(`UPDATE pvp_sessions SET name = ?, updated_at = ? WHERE client_id = ?`).bind(name || "旅者", Date.now(), session.client_id).run();
       break;
     }
-    case "create_room": await dbCreateRoom(db, session, parsePvpFormat(message.format)); break;
+    case "create_room": await dbCreateRoom(db, session, parsePvpFormat(message.format), parseRankedFormat(message.rankedFormat)); break;
     case "join_room": await dbJoinRoom(db, session, typeof message.room === "string" ? message.room.trim().toUpperCase() : ""); break;
-    case "queue_join": await dbJoinQueue(db, session, parsePvpFormat(message.format)); break;
+    case "queue_join": await dbJoinQueue(db, session, parsePvpFormat(message.format), parseRankedFormat(message.rankedFormat)); break;
     case "queue_leave": await dbLeaveQueue(db, session); await queuePvpDbMessage(db, session.client_id, { type: "queue_left", message: "已取消匹配。" }); break;
     case "action": await dbRelayAction(db, session, message); break;
     case "sync":
@@ -1869,15 +2043,16 @@ function pvpRoomState(room: PvpRoom): void {
     type: "room_state",
     room: room.code,
     format: room.format,
-    payload: { players, format: room.format },
+    rankedFormat: room.rankedFormat,
+    payload: { players, format: room.format, rankedFormat: room.rankedFormat },
   }));
 }
 
 function removeMemoryQueue(peer: PvpPeer): void {
-  for (const [format, peers] of pvpQueues) {
-    const remaining = peers.filter((candidate) => candidate !== peer);
-    if (remaining.length) pvpQueues.set(format, remaining);
-    else pvpQueues.delete(format);
+    for (const [queueKey, peers] of pvpQueues) {
+      const remaining = peers.filter((candidate) => candidate !== peer);
+    if (remaining.length) pvpQueues.set(queueKey, remaining);
+    else pvpQueues.delete(queueKey);
   }
 }
 
@@ -1933,6 +2108,7 @@ function leavePvpRoom(peer: PvpPeer): void {
         type: "room_created",
         room: room.code,
         format: room.format,
+        rankedFormat: room.rankedFormat,
         message: "原房主已离开，你现在是房主。",
       });
     }
@@ -1940,20 +2116,22 @@ function leavePvpRoom(peer: PvpPeer): void {
   }
 }
 
-function queuePvpPeer(peer: PvpPeer, format: "ranked" | "casual"): void {
+function queuePvpPeer(peer: PvpPeer, format: "ranked" | "casual", rankedFormat: RankedFormat): void {
   removeMemoryQueue(peer);
   leavePvpRoom(peer);
-  const waiting = pvpQueues.get(format) ?? [];
+  const queueKey = `${format}:${rankedFormat}`;
+  const waiting = pvpQueues.get(queueKey) ?? [];
   const opponentIndex = waiting.findIndex((candidate) => (
     candidate !== peer &&
     (!peer.identityKey || !candidate.identityKey || candidate.identityKey !== peer.identityKey)
   ));
   const opponent = opponentIndex >= 0 ? waiting.splice(opponentIndex, 1)[0] : undefined;
   if (opponent && opponent !== peer) {
-    if (waiting.length) pvpQueues.set(format, waiting); else pvpQueues.delete(format);
+    if (waiting.length) pvpQueues.set(queueKey, waiting); else pvpQueues.delete(queueKey);
     const room: PvpRoom = {
       code: "",
       format,
+      rankedFormat,
       peers: [opponent, peer],
       nextSequence: 0,
       readyDecks: new Map(),
@@ -1966,8 +2144,8 @@ function queuePvpPeer(peer: PvpPeer, format: "ranked" | "casual"): void {
     pvpRooms.set(code, room);
     opponent.room = code;
     peer.room = code;
-    pvpJson(opponent, { type: "room_created", room: code, format, message: "已匹配到对手，房间已建立。" });
-    pvpJson(peer, { type: "room_joined", room: code, format, message: "已匹配到对手，房间已建立。" });
+    pvpJson(opponent, { type: "room_created", room: code, format, rankedFormat, message: "已匹配到对手，房间已建立。" });
+    pvpJson(peer, { type: "room_joined", room: code, format, rankedFormat, message: "已匹配到对手，房间已建立。" });
     pvpJson(opponent, { type: "peer_joined", peerName: peer.name, playerId: peer.id, message: `${peer.name} 已加入房间` });
     pvpJson(peer, { type: "peer_joined", peerName: opponent.name, playerId: opponent.id, message: `${opponent.name} 已加入房间` });
     pvpRoomState(room);
@@ -1975,8 +2153,8 @@ function queuePvpPeer(peer: PvpPeer, format: "ranked" | "casual"): void {
   }
   const next = waiting.filter((candidate) => candidate.id !== peer.id);
   next.push(peer);
-  pvpQueues.set(format, next);
-  pvpJson(peer, { type: "queue_joined", format, joinedAt: Date.now(), message: `${format === "ranked" ? "天梯" : "休闲"}匹配中，正在寻找同模式对手…` });
+  pvpQueues.set(queueKey, next);
+  pvpJson(peer, { type: "queue_joined", format, rankedFormat, joinedAt: Date.now(), message: `${rankedFormat === "standard" ? "标准" : "狂野"}${format === "ranked" ? "天梯" : "休闲"}匹配中，正在寻找同模式对手…` });
 }
 
 function leavePvpPeer(peer: PvpPeer): void {
@@ -1985,7 +2163,7 @@ function leavePvpPeer(peer: PvpPeer): void {
   leavePvpRoom(peer);
 }
 
-function createPvpRoom(peer: PvpPeer, format: "ranked" | "casual"): void {
+function createPvpRoom(peer: PvpPeer, format: "ranked" | "casual", rankedFormat: RankedFormat): void {
   leavePvpRoom(peer);
   let code = "";
   do {
@@ -1994,13 +2172,14 @@ function createPvpRoom(peer: PvpPeer, format: "ranked" | "casual"): void {
   const room: PvpRoom = {
     code,
     format,
+    rankedFormat,
     peers: [peer],
     nextSequence: 0,
     readyDecks: new Map(),
   };
   pvpRooms.set(code, room);
   peer.room = code;
-  pvpJson(peer, { type: "room_created", room: code, format, message: "房间已创建，等待对手加入" });
+  pvpJson(peer, { type: "room_created", room: code, format, rankedFormat, message: "房间已创建，等待对手加入" });
   pvpRoomState(room);
 }
 
@@ -2014,7 +2193,7 @@ function joinPvpRoom(peer: PvpPeer, code: string): void {
   leavePvpRoom(peer);
   room.peers.push(peer);
   peer.room = room.code;
-  pvpJson(peer, { type: "room_joined", room: room.code, format: room.format, message: "已加入房间" });
+  pvpJson(peer, { type: "room_joined", room: room.code, format: room.format, rankedFormat: room.rankedFormat, message: "已加入房间" });
   const recipients = room.peers.filter((other) => other !== peer);
   recipients.forEach((other) => pvpJson(other, {
     type: "peer_joined",
@@ -2113,7 +2292,7 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     // The in-memory transport is a local/dev fallback with no authenticated
     // account-state database. It can enforce game deck rules only; production
     // D1 additionally verifies saved-deck membership and collection ownership.
-    const deckIds = parsePvpDeck(rawPayload.deckIds);
+    const deckIds = parsePvpDeck(rawPayload.deckIds, room.rankedFormat);
     if (!deckIds) return rejectMemoryPvpAction(peer, action, "卡组无效，无法准备。");
     room.readyDecks.set(peer.clientId, deckIds);
     const sequence = ++room.nextSequence;
@@ -2161,6 +2340,7 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
           seed: 0,
           startingPlayer,
           format: room.format,
+          rankedFormat: room.rankedFormat,
           deck: index === 0 ? hostDeck : guestDeck,
           matchToken: room.matchToken,
         },
@@ -2173,6 +2353,7 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
           state: redactPvpStateForViewer(room.matchState as MatchState, viewer),
           matchToken: room.matchToken,
           format: room.format,
+          rankedFormat: room.rankedFormat,
         },
       });
     });
@@ -2265,13 +2446,13 @@ function handlePvpMessage(peer: PvpPeer, raw: unknown): void {
       break;
     }
     case "create_room":
-      createPvpRoom(peer, parsePvpFormat(message.format));
+      createPvpRoom(peer, parsePvpFormat(message.format), parseRankedFormat(message.rankedFormat));
       break;
     case "join_room":
       joinPvpRoom(peer, typeof message.room === "string" ? message.room.trim().toUpperCase() : "");
       break;
     case "queue_join":
-      queuePvpPeer(peer, parsePvpFormat(message.format));
+      queuePvpPeer(peer, parsePvpFormat(message.format), parseRankedFormat(message.rankedFormat));
       break;
     case "queue_leave":
       removeMemoryQueue(peer);
@@ -2294,6 +2475,7 @@ function handlePvpMessage(peer: PvpPeer, raw: unknown): void {
               state: redactPvpStateForViewer(room.matchState, viewer),
               matchToken: room.matchToken,
               format: room.format,
+              rankedFormat: room.rankedFormat,
             },
           });
         }

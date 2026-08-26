@@ -49,6 +49,9 @@ export const matchRecords = sqliteTable(
     format: text("format", { enum: ["ranked", "casual"] })
       .notNull()
       .default("ranked"),
+    rankedFormat: text("ranked_format", { enum: ["standard", "wild"] })
+      .notNull()
+      .default("standard"),
     createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   },
   (table) => [
@@ -139,6 +142,9 @@ export const pvpMatches = sqliteTable(
     format: text("format", { enum: ["ranked", "casual"] })
       .notNull()
       .default("ranked"),
+    rankedFormat: text("ranked_format", { enum: ["standard", "wild"] })
+      .notNull()
+      .default("standard"),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull(),
   },
@@ -153,6 +159,9 @@ export const pvpMatchArchives = sqliteTable("pvp_match_archives", {
   format: text("format", { enum: ["ranked", "casual"] })
     .notNull()
     .default("ranked"),
+  rankedFormat: text("ranked_format", { enum: ["standard", "wild"] })
+    .notNull()
+    .default("standard"),
   createdAt: integer("created_at").notNull(),
   updatedAt: integer("updated_at").notNull(),
 });
@@ -222,4 +231,49 @@ export const pvpMmrSettlements = sqliteTable(
     createdAt: integer("created_at").notNull(),
   },
   (table) => [index("pvp_mmr_settlements_created_idx").on(table.createdAt)],
+);
+
+// Standard and Wild Ranked keep separate hidden ratings; Casual intentionally
+// uses the single "shared" pool across both deck formats.
+export const pvpFormatMatchmakingRatings = sqliteTable(
+  "pvp_format_matchmaking_ratings",
+  {
+    identityKey: text("identity_key").notNull(),
+    mode: text("mode", { enum: ["ranked", "casual"] }).notNull(),
+    ratingPool: text("rating_pool", { enum: ["standard", "wild", "shared"] }).notNull(),
+    rating: integer("rating").notNull().default(1500),
+    games: integer("games").notNull().default(0),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.identityKey, table.mode, table.ratingPool] }),
+    index("pvp_format_ratings_pool_rating_idx").on(
+      table.mode,
+      table.ratingPool,
+      table.rating,
+    ),
+  ],
+);
+
+export const pvpFormatMmrSettlements = sqliteTable(
+  "pvp_format_mmr_settlements",
+  {
+    matchToken: text("match_token").primaryKey(),
+    mode: text("mode", { enum: ["ranked", "casual"] }).notNull(),
+    ratingPool: text("rating_pool", { enum: ["standard", "wild", "shared"] }).notNull(),
+    hostIdentity: text("host_identity").notNull(),
+    guestIdentity: text("guest_identity").notNull(),
+    winner: integer("winner"),
+    hostRatingBefore: integer("host_rating_before").notNull(),
+    guestRatingBefore: integer("guest_rating_before").notNull(),
+    hostGamesBefore: integer("host_games_before").notNull(),
+    guestGamesBefore: integer("guest_games_before").notNull(),
+    hostRatingAfter: integer("host_rating_after").notNull(),
+    guestRatingAfter: integer("guest_rating_after").notNull(),
+    hostGamesAfter: integer("host_games_after").notNull(),
+    guestGamesAfter: integer("guest_games_after").notNull(),
+    applied: integer("applied").notNull().default(0),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [index("pvp_format_mmr_settlements_created_idx").on(table.createdAt)],
 );

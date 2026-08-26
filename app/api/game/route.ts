@@ -37,6 +37,7 @@ import {
   LADDER_READY_DECKS,
   type ApprenticeMilestoneId,
   type LadderReadyDeckId,
+  type RankedFormat,
 } from "../../../lib/game";
 
 export const dynamic = "force-dynamic";
@@ -78,6 +79,7 @@ type GameAction =
       deck: {
         id?: string;
         name: string;
+        format: RankedFormat;
         cardIds: string[];
       };
     }
@@ -127,6 +129,7 @@ type GameAction =
       pvpToken?: string;
       pvpPlayer?: 0 | 1;
       format?: MatchFormat;
+      rankedFormat?: RankedFormat;
       aiProof?: AiMatchProof;
     }
   | {
@@ -575,12 +578,15 @@ function parseAction(value: unknown): GameAction {
       }
       assertExactKeys(
         value.deck,
-        ["name", "cardIds"],
-        ["id", "name", "cardIds"],
+        ["name", "format", "cardIds"],
+        ["id", "name", "format", "cardIds"],
       );
 
       const name = parseTrimmedString(value.deck.name, "deck.name", 1, 32);
       const cardIds = parseCardIds(value.deck.cardIds);
+      const format = value.deck.format === "wild" ? "wild" : value.deck.format === "standard"
+        ? "standard"
+        : (() => { throw new PayloadError("deck.format 必须是 standard 或 wild。"); })();
       const id =
         value.deck.id === undefined
           ? undefined
@@ -589,7 +595,7 @@ function parseAction(value: unknown): GameAction {
       return {
         action: "save_deck",
         idempotencyKey,
-        deck: { ...(id ? { id } : {}), name, cardIds },
+        deck: { ...(id ? { id } : {}), name, format, cardIds },
       };
     }
     case "claim_task":
@@ -661,7 +667,7 @@ function parseAction(value: unknown): GameAction {
         "result",
         "mode",
         "opponent",
-      ], ["action", "idempotencyKey", "result", "mode", "opponent", "pvpToken", "pvpPlayer", "format", "aiProof"]);
+      ], ["action", "idempotencyKey", "result", "mode", "opponent", "pvpToken", "pvpPlayer", "format", "rankedFormat", "aiProof"]);
       if (value.result !== "win" && value.result !== "loss" && value.result !== "draw") {
         throw new PayloadError("result 必须是 win、loss 或 draw。");
       }
@@ -681,6 +687,11 @@ function parseAction(value: unknown): GameAction {
         : value.format === "ranked" || value.format === "casual"
           ? value.format
           : (() => { throw new PayloadError("format 必须是 ranked 或 casual。"); })();
+      const rankedFormat = value.rankedFormat === undefined
+        ? undefined
+        : value.rankedFormat === "standard" || value.rankedFormat === "wild"
+          ? value.rankedFormat
+          : (() => { throw new PayloadError("rankedFormat 必须是 standard 或 wild。"); })();
       if (value.mode === "pvp" && !pvpToken) {
         throw new PayloadError("PVP 对局必须携带服务器对局凭证。");
       }
@@ -697,6 +708,7 @@ function parseAction(value: unknown): GameAction {
         ...(pvpToken ? { pvpToken } : {}),
         ...(pvpPlayer === undefined ? {} : { pvpPlayer }),
         ...(format ? { format } : {}),
+        ...(rankedFormat ? { rankedFormat } : {}),
         ...(aiProof ? { aiProof } : {}),
       };
     case "reset_demo":
