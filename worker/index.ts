@@ -1557,9 +1557,16 @@ function canonicalCommand(value: unknown, role: 0 | 1): BattleCommand | null {
       if (!cardId) return null;
       const handIndex = canonicalHandIndex(raw.handIndex);
       if (raw.handIndex !== undefined && handIndex === undefined) return null;
-      if (raw.target === undefined) return { type: "play-card", ...metadata, cardId, ...(handIndex === undefined ? {} : { handIndex }) };
+      const placement = raw.placement === undefined
+        ? undefined
+        : raw.placement === "friendly" || raw.placement === "enemy"
+          ? raw.placement
+          : null;
+      if (placement === null) return null;
+      const placementFields = placement === undefined ? {} : { placement };
+      if (raw.target === undefined) return { type: "play-card", ...metadata, cardId, ...(handIndex === undefined ? {} : { handIndex }), ...placementFields };
       const target = canonicalTarget(raw.target, role);
-      return target ? { type: "play-card", ...metadata, cardId, ...(handIndex === undefined ? {} : { handIndex }), target } : null;
+      return target ? { type: "play-card", ...metadata, cardId, ...(handIndex === undefined ? {} : { handIndex }), ...placementFields, target } : null;
     }
     case "trade-card": {
       const cardId = canonicalCommandString(raw.cardId);
