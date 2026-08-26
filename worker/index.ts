@@ -245,6 +245,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
     if (
       safeEvent.type === "card-drawn"
       || safeEvent.type === "card-burned"
+      || safeEvent.type === "card-copied"
       || safeEvent.type === "card-traded"
       || safeEvent.type === "card-prepared"
     ) {
@@ -256,9 +257,11 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
           ? "对手完成了一次可交易循环。"
           : safeEvent.type === "card-prepared"
             ? "对手完成了一次预备。"
+          : safeEvent.type === "card-copied"
+            ? "对手复制了一张牌。"
           : safeEvent.type === "card-drawn"
             ? "对手抽取了一张牌。"
-            : safeEvent.message,
+            : "对手的一张牌因手牌已满被销毁。",
         data: safeData,
       };
     }
