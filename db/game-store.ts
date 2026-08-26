@@ -25,11 +25,14 @@ import {
   type ApprenticeMilestoneId,
 } from "../lib/game/economy.ts";
 import {
-  LADDER_START_RATING,
-  ladderStarsForRating,
-  ladderTierForRating,
+  LADDER_LEGEND_PROGRESS,
+  LADDER_MAX_STAR_BONUS,
+  createRankedSnapshot,
+  normalizeRankedSnapshot,
+  resetRankedSnapshotForSeason,
   updateRankedSnapshot,
 } from "../lib/game/ranked.ts";
+import type { RankedSnapshot } from "../lib/game/ranked.ts";
 
 export type MatchResult = "win" | "loss" | "draw";
 export type MatchMode = "ai" | "pvp";
@@ -100,16 +103,7 @@ export type LadderReadyState = {
   claimedDeckId: LadderReadyDeckId | null;
 };
 
-export type PlayerLadder = {
-  seasonKey: string;
-  rating: number;
-  tier: string;
-  stars: number;
-  wins: number;
-  losses: number;
-  highestRating: number;
-  winStreak?: number;
-};
+export type PlayerLadder = RankedSnapshot;
 
 export type FriendSummary = {
   id: string;
@@ -3118,7 +3112,7 @@ function createDefaultState(now: string): StoredPlayerState {
     rewardTrack: { claimedLevels: [] },
     apprenticeTrack: { claimedMilestones: [] },
     ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null },
-    ladder: { seasonKey: utcSeasonKey(now), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 },
+    ladder: createRankedSnapshot(utcSeasonKey(now)),
     stats: {
       wins: 0,
       losses: 0,
@@ -3223,22 +3217,10 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
           : null,
       }
     : { activatedAt: null, expiresAt: null, claimedDeckId: null };
-  const ladder = isRecord(value.ladder)
-    ? {
-        seasonKey: typeof value.ladder.seasonKey === "string" ? value.ladder.seasonKey : utcSeasonKey(new Date().toISOString()),
-        rating: isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : LADDER_START_RATING,
-        tier: typeof value.ladder.tier === "string" ? value.ladder.tier : ladderTierForRating(LADDER_START_RATING),
-        stars: isFiniteNonNegativeInteger(value.ladder.stars) ? value.ladder.stars : ladderStarsForRating(LADDER_START_RATING),
-        wins: isFiniteNonNegativeInteger(value.ladder.wins) ? value.ladder.wins : 0,
-        losses: isFiniteNonNegativeInteger(value.ladder.losses) ? value.ladder.losses : 0,
-        highestRating: isFiniteNonNegativeInteger(value.ladder.highestRating)
-          ? value.ladder.highestRating
-          : (isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : LADDER_START_RATING),
-        winStreak: isFiniteNonNegativeInteger(value.ladder.winStreak) ? value.ladder.winStreak : 0,
-      }
-    : { seasonKey: utcSeasonKey(new Date().toISOString()), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 };
-  ladder.tier = ladderTierForRating(ladder.rating);
-  ladder.stars = ladderStarsForRating(ladder.rating);
+  const ladder = normalizeRankedSnapshot(
+    value.ladder,
+    utcSeasonKey(new Date().toISOString()),
+  );
   return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, ladder } as StoredPlayerState;
 }
 
@@ -3328,17 +3310,33 @@ function isLadderReadyState(value: unknown): value is LadderReadyState {
 }
 
 function isLadder(value: unknown): value is PlayerLadder {
-  return (
-    isRecord(value) &&
-    typeof value.seasonKey === "string" &&
-    isFiniteNonNegativeInteger(value.rating) &&
-    typeof value.tier === "string" &&
-    isFiniteNonNegativeInteger(value.stars) &&
-    isFiniteNonNegativeInteger(value.wins) &&
-    isFiniteNonNegativeInteger(value.losses) &&
-    isFiniteNonNegativeInteger(value.highestRating) &&
-    (value.winStreak === undefined || isFiniteNonNegativeInteger(value.winStreak))
-  );
+  if (
+    !isRecord(value) ||
+    typeof value.seasonKey !== "string" ||
+    !isFiniteNonNegativeInteger(value.rating) ||
+    typeof value.tier !== "string" ||
+    !isFiniteNonNegativeInteger(value.rank) ||
+    !isFiniteNonNegativeInteger(value.stars) ||
+    !isFiniteNonNegativeInteger(value.rankProgress) ||
+    value.rankProgress > LADDER_LEGEND_PROGRESS ||
+    !isFiniteNonNegativeInteger(value.starBonus) ||
+    value.starBonus < 1 ||
+    value.starBonus > LADDER_MAX_STAR_BONUS ||
+    !isFiniteNonNegativeInteger(value.seasonBestProgress) ||
+    value.seasonBestProgress > LADDER_LEGEND_PROGRESS ||
+    value.seasonBestProgress < value.rankProgress ||
+    !isFiniteNonNegativeInteger(value.wins) ||
+    !isFiniteNonNegativeInteger(value.losses) ||
+    !isFiniteNonNegativeInteger(value.highestRating) ||
+    (value.winStreak !== undefined && !isFiniteNonNegativeInteger(value.winStreak))
+  ) {
+    return false;
+  }
+  const normalized = normalizeRankedSnapshot(value, value.seasonKey);
+  return normalized.rating === value.rating
+    && normalized.tier === value.tier
+    && normalized.rank === value.rank
+    && normalized.stars === value.stars;
 }
 
 function isDeck(value: unknown): value is PlayerDeck {
@@ -3416,7 +3414,7 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.apprenticeTrack.claimedMilestones.length === 0 &&
     state.ladderReady.activatedAt === null &&
     state.ladderReady.claimedDeckId === null &&
-    state.ladder.rating === 1000 &&
+    state.ladder.rankProgress === 0 &&
     state.tasks.every((task) => task.progress === 0 && !task.claimed)
   );
 }
@@ -3514,8 +3512,10 @@ function refreshTaskCycle(state: StoredPlayerState, now: string): StoredPlayerSt
       aiRewardsToday: dayChanged || firstLoad ? 0 : state.taskCycle.aiRewardsToday,
       weeklyFreePackClaimed: weekChanged || firstLoad ? false : state.taskCycle.weeklyFreePackClaimed,
     },
-    ladder: seasonChanged || firstLoad
-      ? { ...state.ladder, seasonKey, rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, winStreak: 0 }
+    // Missing legacy task-cycle fields may refresh quests, but must never
+    // masquerade as a new ladder season and wipe visible rank progress.
+    ladder: seasonChanged
+      ? resetRankedSnapshotForSeason(state.ladder, seasonKey)
       : state.ladder,
   };
 }
