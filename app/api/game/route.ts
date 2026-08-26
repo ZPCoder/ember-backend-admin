@@ -67,6 +67,7 @@ type GameAction =
       deckId?: string;
       ladderReadyDeckId?: LadderReadyDeckId;
       opponentArchetypeId: string;
+      training?: boolean;
     }
   | {
       action: "activate_ladder_ready";
@@ -583,13 +584,20 @@ function parseAction(value: unknown): GameAction {
 
   switch (value.action) {
     case "create_ai_match": {
-      assertExactKeys(value, ["action", "opponentArchetypeId"], ["action", "opponentArchetypeId", "deckId", "ladderReadyDeckId"]);
+      assertExactKeys(value, ["action", "opponentArchetypeId"], ["action", "opponentArchetypeId", "deckId", "ladderReadyDeckId", "training"]);
+      const training = value.training === true;
+      if (value.training !== undefined && typeof value.training !== "boolean") {
+        throw new PayloadError("training 必须是布尔值。");
+      }
       const deckId = value.deckId === undefined ? undefined : parseIdentifier(value.deckId, "deckId");
       const rawLadderReadyDeckId = value.ladderReadyDeckId === undefined
         ? undefined
         : parseIdentifier(value.ladderReadyDeckId, "ladderReadyDeckId");
-      if (Boolean(deckId) === Boolean(rawLadderReadyDeckId)) {
+      if (!training && Boolean(deckId) === Boolean(rawLadderReadyDeckId)) {
         throw new PayloadError("deckId 与 ladderReadyDeckId 必须且只能提供一个。");
+      }
+      if (training && (deckId || rawLadderReadyDeckId)) {
+        throw new PayloadError("训练对局使用固定教学牌组，不能指定普通牌组。");
       }
       if (rawLadderReadyDeckId && !LADDER_READY_DECKS.some((deck) => deck.id === rawLadderReadyDeckId)) {
         throw new PayloadError("ladderReadyDeckId 不是有效的天梯预备套牌。");
@@ -598,6 +606,7 @@ function parseAction(value: unknown): GameAction {
         action: "create_ai_match",
         ...(deckId ? { deckId } : {}),
         ...(rawLadderReadyDeckId ? { ladderReadyDeckId: rawLadderReadyDeckId as LadderReadyDeckId } : {}),
+        ...(training ? { training: true } : {}),
         opponentArchetypeId: parseIdentifier(value.opponentArchetypeId, "opponentArchetypeId"),
       };
     }

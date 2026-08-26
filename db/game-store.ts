@@ -21,6 +21,11 @@ import {
   TRIAL_CARD_ACCESS_MS,
   RETURN_QUEST_STAGE_IDS,
   returnQuestStageReady,
+  TRAINING_DECK_ID,
+  TRAINING_MATCH_SEED,
+  TRAINING_OPPONENT_ARCHETYPE_ID,
+  TRAINING_PLAYER_DECK,
+  TRAINING_STARTING_PLAYER,
   ladderReadyTrialIsActive,
   validateDeck,
   validateDeckForFormat,
@@ -520,6 +525,7 @@ export async function createAiMatch(
     deckId?: string;
     ladderReadyDeckId?: LadderReadyDeckId;
     opponentArchetypeId: string;
+    training?: boolean;
   },
 ): Promise<CreateAiMatchResult> {
   const db = getD1();
@@ -529,7 +535,9 @@ export async function createAiMatch(
   const nowIso = now.toISOString();
 
   const existing = await loadActiveAiTicket(db, player.id);
-  if (existing && existing.expiresAt > nowIso) {
+  const requestedTraining = input.training === true;
+  const existingTraining = existing?.deckId === TRAINING_DECK_ID;
+  if (existing && existing.expiresAt > nowIso && requestedTraining === existingTraining) {
     return {
       player: await loadPublicPlayer(db, player),
       aiMatch: parseAiMatchTicketRow(existing),
@@ -554,7 +562,11 @@ export async function createAiMatch(
   let selectedDeckId: string;
   let selectedCardIds: readonly string[];
   let selectedRankedFormat: RankedFormat;
-  if (trialDeck) {
+  if (requestedTraining) {
+    selectedDeckId = TRAINING_DECK_ID;
+    selectedCardIds = TRAINING_PLAYER_DECK;
+    selectedRankedFormat = "standard";
+  } else if (trialDeck) {
     assertLadderReadyTrialActive(state.ladderReady, now);
     selectedDeckId = `trial:${trialDeck.id}`;
     selectedCardIds = trialDeck.deck;
@@ -576,7 +588,10 @@ export async function createAiMatch(
   if (!validation.valid) {
     throw new GameStoreError("INVALID_DECK", "卡组不符合组牌规则。", 400, validation.errors);
   }
-  const archetype = AI_ARCHETYPES.find((candidate) => candidate.id === input.opponentArchetypeId);
+  const requestedArchetypeId = requestedTraining
+    ? TRAINING_OPPONENT_ARCHETYPE_ID
+    : input.opponentArchetypeId;
+  const archetype = AI_ARCHETYPES.find((candidate) => candidate.id === requestedArchetypeId);
   if (!archetype) {
     throw new GameStoreError("AI_ARCHETYPE_NOT_FOUND", "AI 对手原型不存在。", 400);
   }
@@ -588,8 +603,8 @@ export async function createAiMatch(
     : now.getTime() + AI_MATCH_TICKET_TTL_MS;
   const ticket: AiMatchTicket = {
     token: `ai-${crypto.randomUUID()}`,
-    seed: (randomness[0] ?? 0) & 0x7fffffff,
-    startingPlayer: ((randomness[1] ?? 0) & 1) as 0 | 1,
+    seed: requestedTraining ? TRAINING_MATCH_SEED : (randomness[0] ?? 0) & 0x7fffffff,
+    startingPlayer: requestedTraining ? TRAINING_STARTING_PLAYER : ((randomness[1] ?? 0) & 1) as 0 | 1,
     rankedFormat: selectedRankedFormat,
     playerDeck: [...selectedCardIds],
     opponentArchetypeId: archetype.id,
@@ -2239,6 +2254,9 @@ export async function recordMatch(
   }
   if (verifiedAiTicket.expiresAt <= new Date().toISOString()) {
     throw new GameStoreError("AI_TICKET_EXPIRED", "AI 对局凭证已过期，请重新开始对局。", 409);
+  }
+  if (verifiedAiTicket.deckId === TRAINING_DECK_ID) {
+    throw new GameStoreError("TRAINING_MATCH_NO_SETTLEMENT", "训练对局不计入正式战绩与奖励。", 409);
   }
   const ticket = parseAiMatchTicketRow(verifiedAiTicket);
   if (!aiMatchTicketMatchesProof(ticket, input.aiProof)) {
