@@ -166,6 +166,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
         handFragments: (player.handFragments ?? player.hand.map(() => null)).map((fragment) =>
           fragment ? { ...fragment } : null),
         handEnteredTurns: [...(player.handEnteredTurns ?? player.hand.map(() => 0))],
+        handEntityIds: [...(player.handEntityIds ?? player.hand.map((_, index) => `legacy-hand-${index}`))],
       };
     }
     return {
@@ -179,6 +180,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       handFragments: privateCards.map(() => null),
       handStartedInDeck: privateCards.map(() => true),
       handEnteredTurns: privateCards.map(() => 0),
+      handEntityIds: privateCards.map((_, index) => `hidden-hand-${index}`),
       // The ordered spell identity history can reveal an untriggered Secret.
       // Keep the complete list server-side for recast effects.
       spellsPlayedThisGame: [],
@@ -283,6 +285,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       delete safeData.retainedCostReduction;
       delete safeData.fragment;
       delete safeData.groupId;
+      delete safeData.handEntityId;
       return {
         ...safeEvent,
         message: safeEvent.type === "card-traded"
