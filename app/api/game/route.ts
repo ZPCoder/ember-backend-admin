@@ -1,5 +1,6 @@
 import { getChatGPTUser } from "../../chatgpt-auth";
 import {
+  claimApprenticeReward,
   claimTask,
   claimReward,
   claimWeeklyPack,
@@ -29,6 +30,10 @@ import {
   type MatchFormat,
   type MatchResult,
 } from "../../../db/game-store";
+import {
+  APPRENTICE_MILESTONES,
+  type ApprenticeMilestoneId,
+} from "../../../lib/game";
 
 export const dynamic = "force-dynamic";
 
@@ -93,6 +98,11 @@ type GameAction =
       action: "claim_reward";
       idempotencyKey: string;
       level: number;
+    }
+  | {
+      action: "claim_apprentice_reward";
+      idempotencyKey: string;
+      milestoneId: ApprenticeMilestoneId;
     }
   | {
       action: "record_match";
@@ -265,6 +275,17 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           level: result.level,
+          reward: result.reward,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "claim_apprentice_reward": {
+        const result = await claimApprenticeReward(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          apprenticeMilestoneId: result.milestoneId,
           reward: result.reward,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
@@ -558,6 +579,18 @@ function parseAction(value: unknown): GameAction {
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
         level: value.level,
       };
+    case "claim_apprentice_reward": {
+      assertExactKeys(value, ["action", "idempotencyKey", "milestoneId"]);
+      const milestoneId = parseIdentifier(value.milestoneId, "milestoneId");
+      if (!APPRENTICE_MILESTONES.some((milestone) => milestone.id === milestoneId)) {
+        throw new PayloadError("milestoneId 不是有效的新兵里程碑。");
+      }
+      return {
+        action: "claim_apprentice_reward",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        milestoneId: milestoneId as ApprenticeMilestoneId,
+      };
+    }
     case "record_match":
       assertExactKeys(value, [
         "action",

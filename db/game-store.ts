@@ -14,9 +14,12 @@ import {
 import type { BattleCommand, MatchState } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
 import {
+  APPRENTICE_MILESTONES,
   REWARD_TRACK,
+  apprenticeMilestoneComplete,
   craftCost,
   disenchantValue,
+  type ApprenticeMilestoneId,
 } from "../lib/game/economy.ts";
 import {
   LADDER_START_RATING,
@@ -82,6 +85,10 @@ export type PlayerProgression = {
 
 export type RewardTrackState = {
   claimedLevels: number[];
+};
+
+export type ApprenticeTrackState = {
+  claimedMilestones: ApprenticeMilestoneId[];
 };
 
 export type PlayerLadder = {
@@ -157,6 +164,7 @@ export type PlayerState = {
   taskCycle: TaskCycle;
   progression: PlayerProgression;
   rewardTrack: RewardTrackState;
+  apprenticeTrack: ApprenticeTrackState;
   ladder: PlayerLadder;
   friends?: FriendSummary[];
   chatMessages?: SocialMessage[];
@@ -241,6 +249,13 @@ export type CardEconomyResult = {
 export type ClaimRewardResult = {
   player: PlayerState;
   level: number;
+  reward: { title: string; kind: "gold" | "pack" | "dust"; amount: number };
+  replayed: boolean;
+};
+
+export type ClaimApprenticeRewardResult = {
+  player: PlayerState;
+  milestoneId: ApprenticeMilestoneId;
   reward: { title: string; kind: "gold" | "pack" | "dust"; amount: number };
   replayed: boolean;
 };
@@ -1329,6 +1344,61 @@ export async function claimReward(
   ).then(({ player: nextPlayer, result, replayed }) => ({
     player: nextPlayer,
     level: result.level,
+    reward: result.reward,
+    replayed,
+  }));
+}
+
+export async function claimApprenticeReward(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; milestoneId: ApprenticeMilestoneId },
+): Promise<ClaimApprenticeRewardResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const milestone = APPRENTICE_MILESTONES.find((candidate) => candidate.id === input.milestoneId);
+  if (!milestone) {
+    throw new GameStoreError("APPRENTICE_MILESTONE_NOT_FOUND", "新兵里程碑不存在。", 404);
+  }
+
+  return commitMutation(
+    db,
+    player,
+    "claim_apprentice_reward",
+    input.idempotencyKey,
+    { milestoneId: input.milestoneId },
+    (current) => {
+      if (current.apprenticeTrack.claimedMilestones.includes(milestone.id)) {
+        throw new GameStoreError("APPRENTICE_REWARD_ALREADY_CLAIMED", "该新兵奖励已经领取。", 409);
+      }
+      const complete = apprenticeMilestoneComplete(milestone, {
+        packsOpened: current.packPity.packsOpened,
+        matchesPlayed: current.stats.matchesPlayed,
+        wins: current.stats.wins,
+        level: current.progression.level,
+      });
+      if (!complete) {
+        throw new GameStoreError("APPRENTICE_MILESTONE_INCOMPLETE", "新兵里程碑尚未完成。", 409);
+      }
+
+      const claimedMilestones = [...current.apprenticeTrack.claimedMilestones, milestone.id];
+      return {
+        nextState: {
+          ...current,
+          apprenticeTrack: { claimedMilestones },
+          currencies: {
+            ...current.currencies,
+            gold: current.currencies.gold + (milestone.reward.kind === "gold" ? milestone.reward.amount : 0),
+            dust: current.currencies.dust + (milestone.reward.kind === "dust" ? milestone.reward.amount : 0),
+          },
+          packsAvailable: current.packsAvailable + (milestone.reward.kind === "pack" ? milestone.reward.amount : 0),
+        },
+        result: { milestoneId: milestone.id, reward: milestone.reward },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    milestoneId: result.milestoneId,
     reward: result.reward,
     replayed,
   }));
@@ -2905,6 +2975,7 @@ function createDefaultState(now: string): StoredPlayerState {
     },
     progression: { xp: 0, level: 1 },
     rewardTrack: { claimedLevels: [] },
+    apprenticeTrack: { claimedMilestones: [] },
     ladder: { seasonKey: utcSeasonKey(now), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 },
     stats: {
       wins: 0,
@@ -2994,6 +3065,13 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
   const rewardTrack = isRecord(value.rewardTrack) && Array.isArray(value.rewardTrack.claimedLevels)
     ? { claimedLevels: value.rewardTrack.claimedLevels.filter(isFiniteNonNegativeInteger) }
     : { claimedLevels: [] };
+  const apprenticeTrack = isRecord(value.apprenticeTrack) && Array.isArray(value.apprenticeTrack.claimedMilestones)
+    ? {
+        claimedMilestones: value.apprenticeTrack.claimedMilestones.filter(
+          (id): id is ApprenticeMilestoneId => typeof id === "string" && APPRENTICE_MILESTONES.some((milestone) => milestone.id === id),
+        ),
+      }
+    : { claimedMilestones: [] };
   const ladder = isRecord(value.ladder)
     ? {
         seasonKey: typeof value.ladder.seasonKey === "string" ? value.ladder.seasonKey : utcSeasonKey(new Date().toISOString()),
@@ -3010,7 +3088,7 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
     : { seasonKey: utcSeasonKey(new Date().toISOString()), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 };
   ladder.tier = ladderTierForRating(ladder.rating);
   ladder.stars = ladderStarsForRating(ladder.rating);
-  return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, ladder } as StoredPlayerState;
+  return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladder } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -3034,6 +3112,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isTaskCycle(value.taskCycle) &&
     isProgression(value.progression) &&
     isRewardTrack(value.rewardTrack) &&
+    isApprenticeTrack(value.apprenticeTrack) &&
     isLadder(value.ladder) &&
     value.decks.every(isDeck) &&
     value.tasks.every(isTask) &&
@@ -3073,6 +3152,14 @@ function isProgression(value: unknown): value is PlayerProgression {
 
 function isRewardTrack(value: unknown): value is RewardTrackState {
   return isRecord(value) && Array.isArray(value.claimedLevels) && value.claimedLevels.every(isFiniteNonNegativeInteger);
+}
+
+function isApprenticeTrack(value: unknown): value is ApprenticeTrackState {
+  return isRecord(value)
+    && Array.isArray(value.claimedMilestones)
+    && value.claimedMilestones.every(
+      (id) => typeof id === "string" && APPRENTICE_MILESTONES.some((milestone) => milestone.id === id),
+    );
 }
 
 function isLadder(value: unknown): value is PlayerLadder {
@@ -3127,6 +3214,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     taskCycle: { ...state.taskCycle },
     progression: { ...state.progression },
     rewardTrack: { claimedLevels: [...state.rewardTrack.claimedLevels] },
+    apprenticeTrack: { claimedMilestones: [...state.apprenticeTrack.claimedMilestones] },
     ladder: { ...state.ladder },
     stats: { ...state.stats },
   };
@@ -3159,6 +3247,7 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.stats.matchesPlayed === 0 &&
     state.progression.xp === 0 &&
     state.rewardTrack.claimedLevels.length === 0 &&
+    state.apprenticeTrack.claimedMilestones.length === 0 &&
     state.ladder.rating === 1000 &&
     state.tasks.every((task) => task.progress === 0 && !task.claimed)
   );
