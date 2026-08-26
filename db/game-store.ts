@@ -16,11 +16,13 @@ import {
   generateCatchUpPack,
   collectionWithTrialCards,
   TRIAL_CARD_ACCESS_MS,
+  RETURN_QUEST_STAGE_IDS,
+  returnQuestStageReady,
   ladderReadyTrialIsActive,
   validateDeck,
   validateDeckForFormat,
 } from "../lib/game";
-import type { BattleCommand, LadderReadyDeckId, MatchState, RankedFormat, TrialCardAccess } from "../lib/game";
+import type { BattleCommand, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrialCardAccess } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
 import {
   APPRENTICE_MILESTONES,
@@ -199,6 +201,7 @@ export type PlayerState = {
   ladderReady: LadderReadyState;
   catchUpPack: CatchUpPackState;
   trialCards: TrialCardAccess;
+  returnJourney: ReturnJourneyState;
   rankedLadders: RankedLadders;
   rankedRewards: RankedRewardState;
   friends?: FriendSummary[];
@@ -316,6 +319,10 @@ export type ClaimCatchUpPackResult = {
   player: PlayerState;
   openedCards: Array<{ cardId: string; count: number }>;
   replayed: boolean;
+};
+
+export type ClaimReturnQuestResult = ClaimCatchUpPackResult & {
+  stageId: ReturnQuestStageId;
 };
 
 export type RecordMatchResult = {
@@ -1576,6 +1583,10 @@ export async function activateLadderReady(
             activatedAt: activatedAt.toISOString(),
             expiresAt: new Date(activatedAt.getTime() + TRIAL_CARD_ACCESS_MS).toISOString(),
           },
+          returnJourney: {
+            claimedStageIds: [],
+            matchesPlayedAtActivation: current.stats.matchesPlayed,
+          },
         },
         result: {},
       };
@@ -1683,6 +1694,12 @@ export async function claimCatchUpPack(
           ...current,
           collection,
           catchUpPack: { claimedAt, cardsGranted: cards.length },
+          returnJourney: {
+            ...current.returnJourney,
+            claimedStageIds: current.returnJourney.claimedStageIds.includes("reconnect")
+              ? current.returnJourney.claimedStageIds
+              : ["reconnect", ...current.returnJourney.claimedStageIds],
+          },
         },
         result: {
           openedCards: [...counts].map(([cardId, count]) => ({ cardId, count })),
@@ -1691,6 +1708,70 @@ export async function claimCatchUpPack(
     },
   ).then(({ player: nextPlayer, result, replayed }) => ({
     player: nextPlayer,
+    openedCards: result.openedCards,
+    replayed,
+  }));
+}
+
+export async function claimReturnQuest(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; stageId: ReturnQuestStageId },
+): Promise<ClaimReturnQuestResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  return commitMutation(
+    db,
+    player,
+    "claim_return_quest",
+    input.idempotencyKey,
+    { stageId: input.stageId },
+    (current) => {
+      if (current.returnJourney.claimedStageIds.includes(input.stageId)) {
+        throw new GameStoreError("RETURN_QUEST_ALREADY_CLAIMED", "该回归任务奖励已经领取。", 409);
+      }
+      if (!returnQuestStageReady(input.stageId, current.returnJourney, {
+        activatedAt: current.ladderReady.activatedAt,
+        decks: current.decks,
+        matchesPlayed: current.stats.matchesPlayed,
+      })) {
+        throw new GameStoreError("RETURN_QUEST_NOT_READY", "请先完成当前回归任务及其前置步骤。", 409);
+      }
+      const stageIndex = RETURN_QUEST_STAGE_IDS.indexOf(input.stageId);
+      const seed = current.stats.matchesPlayed
+        + current.packPity.packsOpened * 31
+        + Object.values(current.collection).reduce((sum, count) => sum + count, 0) * 131
+        + (stageIndex + 1) * 7_919;
+      const cards = generateCatchUpPack(current.collection, seed);
+      const collection = { ...current.collection };
+      const counts = new Map<string, number>();
+      for (const cardId of cards) {
+        collection[cardId] = (collection[cardId] ?? 0) + 1;
+        counts.set(cardId, (counts.get(cardId) ?? 0) + 1);
+      }
+      const claimedAt = new Date().toISOString();
+      return {
+        nextState: {
+          ...current,
+          collection,
+          catchUpPack: {
+            claimedAt: current.catchUpPack.claimedAt ?? claimedAt,
+            cardsGranted: current.catchUpPack.cardsGranted + cards.length,
+          },
+          returnJourney: {
+            ...current.returnJourney,
+            claimedStageIds: [...current.returnJourney.claimedStageIds, input.stageId],
+          },
+        },
+        result: {
+          stageId: input.stageId,
+          openedCards: [...counts].map(([cardId, count]) => ({ cardId, count })),
+        },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    stageId: result.stageId,
     openedCards: result.openedCards,
     replayed,
   }));
@@ -3323,6 +3404,7 @@ function createDefaultState(now: string): StoredPlayerState {
     ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null },
     catchUpPack: { claimedAt: null, cardsGranted: 0 },
     trialCards: { activatedAt: null, expiresAt: null },
+    returnJourney: { claimedStageIds: [], matchesPlayedAtActivation: 0 },
     rankedLadders: createRankedLadders(utcSeasonKey(now)),
     rankedRewards: createRankedRewardState(),
     stats: {
@@ -3456,13 +3538,31 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
     : ladderReady.activatedAt && ladderReady.expiresAt
       ? { activatedAt: ladderReady.activatedAt, expiresAt: ladderReady.expiresAt }
       : { activatedAt: null, expiresAt: null };
+  const migratedReturnStageIds: ReturnQuestStageId[] = [];
+  if (isRecord(value.returnJourney) && Array.isArray(value.returnJourney.claimedStageIds)) {
+    for (const id of RETURN_QUEST_STAGE_IDS) {
+      if (!value.returnJourney.claimedStageIds.includes(id)) break;
+      migratedReturnStageIds.push(id);
+    }
+  } else if (catchUpPack.claimedAt) {
+    migratedReturnStageIds.push("reconnect");
+  }
+  const returnJourney: ReturnJourneyState = {
+    claimedStageIds: migratedReturnStageIds,
+    matchesPlayedAtActivation: isRecord(value.returnJourney)
+      && isFiniteNonNegativeInteger(value.returnJourney.matchesPlayedAtActivation)
+      ? value.returnJourney.matchesPlayedAtActivation
+      : isRecord(value.stats) && isFiniteNonNegativeInteger(value.stats.matchesPlayed)
+        ? value.stats.matchesPlayed
+        : 0,
+  };
   const rankedLadders = normalizeRankedLadders(
     value.rankedLadders,
     value.ladder,
     utcSeasonKey(new Date().toISOString()),
   );
   const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
-  return { ...value, decks, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, rankedLadders, rankedRewards } as StoredPlayerState;
+  return { ...value, decks, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, returnJourney, rankedLadders, rankedRewards } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -3490,6 +3590,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isLadderReadyState(value.ladderReady) &&
     isCatchUpPackState(value.catchUpPack) &&
     isTrialCardAccess(value.trialCards) &&
+    isReturnJourneyState(value.returnJourney) &&
     isRankedLadders(value.rankedLadders) &&
     isRankedRewardState(value.rankedRewards) &&
     value.decks.every(isDeck) &&
@@ -3568,6 +3669,15 @@ function isTrialCardAccess(value: unknown): value is TrialCardAccess {
     && Number.isFinite(Date.parse(value.activatedAt))
     && Number.isFinite(Date.parse(value.expiresAt))
     && Date.parse(value.expiresAt) > Date.parse(value.activatedAt);
+}
+
+function isReturnJourneyState(value: unknown): value is ReturnJourneyState {
+  return isRecord(value)
+    && Array.isArray(value.claimedStageIds)
+    && value.claimedStageIds.every((id) => typeof id === "string" && RETURN_QUEST_STAGE_IDS.includes(id as ReturnQuestStageId))
+    && new Set(value.claimedStageIds).size === value.claimedStageIds.length
+    && value.claimedStageIds.every((id, index) => id === RETURN_QUEST_STAGE_IDS[index])
+    && isFiniteNonNegativeInteger(value.matchesPlayedAtActivation);
 }
 
 function isLadder(value: unknown): value is PlayerLadder {
@@ -3659,6 +3769,10 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     ladderReady: { ...state.ladderReady },
     catchUpPack: { ...state.catchUpPack },
     trialCards: { ...state.trialCards },
+    returnJourney: {
+      claimedStageIds: [...state.returnJourney.claimedStageIds],
+      matchesPlayedAtActivation: state.returnJourney.matchesPlayedAtActivation,
+    },
     rankedLadders: cloneRankedLadders(state.rankedLadders),
     rankedRewards: {
       claimedFirstTimeFloors: [...state.rankedRewards.claimedFirstTimeFloors],
@@ -3702,6 +3816,8 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.ladderReady.claimedDeckId === null &&
     state.catchUpPack.claimedAt === null &&
     state.trialCards.activatedAt === null &&
+    state.returnJourney.claimedStageIds.length === 0 &&
+    state.returnJourney.matchesPlayedAtActivation === 0 &&
     state.rankedLadders.standard.rankProgress === 0 &&
     state.rankedLadders.wild.rankProgress === 0 &&
     state.rankedRewards.claimedFirstTimeFloors.length === 0 &&

@@ -3,6 +3,7 @@ import {
   claimApprenticeReward,
   claimLadderReadyDeck,
   claimCatchUpPack,
+  claimReturnQuest,
   claimTask,
   claimReward,
   claimWeeklyPack,
@@ -40,6 +41,7 @@ import {
   type ApprenticeMilestoneId,
   type LadderReadyDeckId,
   type RankedFormat,
+  type ReturnQuestStageId,
 } from "../../../lib/game";
 
 export const dynamic = "force-dynamic";
@@ -78,6 +80,11 @@ type GameAction =
   | {
       action: "claim_catch_up_pack";
       idempotencyKey: string;
+    }
+  | {
+      action: "claim_return_quest";
+      idempotencyKey: string;
+      stageId: ReturnQuestStageId;
     }
   | {
       action: "save_deck";
@@ -246,6 +253,17 @@ export async function POST(request: Request): Promise<Response> {
           ok: true,
           action: action.action,
           player: result.player,
+          openedCards: result.openedCards,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "claim_return_quest": {
+        const result = await claimReturnQuest(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          stageId: result.stageId,
           openedCards: result.openedCards,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
@@ -607,6 +625,18 @@ function parseAction(value: unknown): GameAction {
         action: "claim_catch_up_pack",
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
       };
+    case "claim_return_quest": {
+      assertExactKeys(value, ["action", "idempotencyKey", "stageId"]);
+      const stageId = parseIdentifier(value.stageId, "stageId");
+      if (stageId !== "reconnect" && stageId !== "rebuild" && stageId !== "battle") {
+        throw new PayloadError("stageId 不是有效的回归任务阶段。");
+      }
+      return {
+        action: "claim_return_quest",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        stageId,
+      };
+    }
     case "save_deck": {
       assertExactKeys(value, ["action", "idempotencyKey", "deck"]);
       const idempotencyKey = parseIdempotencyKey(value.idempotencyKey);
