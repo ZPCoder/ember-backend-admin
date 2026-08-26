@@ -1,0 +1,1 @@
+ALTER TABLE `ai_match_tickets` ADD `ranked_format` text DEFAULT 'standard' NOT NULL;

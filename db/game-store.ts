@@ -154,6 +154,7 @@ export type AiMatchProof = {
   ticketToken: string;
   seed: number;
   startingPlayer: 0 | 1;
+  rankedFormat: RankedFormat;
   playerDeck: string[];
   opponentArchetypeId: string;
   commands: BattleCommand[];
@@ -163,6 +164,7 @@ export type AiMatchTicket = {
   token: string;
   seed: number;
   startingPlayer: 0 | 1;
+  rankedFormat: RankedFormat;
   playerDeck: string[];
   opponentArchetypeId: string;
   expiresAt: string;
@@ -392,6 +394,7 @@ type AiMatchTicketRow = {
   opponentArchetypeId: string;
   seed: number;
   startingPlayer: number;
+  rankedFormat?: RankedFormat | null;
   expiresAt: string;
   consumedAt?: string | null;
   consumedByIdempotencyKey?: string | null;
@@ -524,10 +527,12 @@ export async function createAiMatch(
     : undefined;
   let selectedDeckId: string;
   let selectedCardIds: readonly string[];
+  let selectedRankedFormat: RankedFormat;
   if (trialDeck) {
     assertLadderReadyTrialActive(state.ladderReady, now);
     selectedDeckId = `trial:${trialDeck.id}`;
     selectedCardIds = trialDeck.deck;
+    selectedRankedFormat = "standard";
   } else {
     const deck = state.decks.find((candidate) => candidate.id === input.deckId);
     if (!deck) {
@@ -536,8 +541,9 @@ export async function createAiMatch(
     assertCardsOwned(deck.cardIds, state.collection);
     selectedDeckId = deck.id;
     selectedCardIds = deck.cardIds;
+    selectedRankedFormat = deck.format === "wild" ? "wild" : "standard";
   }
-  const validation = validateDeck(selectedCardIds);
+  const validation = validateDeckForFormat(selectedCardIds, selectedRankedFormat);
   if (!validation.valid) {
     throw new GameStoreError("INVALID_DECK", "卡组不符合组牌规则。", 400, validation.errors);
   }
@@ -555,6 +561,7 @@ export async function createAiMatch(
     token: `ai-${crypto.randomUUID()}`,
     seed: (randomness[0] ?? 0) & 0x7fffffff,
     startingPlayer: ((randomness[1] ?? 0) & 1) as 0 | 1,
+    rankedFormat: selectedRankedFormat,
     playerDeck: [...selectedCardIds],
     opponentArchetypeId: archetype.id,
     expiresAt: new Date(ticketExpiryMs).toISOString(),
@@ -565,8 +572,8 @@ export async function createAiMatch(
       .prepare(
         `INSERT INTO ai_match_tickets
            (token, player_id, deck_id, deck_json, opponent_archetype_id,
-            seed, starting_player, active_slot, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+            seed, starting_player, ranked_format, active_slot, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
       )
       .bind(
         ticket.token,
@@ -576,6 +583,7 @@ export async function createAiMatch(
         ticket.opponentArchetypeId,
         ticket.seed,
         ticket.startingPlayer,
+        ticket.rankedFormat,
         ticket.expiresAt,
         nowIso,
       )
@@ -2413,7 +2421,8 @@ async function loadActiveAiTicket(
     .prepare(
       `SELECT token, player_id AS playerId, deck_id AS deckId,
               deck_json AS deckJson, opponent_archetype_id AS opponentArchetypeId,
-              seed, starting_player AS startingPlayer, expires_at AS expiresAt,
+              seed, starting_player AS startingPlayer,
+              COALESCE(ranked_format, 'standard') AS rankedFormat, expires_at AS expiresAt,
               consumed_at AS consumedAt,
               consumed_by_idempotency_key AS consumedByIdempotencyKey
        FROM ai_match_tickets
@@ -2432,7 +2441,8 @@ async function loadAiTicket(
     .prepare(
       `SELECT token, player_id AS playerId, deck_id AS deckId,
               deck_json AS deckJson, opponent_archetype_id AS opponentArchetypeId,
-              seed, starting_player AS startingPlayer, expires_at AS expiresAt,
+              seed, starting_player AS startingPlayer,
+              COALESCE(ranked_format, 'standard') AS rankedFormat, expires_at AS expiresAt,
               consumed_at AS consumedAt,
               consumed_by_idempotency_key AS consumedByIdempotencyKey
        FROM ai_match_tickets
@@ -2465,6 +2475,7 @@ function parseAiMatchTicketRow(row: AiMatchTicketRow): AiMatchTicket {
     token: row.token,
     seed: row.seed,
     startingPlayer: row.startingPlayer,
+    rankedFormat: row.rankedFormat === "wild" ? "wild" : "standard",
     playerDeck,
     opponentArchetypeId: row.opponentArchetypeId,
     expiresAt: row.expiresAt,
@@ -2913,6 +2924,7 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
         opponent_archetype_id TEXT NOT NULL,
         seed INTEGER NOT NULL,
         starting_player INTEGER NOT NULL CHECK (starting_player IN (0, 1)),
+        ranked_format TEXT NOT NULL DEFAULT 'standard' CHECK (ranked_format IN ('standard', 'wild')),
         active_slot INTEGER CHECK (active_slot IS NULL OR active_slot = 1),
         expires_at TEXT NOT NULL,
         consumed_at TEXT,
@@ -3061,6 +3073,11 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
   ).run();
   try {
     await db.prepare("ALTER TABLE match_records ADD COLUMN pvp_token TEXT").run();
+  } catch {
+    // Column already exists on new installations or a previous migration.
+  }
+  try {
+    await db.prepare("ALTER TABLE ai_match_tickets ADD COLUMN ranked_format TEXT NOT NULL DEFAULT 'standard'").run();
   } catch {
     // Column already exists on new installations or a previous migration.
   }
@@ -3870,7 +3887,8 @@ function replayAiMatchProof(
     !Array.isArray(proof.commands) ||
     proof.commands.length === 0 ||
     proof.commands.length > MAX_AI_PROOF_COMMANDS ||
-    (proof.startingPlayer !== 0 && proof.startingPlayer !== 1)
+    (proof.startingPlayer !== 0 && proof.startingPlayer !== 1) ||
+    (proof.rankedFormat !== "standard" && proof.rankedFormat !== "wild")
   ) {
     throw new GameStoreError("AI_PROOF_INVALID", "AI 对局重放凭证格式无效。", 409);
   }
@@ -3881,7 +3899,7 @@ function replayAiMatchProof(
   if (!archetype) {
     throw new GameStoreError("AI_PROOF_INVALID", "AI 对手原型不存在。", 409);
   }
-  const deckValidation = validateDeck(proof.playerDeck);
+  const deckValidation = validateDeckForFormat(proof.playerDeck, proof.rankedFormat);
   if (!deckValidation.valid) {
     throw new GameStoreError("AI_PROOF_INVALID", "AI 对局使用了无效玩家卡组。", 409, deckValidation.errors);
   }
@@ -3889,6 +3907,7 @@ function replayAiMatchProof(
   let state = createMatch({
     seed: proof.seed,
     startingPlayer: proof.startingPlayer,
+    rankedFormat: proof.rankedFormat,
     decks: [proof.playerDeck, [...archetype.deck]],
   });
   const commandIds = new Set<string>();

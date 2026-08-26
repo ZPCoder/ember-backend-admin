@@ -111,6 +111,9 @@ export const aiMatchTickets = sqliteTable(
     opponentArchetypeId: text("opponent_archetype_id").notNull(),
     seed: integer("seed").notNull(),
     startingPlayer: integer("starting_player").notNull(),
+    rankedFormat: text("ranked_format", { enum: ["standard", "wild"] })
+      .notNull()
+      .default("standard"),
     activeSlot: integer("active_slot"),
     expiresAt: text("expires_at").notNull(),
     consumedAt: text("consumed_at"),

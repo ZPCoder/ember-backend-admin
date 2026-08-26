@@ -1047,11 +1047,11 @@ function parseRankedFormat(value: unknown): RankedFormat {
   return value === "wild" ? "wild" : "standard";
 }
 
-function parsePvpState(value: string): MatchState | null {
+function parsePvpState(value: string, rankedFormat: RankedFormat = "standard"): MatchState | null {
   try {
     const parsed = JSON.parse(value) as MatchState;
     return parsed && typeof parsed === "object" && Array.isArray(parsed.players) && typeof parsed.version === "number"
-      ? parsed
+      ? { ...parsed, rankedFormat: parsed.rankedFormat === "wild" ? "wild" : rankedFormat }
       : null;
   } catch {
     return null;
@@ -1082,7 +1082,7 @@ async function dbRoomState(db: PvpDatabase, room: PvpDbRoom): Promise<void> {
 async function clearPvpMatchIfActive(db: PvpDatabase, roomCode: string): Promise<boolean> {
   const match = await getPvpDbMatch(db, roomCode);
   if (!match) return true;
-  const state = match ? parsePvpState(match.state_json) : null;
+  const state = match ? parsePvpState(match.state_json, match.ranked_format) : null;
   // Archive completed proof before freeing the room's current-match slot.
   // Settlement reads the immutable archive, so a leaver/rematch cannot erase
   // the result and a promoted guest cannot restore the old match as player 0.
@@ -1137,7 +1137,7 @@ async function settlePvpDeparture(
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const match = await getPvpDbMatch(db, roomCode);
     if (!match) return true;
-    const current = parsePvpState(match.state_json);
+    const current = parsePvpState(match.state_json, match.ranked_format);
     if (current?.phase === "game-over") {
       const participant = room
         ? await ensurePvpParticipantForExistingMatch(db, room, match)
@@ -1232,7 +1232,7 @@ async function dbRestoreSession(db: PvpDatabase, session: PvpDbSession): Promise
   }
   await dbRoomState(db, room);
   const match = await getPvpDbMatch(db, room.code);
-  const matchState = match ? parsePvpState(match.state_json) : null;
+  const matchState = match ? parsePvpState(match.state_json, match.ranked_format) : null;
   if (match && matchState) {
     const viewer = isHost ? 0 : 1;
     await queuePvpDbMessage(db, session.client_id, {
@@ -1788,7 +1788,7 @@ async function advancePvpTimeoutOnPoll(db: PvpDatabase, session: PvpDbSession): 
   const room = await getPvpDbRoom(db, session.room_code);
   if (!room || pvpRoleIndex(room, session.client_id) === null) return;
   const match = await getPvpDbMatch(db, room.code);
-  const current = match ? parsePvpState(match.state_json) : null;
+  const current = match ? parsePvpState(match.state_json, match.ranked_format) : null;
   const now = Date.now();
   if (
     !match ||
@@ -1851,7 +1851,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     if (!room.guest_client_id) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "等待对手加入房间。" });
     const existing = await getPvpDbMatch(db, room.code);
     if (existing) {
-      const existingState = parsePvpState(existing.state_json);
+      const existingState = parsePvpState(existing.state_json, existing.ranked_format);
       return queuePvpDbMessage(db, session.client_id, {
         type: "action_rejected",
         action,
@@ -1891,7 +1891,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     // Choose first player on the authoritative path; the room creator is not
     // always first, matching the normal Hearthstone opening cadence.
     const startingPlayer = createAuthoritativeStartingPlayer();
-    const state = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed });
+    const state = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed, rankedFormat: room.ranked_format });
     const matchToken = crypto.randomUUID();
     const now = Date.now();
     const stateJson = JSON.stringify(state);
@@ -1993,7 +1993,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     if (role !== 0) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "只有房主可以发起再来一局。" });
     if (!room.guest_client_id) return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "等待对手加入房间。" });
     const existing = await getPvpDbMatch(db, room.code);
-    const existingState = existing ? parsePvpState(existing.state_json) : null;
+    const existingState = existing ? parsePvpState(existing.state_json, existing.ranked_format) : null;
     if (!existingState || existingState.phase !== "game-over") {
       return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "本局尚未结束，暂时不能重新开始。" });
     }
@@ -2016,7 +2016,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
   }
 
   const match = await getPvpDbMatch(db, room.code);
-  const current = match ? parsePvpState(match.state_json) : null;
+  const current = match ? parsePvpState(match.state_json, match.ranked_format) : null;
   const command = canonicalCommand(payload.command, role);
   if (!match || !current || !command) {
     return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, commandId: typeof payload.command === "object" && payload.command ? (payload.command as Record<string, unknown>).commandId : undefined, message: "对局指令无效或对局尚未开始。" });
@@ -2403,7 +2403,7 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     }
     const seed = createAuthoritativePvpSeed();
     const startingPlayer = createAuthoritativeStartingPlayer();
-    room.matchState = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed });
+    room.matchState = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed, rankedFormat: room.rankedFormat });
     room.matchToken = crypto.randomUUID();
     room.matchUpdatedAt = Date.now();
     const sequence = ++room.nextSequence;

@@ -798,13 +798,16 @@ function parseIdempotencyKey(value: unknown): string {
 
 function parseAiMatchProof(value: unknown): AiMatchProof {
   if (!isRecord(value)) throw new PayloadError("aiProof 必须是对象。");
-  assertExactKeys(value, ["ticketToken", "seed", "startingPlayer", "playerDeck", "opponentArchetypeId", "commands"]);
+  assertExactKeys(value, ["ticketToken", "seed", "startingPlayer", "rankedFormat", "playerDeck", "opponentArchetypeId", "commands"]);
   const ticketToken = parseTrimmedString(value.ticketToken, "aiProof.ticketToken", 16, 128);
   if (typeof value.seed !== "number" || !Number.isSafeInteger(value.seed) || value.seed < 0 || value.seed > 0x7fffffff) {
     throw new PayloadError("aiProof.seed 必须是合法整数。");
   }
   if (value.startingPlayer !== 0 && value.startingPlayer !== 1) {
     throw new PayloadError("aiProof.startingPlayer 必须是 0 或 1。");
+  }
+  if (value.rankedFormat !== "standard" && value.rankedFormat !== "wild") {
+    throw new PayloadError("aiProof.rankedFormat 必须是 standard 或 wild。");
   }
   const playerDeck = parseCardIds(value.playerDeck);
   const opponentArchetypeId = parseIdentifier(value.opponentArchetypeId, "aiProof.opponentArchetypeId");
@@ -832,7 +835,7 @@ function parseAiMatchProof(value: unknown): AiMatchProof {
     }
     return raw;
   }) as unknown as AiMatchProof["commands"];
-  return { ticketToken, seed: value.seed, startingPlayer: value.startingPlayer, playerDeck, opponentArchetypeId, commands };
+  return { ticketToken, seed: value.seed, startingPlayer: value.startingPlayer, rankedFormat: value.rankedFormat, playerDeck, opponentArchetypeId, commands };
 }
 
 function parseIdentifier(value: unknown, field: string): string {
