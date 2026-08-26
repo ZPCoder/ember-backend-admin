@@ -104,6 +104,7 @@ type GameAction =
         name: string;
         format: RankedFormat;
         cardIds: string[];
+        cardBackId?: string;
       };
     }
   | {
@@ -752,7 +753,7 @@ function parseAction(value: unknown): GameAction {
       assertExactKeys(
         value.deck,
         ["name", "format", "cardIds"],
-        ["id", "name", "format", "cardIds"],
+        ["id", "name", "format", "cardIds", "cardBackId"],
       );
 
       const name = parseTrimmedString(value.deck.name, "deck.name", 1, 32);
@@ -764,11 +765,14 @@ function parseAction(value: unknown): GameAction {
         value.deck.id === undefined
           ? undefined
           : parseIdentifier(value.deck.id, "deck.id");
+      const cardBackId = value.deck.cardBackId === undefined
+        ? undefined
+        : parseIdentifier(value.deck.cardBackId, "deck.cardBackId");
 
       return {
         action: "save_deck",
         idempotencyKey,
-        deck: { ...(id ? { id } : {}), name, format, cardIds },
+        deck: { ...(id ? { id } : {}), name, format, cardIds, ...(cardBackId ? { cardBackId } : {}) },
       };
     }
     case "delete_deck":

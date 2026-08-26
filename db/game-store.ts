@@ -3,6 +3,7 @@ import {
   AI_ARCHETYPES,
   CARD_CATALOG,
   DEFAULT_STARTER_DECK,
+  DEFAULT_CARD_BACK_ID,
   LADDER_READY_TRIAL_MS,
   MAX_SAVED_DECKS,
   removeSavedDeck,
@@ -32,6 +33,9 @@ import {
   ladderReadyTrialIsActive,
   validateDeck,
   validateDeckForFormat,
+  cardBackIsUnlocked,
+  isCardBackId,
+  normalizeOwnedCardBackId,
 } from "../lib/game";
 import type { BattleCommand, CatchUpPackProgress, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrainingCampaignState, TrainingChapterId, TrialCardAccess } from "../lib/game";
 import {
@@ -104,6 +108,7 @@ export type PlayerDeck = {
   name: string;
   format: RankedFormat;
   cardIds: string[];
+  cardBackId: string;
   updatedAt: string;
 };
 
@@ -953,6 +958,7 @@ export async function saveDeck(
       name: string;
       format: RankedFormat;
       cardIds: string[];
+      cardBackId?: string;
     };
   },
 ): Promise<SaveDeckResult> {
@@ -967,6 +973,7 @@ export async function saveDeck(
     name: input.deck.name,
     format: input.deck.format,
     cardIds: [...input.deck.cardIds],
+    cardBackId: input.deck.cardBackId ?? DEFAULT_CARD_BACK_ID,
     updatedAt: now,
   };
 
@@ -977,6 +984,9 @@ export async function saveDeck(
     input.idempotencyKey,
     { deck: requestedDeck },
     (current) => {
+      if (!cardBackIsUnlocked(requestedDeck.cardBackId, current.rankedRewards)) {
+        throw new GameStoreError("CARD_BACK_LOCKED", "该卡背尚未解锁。", 400);
+      }
       const validation = validateDeckForFormat(requestedDeck.cardIds, requestedDeck.format);
       if (!validation.valid) {
         throw new GameStoreError(
@@ -2078,6 +2088,7 @@ export async function claimLadderReadyDeck(
         name: `${offer.faction} · ${offer.name}`,
         format: "standard",
         cardIds: [...offer.deck],
+        cardBackId: DEFAULT_CARD_BACK_ID,
         updatedAt: new Date().toISOString(),
       };
       if (!current.decks.some((deck) => deck.id === claimedDeck.id) && current.decks.length >= MAX_SAVED_DECKS) {
@@ -3819,6 +3830,7 @@ function createDefaultState(now: string): StoredPlayerState {
         name: "曙光远征队",
         format: "standard",
         cardIds: [...DEFAULT_STARTER_DECK],
+        cardBackId: DEFAULT_CARD_BACK_ID,
         updatedAt: now,
       },
     ],
@@ -3920,6 +3932,7 @@ function parseStoredState(value: string): StoredPlayerState {
 
 function normalizeStoredState(value: unknown): StoredPlayerState | null {
   if (!isRecord(value)) return null;
+  const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
   const decks = Array.isArray(value.decks)
     ? value.decks.map((deck) => {
         if (!isRecord(deck)) return deck;
@@ -3931,7 +3944,12 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
           : deck.format === "standard"
             ? "standard"
             : validateDeckForFormat(cardIds, "standard").valid ? "standard" : "wild";
-        return { ...deck, cardIds, format };
+        return {
+          ...deck,
+          cardIds,
+          format,
+          cardBackId: normalizeOwnedCardBackId(deck.cardBackId, rankedRewards),
+        };
       })
     : value.decks;
   const tasks = Array.isArray(value.tasks)
@@ -4112,7 +4130,6 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
     value.ladder,
     utcSeasonKey(new Date().toISOString()),
   );
-  const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
   return { ...value, decks, tasks, taskCycle, packPity, expansionPacks, expansionPackPity, goldenPacks, goldenPackPity, goldenCollection, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, returnJourney, trainingCampaign, rankedLadders, rankedRewards } as StoredPlayerState;
 }
 
@@ -4151,6 +4168,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isRankedLadders(value.rankedLadders) &&
     isRankedRewardState(value.rankedRewards) &&
     value.decks.every(isDeck) &&
+    value.decks.every((deck) => cardBackIsUnlocked(deck.cardBackId, value.rankedRewards)) &&
     value.tasks.every(isTask) &&
     Object.entries(value.collection).every(
       ([cardId, count]) =>
@@ -4328,6 +4346,7 @@ function isDeck(value: unknown): value is PlayerDeck {
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     (value.format === "standard" || value.format === "wild") &&
+    isCardBackId(value.cardBackId) &&
     typeof value.updatedAt === "string" &&
     Array.isArray(value.cardIds) &&
     value.cardIds.every(isCardId)
