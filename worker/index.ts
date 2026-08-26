@@ -183,6 +183,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       handStartedInDeck: privateCards.map(() => true),
       handEnteredTurns: privateCards.map(() => 0),
       handEntityIds: privateCards.map((_, index) => `hidden-hand-${index}`),
+      coinEntityId: player.coinAvailable ? "hidden-coin" : undefined,
       // The ordered spell identity history can reveal an untriggered Secret.
       // Keep the complete list server-side for recast effects.
       spellsPlayedThisGame: [],
