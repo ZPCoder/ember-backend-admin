@@ -3923,12 +3923,21 @@ function mergeRankedRewardEconomy(
   state: StoredPlayerState,
   economy: RankedRewardEconomy,
 ): StoredPlayerState {
+  const grantedCardIds: string[] = [];
+  for (const [cardId, count] of Object.entries(economy.collection)) {
+    const granted = Math.max(0, count - (state.collection[cardId] ?? 0));
+    for (let index = 0; index < granted; index += 1) grantedCardIds.push(cardId);
+  }
   return {
     ...state,
     rankedLadders: economy.ladders,
     rankedRewards: economy.rankedRewards,
     collection: economy.collection,
     packsAvailable: economy.packsAvailable,
+    catchUpPack: {
+      ...state.catchUpPack,
+      ...recordCatchUpCards(state.catchUpPack, grantedCardIds),
+    },
   };
 }
 
