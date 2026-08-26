@@ -40,6 +40,7 @@ import {
   apprenticeMilestoneComplete,
   craftCost,
   disenchantValue,
+  extraCardDisenchantPlan,
   type ApprenticeMilestoneId,
 } from "../lib/game/economy.ts";
 import {
@@ -299,6 +300,14 @@ export type CardEconomyResult = {
   cardId: string;
   amount: number;
   kind: "craft" | "disenchant";
+  replayed: boolean;
+};
+
+export type BulkDisenchantResult = {
+  player: PlayerState;
+  amount: number;
+  cards: number;
+  copies: number;
   replayed: boolean;
 };
 
@@ -1570,10 +1579,9 @@ export async function disenchantCard(
     { cardId: input.cardId, dust: value },
     (current) => {
       const owned = current.collection[input.cardId] ?? 0;
-      const deckUse = current.decks.reduce(
-        (count, deck) => count + deck.cardIds.filter((cardId) => cardId === input.cardId).length,
-        0,
-      );
+      const deckUse = Math.max(0, ...current.decks.map(
+        (deck) => deck.cardIds.filter((cardId) => cardId === input.cardId).length,
+      ));
       if (owned < 1 || owned <= deckUse) {
         throw new GameStoreError("CARD_IN_USE", "卡牌正在卡组中使用，至少保留卡组所需数量。", 409);
       }
@@ -1591,6 +1599,50 @@ export async function disenchantCard(
     cardId: result.cardId,
     amount: result.amount,
     kind: result.kind,
+    replayed,
+  }));
+}
+
+export async function disenchantExtraCards(
+  identity: GameIdentity,
+  input: { idempotencyKey: string },
+): Promise<BulkDisenchantResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  return commitMutation(
+    db,
+    player,
+    "disenchant_extras",
+    input.idempotencyKey,
+    {},
+    (current) => {
+      const plan = extraCardDisenchantPlan(current.collection, CARD_CATALOG);
+      if (plan.totalCopies === 0) {
+        throw new GameStoreError("NO_EXTRA_CARDS", "收藏中没有超过可用套数的多余卡牌。", 409);
+      }
+      const collection = { ...current.collection };
+      for (const entry of plan.entries) {
+        collection[entry.cardId] = Math.max(0, (collection[entry.cardId] ?? 0) - entry.copies);
+      }
+      return {
+        nextState: {
+          ...current,
+          currencies: { ...current.currencies, dust: current.currencies.dust + plan.totalDust },
+          collection,
+        },
+        result: {
+          amount: plan.totalDust,
+          cards: plan.totalCards,
+          copies: plan.totalCopies,
+        },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    amount: result.amount,
+    cards: result.cards,
+    copies: result.copies,
     replayed,
   }));
 }

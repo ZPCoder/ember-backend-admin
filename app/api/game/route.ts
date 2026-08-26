@@ -16,6 +16,7 @@ import {
   craftCard,
   deleteDeck,
   disenchantCard,
+  disenchantExtraCards,
   GameStoreError,
   getPlayerState,
   linkAnonymousAccount,
@@ -132,6 +133,10 @@ type GameAction =
       action: "craft_card" | "disenchant_card";
       idempotencyKey: string;
       cardId: string;
+    }
+  | {
+      action: "disenchant_extras";
+      idempotencyKey: string;
     }
   | {
       action: "claim_reward";
@@ -371,6 +376,19 @@ export async function POST(request: Request): Promise<Response> {
           cardId: result.cardId,
           amount: result.amount,
           kind: result.kind,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "disenchant_extras": {
+        const result = await disenchantExtraCards(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          amount: result.amount,
+          cards: result.cards,
+          copies: result.copies,
+          kind: "bulk-disenchant",
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -764,6 +782,12 @@ function parseAction(value: unknown): GameAction {
         action: value.action,
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
         cardId: parseIdentifier(value.cardId, "cardId"),
+      };
+    case "disenchant_extras":
+      assertExactKeys(value, ["action", "idempotencyKey"]);
+      return {
+        action: "disenchant_extras",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
       };
     case "claim_reward":
       assertExactKeys(value, ["action", "idempotencyKey", "level"]);
