@@ -27,6 +27,7 @@ import {
   resetDemoPlayer,
   reportPlayer,
   saveDeck,
+  setFavoriteCardBacks,
   sendChatMessage,
   sendFriendRequest,
   unblockPlayer,
@@ -106,6 +107,11 @@ type GameAction =
         cardIds: string[];
         cardBackId?: string;
       };
+    }
+  | {
+      action: "set_favorite_card_backs";
+      idempotencyKey: string;
+      cardBackIds: string[];
     }
   | {
       action: "delete_deck";
@@ -318,6 +324,16 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           savedDeck: result.savedDeck,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "set_favorite_card_backs": {
+        const result = await setFavoriteCardBacks(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          favoriteCardBackIds: result.favoriteCardBackIds,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -773,6 +789,17 @@ function parseAction(value: unknown): GameAction {
         action: "save_deck",
         idempotencyKey,
         deck: { ...(id ? { id } : {}), name, format, cardIds, ...(cardBackId ? { cardBackId } : {}) },
+      };
+    }
+    case "set_favorite_card_backs": {
+      assertExactKeys(value, ["action", "idempotencyKey", "cardBackIds"]);
+      if (!Array.isArray(value.cardBackIds) || value.cardBackIds.length === 0 || value.cardBackIds.length > 128) {
+        throw new PayloadError("cardBackIds 必须是包含 1–128 个卡背的数组。");
+      }
+      return {
+        action: "set_favorite_card_backs",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        cardBackIds: value.cardBackIds.map((cardBackId) => parseIdentifier(cardBackId, "cardBackIds")),
       };
     }
     case "delete_deck":

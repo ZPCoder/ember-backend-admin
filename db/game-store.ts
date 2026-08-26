@@ -36,6 +36,7 @@ import {
   cardBackIsUnlocked,
   isCardBackId,
   normalizeOwnedCardBackId,
+  normalizeFavoriteCardBackIds,
 } from "../lib/game";
 import type { BattleCommand, CatchUpPackProgress, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrainingCampaignState, TrainingChapterId, TrialCardAccess } from "../lib/game";
 import {
@@ -234,6 +235,7 @@ export type PlayerState = {
   goldenPackPity: GoldenPackPity;
   collection: Record<string, number>;
   goldenCollection: Record<string, number>;
+  favoriteCardBackIds: string[];
   decks: PlayerDeck[];
   activeDeckId: string;
   tasks: PlayerTask[];
@@ -263,6 +265,12 @@ export type PlayerState = {
 export type SaveDeckResult = {
   player: PlayerState;
   savedDeck: PlayerDeck;
+  replayed: boolean;
+};
+
+export type SetFavoriteCardBacksResult = {
+  player: PlayerState;
+  favoriteCardBackIds: string[];
   replayed: boolean;
 };
 
@@ -947,6 +955,32 @@ export async function linkAnonymousAccount(
     db.prepare("DELETE FROM players WHERE id = ?").bind(source.id),
   ]);
   return loadPublicPlayer(db, target);
+}
+
+export async function setFavoriteCardBacks(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; cardBackIds: string[] },
+): Promise<SetFavoriteCardBacksResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  return commitMutation(
+    db,
+    player,
+    "set_favorite_card_backs",
+    input.idempotencyKey,
+    { cardBackIds: input.cardBackIds },
+    (current) => {
+      const favoriteCardBackIds = normalizeFavoriteCardBackIds(input.cardBackIds, current.rankedRewards);
+      if (favoriteCardBackIds.length !== input.cardBackIds.length || favoriteCardBackIds.some((id, index) => id !== input.cardBackIds[index])) {
+        throw new GameStoreError("CARD_BACK_FAVORITES_INVALID", "收藏列表包含未解锁、重复或随机卡背。", 400);
+      }
+      return {
+        nextState: { ...current, favoriteCardBackIds },
+        result: { favoriteCardBackIds },
+      };
+    },
+  );
 }
 
 export async function saveDeck(
@@ -3824,6 +3858,7 @@ function createDefaultState(now: string): StoredPlayerState {
     goldenPackPity: emptyGoldenPackPity(),
     collection,
     goldenCollection: {},
+    favoriteCardBackIds: [DEFAULT_CARD_BACK_ID],
     decks: [
       {
         id: "starter-sun",
@@ -3933,6 +3968,7 @@ function parseStoredState(value: string): StoredPlayerState {
 function normalizeStoredState(value: unknown): StoredPlayerState | null {
   if (!isRecord(value)) return null;
   const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
+  const favoriteCardBackIds = normalizeFavoriteCardBackIds(value.favoriteCardBackIds, rankedRewards);
   const decks = Array.isArray(value.decks)
     ? value.decks.map((deck) => {
         if (!isRecord(deck)) return deck;
@@ -4130,7 +4166,7 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
     value.ladder,
     utcSeasonKey(new Date().toISOString()),
   );
-  return { ...value, decks, tasks, taskCycle, packPity, expansionPacks, expansionPackPity, goldenPacks, goldenPackPity, goldenCollection, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, returnJourney, trainingCampaign, rankedLadders, rankedRewards } as StoredPlayerState;
+  return { ...value, decks, tasks, taskCycle, packPity, expansionPacks, expansionPackPity, goldenPacks, goldenPackPity, goldenCollection, favoriteCardBackIds, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, returnJourney, trainingCampaign, rankedLadders, rankedRewards } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -4147,6 +4183,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     !isGoldenPackPity(value.goldenPackPity) ||
     !isRecord(value.collection) ||
     !isRecord(value.goldenCollection) ||
+    !Array.isArray(value.favoriteCardBackIds) ||
     !Array.isArray(value.decks) ||
     !Array.isArray(value.tasks) ||
     !isRecord(value.stats)
@@ -4167,6 +4204,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isTrainingCampaignState(value.trainingCampaign) &&
     isRankedLadders(value.rankedLadders) &&
     isRankedRewardState(value.rankedRewards) &&
+    JSON.stringify(normalizeFavoriteCardBackIds(value.favoriteCardBackIds, value.rankedRewards)) === JSON.stringify(value.favoriteCardBackIds) &&
     value.decks.every(isDeck) &&
     value.decks.every((deck) => cardBackIsUnlocked(deck.cardBackId, value.rankedRewards)) &&
     value.tasks.every(isTask) &&
@@ -4385,6 +4423,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     ])) as GoldenPackPity,
     collection: { ...state.collection },
     goldenCollection: { ...state.goldenCollection },
+    favoriteCardBackIds: [...state.favoriteCardBackIds],
     decks: state.decks.map(cloneDeck),
     activeDeckId: state.activeDeckId,
     tasks: state.tasks.map(cloneTask),
@@ -4441,6 +4480,8 @@ function isPristineState(state: StoredPlayerState): boolean {
     PACK_TYPES.every((packType) => state.goldenPacks[packType] === 0) &&
     PACK_TYPES.every((packType) => state.goldenPackPity[packType].packsOpened === 0 && state.goldenPackPity[packType].packsSinceLegendary === 0) &&
     Object.keys(state.goldenCollection).length === 0 &&
+    state.favoriteCardBackIds.length === 1 &&
+    state.favoriteCardBackIds[0] === DEFAULT_CARD_BACK_ID &&
     collectionKeys.length === starter.size &&
     collectionKeys.every((cardId) => state.collection[cardId] === starter.get(cardId)) &&
     state.decks.length === 1 &&

@@ -23,6 +23,7 @@ import {
   matchQualityForGap,
   normalizeHiddenMmr,
   normalizeOwnedCardBackId,
+  normalizeFavoriteCardBackIds,
   normalizeRankedRewardState,
   resolveCardBackSelection,
   updateHiddenMmrPair,
@@ -1040,7 +1041,7 @@ async function pvpAccountAuthorizesLoadout(
     : null;
 }
 
-async function loadPvpRewardState(db: PvpDatabase, clientId: string): Promise<unknown> {
+async function loadPvpCardBackProfile(db: PvpDatabase, clientId: string): Promise<{ rankedRewards: unknown; favoriteCardBackIds: unknown }> {
   const row = await db.prepare(`
     SELECT ps.state_json
     FROM pvp_session_identities psi
@@ -1049,12 +1050,12 @@ async function loadPvpRewardState(db: PvpDatabase, clientId: string): Promise<un
     WHERE psi.client_id = ? AND psi.identity_key <> ''
     LIMIT 1
   `).bind(clientId).first<{ state_json: string }>();
-  if (!row) return undefined;
+  if (!row) return { rankedRewards: undefined, favoriteCardBackIds: undefined };
   try {
     const state = JSON.parse(row.state_json) as Record<string, unknown>;
-    return state.rankedRewards;
+    return { rankedRewards: state.rankedRewards, favoriteCardBackIds: state.favoriteCardBackIds };
   } catch {
-    return undefined;
+    return { rankedRewards: undefined, favoriteCardBackIds: undefined };
   }
 }
 
@@ -2012,9 +2013,15 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     // Choose first player on the authoritative path; the room creator is not
     // always first, matching the normal Hearthstone opening cadence.
     const startingPlayer = createAuthoritativeStartingPlayer();
+    const [hostCardBackProfile, guestCardBackProfile] = await Promise.all([
+      loadPvpCardBackProfile(db, room.host_client_id),
+      loadPvpCardBackProfile(db, room.guest_client_id),
+    ]);
+    const hostRewards = normalizeRankedRewardState(hostCardBackProfile.rankedRewards);
+    const guestRewards = normalizeRankedRewardState(guestCardBackProfile.rankedRewards);
     const cardBackIds: [string, string] = [
-      resolveCardBackSelection(hostLoadout.cardBackId, normalizeRankedRewardState((await loadPvpRewardState(db, room.host_client_id)) ?? undefined), seed, 0),
-      resolveCardBackSelection(guestLoadout.cardBackId, normalizeRankedRewardState((await loadPvpRewardState(db, room.guest_client_id)) ?? undefined), seed, 1),
+      resolveCardBackSelection(hostLoadout.cardBackId, hostRewards, seed, 0, normalizeFavoriteCardBackIds(hostCardBackProfile.favoriteCardBackIds, hostRewards)),
+      resolveCardBackSelection(guestLoadout.cardBackId, guestRewards, seed, 1, normalizeFavoriteCardBackIds(guestCardBackProfile.favoriteCardBackIds, guestRewards)),
     ];
     const state = {
       ...createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed, rankedFormat: room.ranked_format }),
@@ -2542,8 +2549,8 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     const seed = createAuthoritativePvpSeed();
     const startingPlayer = createAuthoritativeStartingPlayer();
     const cardBackIds: [string, string] = [
-      hostCardBack === "random-owned" ? DEFAULT_CARD_BACK_ID : hostCardBack,
-      guestCardBack === "random-owned" ? DEFAULT_CARD_BACK_ID : guestCardBack,
+      hostCardBack.startsWith("random-") ? DEFAULT_CARD_BACK_ID : hostCardBack,
+      guestCardBack.startsWith("random-") ? DEFAULT_CARD_BACK_ID : guestCardBack,
     ];
     room.matchState = {
       ...createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed, rankedFormat: room.rankedFormat }),
