@@ -18,6 +18,7 @@ import {
   getLadderReadyCatalog,
   ladderReadyCatalogAt,
   ladderReadyCatalogForTrial,
+  ladderReadyReturningPlayerIsEligible,
   generateCatchUpPackReward,
   catchUpProgressFromCollection,
   recordCatchUpCards,
@@ -168,6 +169,7 @@ export type LadderReadyState = {
   claimedDeckId: LadderReadyDeckId | null;
   catalogVersionId: LadderReadyCatalogVersionId | null;
   purchasedDeckIds: LadderReadyDeckId[];
+  cycle: number;
 };
 
 export type CatchUpPackState = CatchUpPackProgress & {
@@ -432,6 +434,7 @@ type PlayerRow = {
   id: string;
   email: string;
   displayName: string;
+  lastActiveAt?: string;
 };
 
 type StateRow = {
@@ -2076,7 +2079,7 @@ export async function activateLadderReady(
     {},
     (current) => {
       if (current.ladderReady.claimedDeckId) {
-        throw new GameStoreError("LADDER_READY_ALREADY_CLAIMED", "本账号已经领取过一套天梯预备套牌。", 409);
+        throw new GameStoreError("LADDER_READY_ALREADY_CLAIMED", "本资格周期已经领取过一套天梯预备套牌。", 409);
       }
       if (current.ladderReady.activatedAt) {
         throw new GameStoreError("LADDER_READY_ALREADY_ACTIVATED", "七日试玩已经激活。", 409);
@@ -2092,6 +2095,7 @@ export async function activateLadderReady(
             claimedDeckId: null,
             catalogVersionId,
             purchasedDeckIds: [],
+            cycle: Math.max(1, current.ladderReady.cycle),
           },
           trialCards: {
             activatedAt: activatedAt.toISOString(),
@@ -2111,6 +2115,7 @@ export async function activateLadderReady(
 function acquireLadderReadyDeck(
   current: StoredPlayerState,
   offer: LadderReadyDeck,
+  catalogVersionId: LadderReadyCatalogVersionId,
 ): {
   deck: PlayerDeck;
   state: Pick<StoredPlayerState, "collection" | "catchUpPack" | "decks" | "activeDeckId">;
@@ -2120,7 +2125,7 @@ function acquireLadderReadyDeck(
     throw new GameStoreError("INVALID_DECK", "天梯预备套牌当前不可用。", 500, validation.errors);
   }
   const deck: PlayerDeck = {
-    id: `ladder-ready-${offer.id}`,
+    id: `ladder-ready-${catalogVersionId}-${offer.id}`,
     name: `${offer.faction} · ${offer.name}`,
     format: "standard",
     cardIds: [...offer.deck],
@@ -2171,12 +2176,12 @@ export async function claimLadderReadyDeck(
         throw new GameStoreError("LADDER_READY_NOT_ACTIVATED", "请先激活七日试玩，再选择永久领取的套牌。", 409);
       }
       if (current.ladderReady.claimedDeckId) {
-        throw new GameStoreError("LADDER_READY_ALREADY_CLAIMED", "本账号已经领取过一套天梯预备套牌。", 409);
+        throw new GameStoreError("LADDER_READY_ALREADY_CLAIMED", "本资格周期已经领取过一套天梯预备套牌。", 409);
       }
       const catalog = ladderReadyCatalogForTrial(current.ladderReady);
       const offer = getLadderReadyDeck(input.deckId, catalog.id);
       if (!offer) throw new GameStoreError("LADDER_READY_DECK_NOT_FOUND", "天梯预备套牌不存在。", 404);
-      const acquired = acquireLadderReadyDeck(current, offer);
+      const acquired = acquireLadderReadyDeck(current, offer, catalog.id);
       return {
         nextState: {
           ...current,
@@ -2220,7 +2225,7 @@ export async function purchaseLadderReadyDeck(
       const catalog = ladderReadyCatalogForTrial(current.ladderReady);
       const offer = getLadderReadyDeck(input.deckId, catalog.id);
       if (!offer) throw new GameStoreError("LADDER_READY_DECK_NOT_FOUND", "天梯预备套牌不存在。", 404);
-      const acquired = acquireLadderReadyDeck(current, offer);
+      const acquired = acquireLadderReadyDeck(current, offer, catalog.id);
       return {
         nextState: {
           ...current,
@@ -3273,7 +3278,7 @@ async function ensurePlayer(
 
   const byIdentity = await db
     .prepare(
-      `SELECT id, email, display_name AS displayName
+      `SELECT id, email, display_name AS displayName, updated_at AS lastActiveAt
        FROM players
        WHERE identity_key = ?
        LIMIT 1`,
@@ -3289,7 +3294,7 @@ async function ensurePlayer(
     ? null
     : await db
         .prepare(
-          `SELECT id, email, display_name AS displayName
+          `SELECT id, email, display_name AS displayName, updated_at AS lastActiveAt
            FROM players
            WHERE email = ?
              AND (identity_key IS NULL OR identity_key = ?)
@@ -3303,6 +3308,10 @@ async function ensurePlayer(
     // Backfill legacy email-based rows on first access. The platform identity
     // may change its auth display name, but a player-chosen public name must
     // survive refreshes; profile changes go through updateProfile instead.
+    // Use the previously persisted player activity before updating it. This
+    // makes every authenticated API request a safe eligibility entry point,
+    // not just the normal initial GET hydration.
+    await refreshLadderReadyReturnEligibility(db, existing, new Date(now));
     await db
       .prepare(
         `UPDATE players
@@ -3335,7 +3344,7 @@ async function ensurePlayer(
 
   const row = await db
     .prepare(
-      `SELECT id, email, display_name AS displayName
+      `SELECT id, email, display_name AS displayName, updated_at AS lastActiveAt
        FROM players
        WHERE identity_key = ?
        LIMIT 1`,
@@ -4011,7 +4020,7 @@ function createDefaultState(now: string): StoredPlayerState {
     progression: { xp: 0, level: 1 },
     rewardTrack: { claimedLevels: [] },
     apprenticeTrack: { claimedMilestones: [] },
-    ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null, purchasedDeckIds: [] },
+    ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null, purchasedDeckIds: [], cycle: 1 },
     catchUpPack: { claimedAt: null, cardsGranted: 0, ...catchUpProgress },
     trialCards: { activatedAt: null, expiresAt: null },
     returnJourney: { claimedStageIds: [], matchesPlayedAtActivation: 0 },
@@ -4193,8 +4202,11 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
           value.ladderReady.purchasedDeckIds,
           typeof value.ladderReady.claimedDeckId === "string" ? value.ladderReady.claimedDeckId as LadderReadyDeckId : null,
         ),
+        cycle: isFiniteNonNegativeInteger(value.ladderReady.cycle) && value.ladderReady.cycle > 0
+          ? value.ladderReady.cycle
+          : 1,
       }
-    : { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null, purchasedDeckIds: [] };
+    : { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null, purchasedDeckIds: [], cycle: 1 };
   const migratedCatchUpProgress = catchUpProgressFromCollection(
     isRecord(value.collection)
       ? Object.fromEntries(Object.entries(value.collection).filter((entry): entry is [string, number] => typeof entry[1] === "number"))
@@ -4383,6 +4395,7 @@ function isLadderReadyState(value: unknown): value is LadderReadyState {
   const claimedDeckId = value.claimedDeckId;
   const catalogVersionId = value.catalogVersionId;
   const purchasedDeckIds = value.purchasedDeckIds;
+  const cycle = value.cycle;
   const noTrial = activatedAt === null && expiresAt === null;
   const validTrial = typeof activatedAt === "string" && Number.isFinite(Date.parse(activatedAt))
     && typeof expiresAt === "string" && Number.isFinite(Date.parse(expiresAt))
@@ -4392,7 +4405,9 @@ function isLadderReadyState(value: unknown): value is LadderReadyState {
     && (activatedAt === null ? catalogVersionId === null : catalogVersionId !== null)
     && (claimedDeckId === null || (typeof claimedDeckId === "string" && Boolean(getLadderReadyDeck(claimedDeckId, typeof catalogVersionId === "string" ? catalogVersionId : null))))
     && Array.isArray(purchasedDeckIds)
-    && normalizePurchasedLadderReadyDeckIds(purchasedDeckIds, typeof claimedDeckId === "string" ? claimedDeckId as LadderReadyDeckId : null).length === purchasedDeckIds.length;
+    && normalizePurchasedLadderReadyDeckIds(purchasedDeckIds, typeof claimedDeckId === "string" ? claimedDeckId as LadderReadyDeckId : null).length === purchasedDeckIds.length
+    && isFiniteNonNegativeInteger(cycle)
+    && cycle > 0;
 }
 
 function isCatchUpPackState(value: unknown): value is CatchUpPackState {
@@ -4832,6 +4847,41 @@ async function refreshPlayerCycle(db: D1DatabaseLike, player: PlayerRow): Promis
          WHERE player_id = ? AND version = ?`,
       )
       .bind(JSON.stringify(next), row.version + 1, new Date().toISOString(), player.id, row.version)
+      .run();
+    if ((result.meta?.changes ?? 0) > 0) return;
+  }
+}
+
+async function refreshLadderReadyReturnEligibility(
+  db: D1DatabaseLike,
+  player: PlayerRow,
+  now = new Date(),
+): Promise<void> {
+  const nowIso = now.toISOString();
+  for (let attempt = 0; attempt < MAX_MUTATION_ATTEMPTS; attempt += 1) {
+    const row = await loadStateRow(db, player.id);
+    const current = parseStoredState(row.stateJson);
+    if (
+      !current.ladderReady.claimedDeckId
+      || !ladderReadyReturningPlayerIsEligible(player.lastActiveAt ?? row.updatedAt, now)
+    ) return;
+    const next: StoredPlayerState = {
+      ...current,
+      ladderReady: {
+        activatedAt: null,
+        expiresAt: null,
+        claimedDeckId: null,
+        catalogVersionId: null,
+        purchasedDeckIds: [],
+        cycle: current.ladderReady.cycle + 1,
+      },
+    };
+    const result = await db
+      .prepare(
+        `UPDATE player_states SET state_json = ?, version = ?, updated_at = ?
+         WHERE player_id = ? AND version = ?`,
+      )
+      .bind(JSON.stringify(next), row.version + 1, nowIso, player.id, row.version)
       .run();
     if ((result.meta?.changes ?? 0) > 0) return;
   }
