@@ -17,6 +17,7 @@ import {
   catchUpProgressFromCollection,
   recordCatchUpCards,
   CATCH_UP_PACK_SETS,
+  cardAvailableInRankedFormat,
   collectionWithTrialCards,
   TRIAL_CARD_ACCESS_MS,
   RETURN_QUEST_STAGE_IDS,
@@ -1523,6 +1524,9 @@ export async function craftCard(
   const player = await ensurePlayer(db, identity);
   const card = CARD_CATALOG.find((candidate) => candidate.id === input.cardId);
   if (!card) throw new GameStoreError("CARD_NOT_FOUND", "卡牌不存在。", 404);
+  if (!cardAvailableInRankedFormat(card, "wild")) {
+    throw new GameStoreError("CARD_NOT_RELEASED", "该卡牌尚未发布，暂时不能制作。", 409);
+  }
   const cost = craftCost(card.rarity);
   return commitMutation(
     db,
