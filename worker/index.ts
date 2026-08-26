@@ -263,8 +263,14 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
         data: safeData,
       };
     }
+    // A card burned by an actual draw is public match-history information.
+    // Failed Discover/generate/copy attempts stay private to the hand owner.
+    if (safeEvent.type === "card-burned" && safeEvent.data?.overdraw === true) {
+      return safeEvent;
+    }
     if (
       safeEvent.type === "card-drawn"
+      || safeEvent.type === "card-added"
       || safeEvent.type === "card-burned"
       || safeEvent.type === "card-copied"
       || safeEvent.type === "card-traded"
@@ -281,6 +287,8 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
           ? "对手完成了一次可交易循环。"
           : safeEvent.type === "card-prepared"
             ? "对手完成了一次预备。"
+          : safeEvent.type === "card-added"
+            ? "对手将一张生成牌加入手牌。"
           : safeEvent.type === "card-copied"
             ? "对手复制了一张牌。"
           : safeEvent.type === "card-drawn"
