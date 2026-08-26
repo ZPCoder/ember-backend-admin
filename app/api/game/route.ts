@@ -21,6 +21,7 @@ import {
   getPlayerState,
   linkAnonymousAccount,
   openPack,
+  openPacks,
   recordMatch,
   rerollTask,
   resetDemoPlayer,
@@ -115,6 +116,11 @@ type GameAction =
   | {
       action: "open_pack";
       idempotencyKey: string;
+    }
+  | {
+      action: "open_packs";
+      idempotencyKey: string;
+      count: number;
     }
   | {
       action: "claim_weekly_pack";
@@ -332,6 +338,18 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           openedCards: result.openedCards,
+          packsOpened: result.packsOpened,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "open_packs": {
+        const result = await openPacks(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          openedCards: result.openedCards,
+          packsOpened: result.packsOpened,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -755,6 +773,16 @@ function parseAction(value: unknown): GameAction {
       return {
         action: "open_pack",
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+      };
+    case "open_packs":
+      assertExactKeys(value, ["action", "idempotencyKey", "count"]);
+      if (!Number.isInteger(value.count)) {
+        throw new PayloadError("count 必须是整数。");
+      }
+      return {
+        action: "open_packs",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        count: value.count as number,
       };
     case "claim_weekly_pack":
       assertExactKeys(value, ["action", "idempotencyKey"]);

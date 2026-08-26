@@ -34,7 +34,12 @@ import {
   validateDeckForFormat,
 } from "../lib/game";
 import type { BattleCommand, CatchUpPackProgress, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrainingCampaignState, TrainingChapterId, TrialCardAccess } from "../lib/game";
-import { drawPack } from "../lib/game/pack.ts";
+import {
+  BULK_PACK_MAX_COUNT,
+  BULK_PACK_MIN_COUNT,
+  PACK_LEGENDARY_PITY_LIMIT,
+  drawPackBatch,
+} from "../lib/game/pack.ts";
 import {
   APPRENTICE_MILESTONES,
   REWARD_TRACK,
@@ -252,6 +257,7 @@ export type ClaimTaskResult = {
 export type OpenPackResult = {
   player: PlayerState;
   openedCards: Array<{ cardId: string; count: number }>;
+  packsOpened: number;
   replayed: boolean;
 };
 
@@ -501,7 +507,7 @@ const MATCH_REWARD_XP = 100;
 const PACK_REWARD_XP = 50;
 const TASK_REWARD_XP = 150;
 const DAILY_REROLL_LIMIT = 1;
-const LEGENDARY_PITY_LIMIT = 40;
+const LEGENDARY_PITY_LIMIT = PACK_LEGENDARY_PITY_LIMIT;
 const MAX_MUTATION_ATTEMPTS = 4;
 const AI_MATCH_TICKET_TTL_MS = 2 * 60 * 60 * 1_000;
 const MAX_PVP_RECONCILIATIONS_PER_REQUEST = 10;
@@ -1013,8 +1019,6 @@ export async function openPack(
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
-  let openedCards: Array<{ cardId: string; count: number }> = [];
-
   return commitMutation(
     db,
     player,
@@ -1039,39 +1043,97 @@ export async function openPack(
           503,
         );
       }
-      const guaranteeLegendary = current.packPity.packsSinceLegendary >= LEGENDARY_PITY_LIMIT - 1;
-      openedCards = drawPack(current.collection, undefined, { guaranteeLegendary });
-      const openedLegendary = openedCards.some((opened) => CARD_CATALOG.find((card) => card.id === opened.cardId)?.rarity === "传说");
+      const batch = drawPackBatch(current.collection, current.packPity, 1);
       const catchUpProgress = recordCatchUpCards(
         current.catchUpPack,
-        openedCards.flatMap((opened) => Array.from({ length: opened.count }, () => opened.cardId)),
+        batch.openedCards.flatMap((opened) => Array.from({ length: opened.count }, () => opened.cardId)),
       );
-
-      const collection = { ...current.collection };
-      for (const opened of openedCards) {
-        collection[opened.cardId] =
-          (collection[opened.cardId] ?? 0) + opened.count;
-      }
 
       return {
         nextState: {
           ...current,
           packsAvailable: current.packsAvailable - 1,
           packPity: {
-            packsOpened: current.packPity.packsOpened + 1,
-            packsSinceLegendary: openedLegendary ? 0 : current.packPity.packsSinceLegendary + 1,
+            packsOpened: batch.packsOpened,
+            packsSinceLegendary: batch.packsSinceLegendary,
           },
           catchUpPack: { ...current.catchUpPack, ...catchUpProgress },
-          collection,
+          collection: batch.collection,
           tasks: advanceTasksMatching(current.tasks, (task) => task.description.includes("卡包"), 1),
           progression: awardXp(current.progression, PACK_REWARD_XP),
         },
-        result: { openedCards },
+        result: { openedCards: batch.openedCards, packsOpened: 1 },
       };
     },
   ).then(({ player: nextPlayer, result, replayed }) => ({
     player: nextPlayer,
     openedCards: result.openedCards,
+    packsOpened: result.packsOpened,
+    replayed,
+  }));
+}
+
+export async function openPacks(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; count: number },
+): Promise<OpenPackResult> {
+  if (!Number.isInteger(input.count) || input.count < BULK_PACK_MIN_COUNT || input.count > BULK_PACK_MAX_COUNT) {
+    throw new GameStoreError(
+      "INVALID_PACK_COUNT",
+      `批量开包数量必须是 ${BULK_PACK_MIN_COUNT}–${BULK_PACK_MAX_COUNT} 的整数。`,
+      400,
+    );
+  }
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+
+  return commitMutation(
+    db,
+    player,
+    "open_packs",
+    input.idempotencyKey,
+    { count: input.count },
+    (current) => {
+      if (current.packsAvailable < input.count) {
+        throw new GameStoreError(
+          "INSUFFICIENT_PACKS",
+          `当前只有 ${current.packsAvailable} 个可开启标准包。`,
+          409,
+        );
+      }
+      if (CARD_CATALOG.length === 0) {
+        throw new GameStoreError("CARD_CATALOG_EMPTY", "卡牌目录尚未就绪。", 503);
+      }
+
+      const batch = drawPackBatch(current.collection, current.packPity, input.count);
+      const grantedCardIds = batch.openedCards.flatMap((opened) =>
+        Array.from({ length: opened.count }, () => opened.cardId));
+      const catchUpProgress = recordCatchUpCards(current.catchUpPack, grantedCardIds);
+      return {
+        nextState: {
+          ...current,
+          packsAvailable: current.packsAvailable - input.count,
+          packPity: {
+            packsOpened: batch.packsOpened,
+            packsSinceLegendary: batch.packsSinceLegendary,
+          },
+          catchUpPack: { ...current.catchUpPack, ...catchUpProgress },
+          collection: batch.collection,
+          tasks: advanceTasksMatching(
+            current.tasks,
+            (task) => task.description.includes("卡包"),
+            input.count,
+          ),
+          progression: awardXp(current.progression, PACK_REWARD_XP * input.count),
+        },
+        result: { openedCards: batch.openedCards, packsOpened: input.count },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    openedCards: result.openedCards,
+    packsOpened: result.packsOpened,
     replayed,
   }));
 }
