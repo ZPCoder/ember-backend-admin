@@ -29,10 +29,18 @@ import {
   LADDER_MAX_STAR_BONUS,
   createRankedSnapshot,
   normalizeRankedSnapshot,
-  resetRankedSnapshotForSeason,
-  updateRankedSnapshot,
 } from "../lib/game/ranked.ts";
 import type { RankedSnapshot } from "../lib/game/ranked.ts";
+import {
+  applyRankedMatchResult,
+  createRankedRewardState,
+  normalizeRankedRewardState,
+  rollRankedSeason,
+} from "../lib/game/ranked-rewards.ts";
+import type {
+  RankedRewardEconomy,
+  RankedRewardState,
+} from "../lib/game/ranked-rewards.ts";
 
 export type MatchResult = "win" | "loss" | "draw";
 export type MatchMode = "ai" | "pvp";
@@ -170,6 +178,7 @@ export type PlayerState = {
   apprenticeTrack: ApprenticeTrackState;
   ladderReady: LadderReadyState;
   ladder: PlayerLadder;
+  rankedRewards: RankedRewardState;
   friends?: FriendSummary[];
   chatMessages?: SocialMessage[];
   blockedPlayerIds?: string[];
@@ -1653,8 +1662,8 @@ async function settleDerivedPvpMatch(
         result: settlement.result,
         format: settlement.format,
       },
-      (current) => ({
-        nextState: {
+      (current) => {
+        let nextState: StoredPlayerState = {
           ...current,
           currencies: {
             ...current.currencies,
@@ -1673,13 +1682,26 @@ async function settleDerivedPvpMatch(
           ),
           progression: awardXp(current.progression, MATCH_REWARD_XP),
           taskCycle: current.taskCycle,
-          ladder: settlement.format === "ranked" && current.ladder.seasonKey === utcSeasonKey(settlement.createdAt)
-            ? updateLadder(current.ladder, settlement.result)
-            : current.ladder,
-        },
-        result: { match },
-        match,
-      }),
+        };
+        if (
+          settlement.format === "ranked"
+          && current.ladder.seasonKey === utcSeasonKey(settlement.createdAt)
+        ) {
+          nextState = mergeRankedRewardEconomy(
+            nextState,
+            applyRankedMatchResult(
+              rankedRewardEconomy(nextState),
+              CARD_CATALOG,
+              settlement.result,
+            ),
+          );
+        }
+        return {
+          nextState,
+          result: { match },
+          match,
+        };
+      },
     ).then(({ player: nextPlayer, result, replayed }) => ({
       player: nextPlayer,
       match: result.match,
@@ -3113,6 +3135,7 @@ function createDefaultState(now: string): StoredPlayerState {
     apprenticeTrack: { claimedMilestones: [] },
     ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null },
     ladder: createRankedSnapshot(utcSeasonKey(now)),
+    rankedRewards: createRankedRewardState(),
     stats: {
       wins: 0,
       losses: 0,
@@ -3221,7 +3244,8 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
     value.ladder,
     utcSeasonKey(new Date().toISOString()),
   );
-  return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, ladder } as StoredPlayerState;
+  const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
+  return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, ladder, rankedRewards } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -3248,6 +3272,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isApprenticeTrack(value.apprenticeTrack) &&
     isLadderReadyState(value.ladderReady) &&
     isLadder(value.ladder) &&
+    isRankedRewardState(value.rankedRewards) &&
     value.decks.every(isDeck) &&
     value.tasks.every(isTask) &&
     Object.entries(value.collection).every(
@@ -3339,6 +3364,18 @@ function isLadder(value: unknown): value is PlayerLadder {
     && normalized.stars === value.stars;
 }
 
+function isRankedRewardState(value: unknown): value is RankedRewardState {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.claimedFirstTimeFloors) ||
+    !Array.isArray(value.earnedCardBackSeasons) ||
+    !Array.isArray(value.seasonChests)
+  ) {
+    return false;
+  }
+  return JSON.stringify(normalizeRankedRewardState(value)) === JSON.stringify(value);
+}
+
 function isDeck(value: unknown): value is PlayerDeck {
   return (
     isRecord(value) &&
@@ -3380,6 +3417,11 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     apprenticeTrack: { claimedMilestones: [...state.apprenticeTrack.claimedMilestones] },
     ladderReady: { ...state.ladderReady },
     ladder: { ...state.ladder },
+    rankedRewards: {
+      claimedFirstTimeFloors: [...state.rankedRewards.claimedFirstTimeFloors],
+      earnedCardBackSeasons: [...state.rankedRewards.earnedCardBackSeasons],
+      seasonChests: state.rankedRewards.seasonChests.map((chest) => ({ ...chest })),
+    },
     stats: { ...state.stats },
   };
 }
@@ -3415,6 +3457,9 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.ladderReady.activatedAt === null &&
     state.ladderReady.claimedDeckId === null &&
     state.ladder.rankProgress === 0 &&
+    state.rankedRewards.claimedFirstTimeFloors.length === 0 &&
+    state.rankedRewards.earnedCardBackSeasons.length === 0 &&
+    state.rankedRewards.seasonChests.length === 0 &&
     state.tasks.every((task) => task.progress === 0 && !task.claimed)
   );
 }
@@ -3424,8 +3469,26 @@ function awardXp(progression: PlayerProgression, amount: number): PlayerProgress
   return { xp, level: Math.floor(xp / 1000) + 1 };
 }
 
-function updateLadder(ladder: PlayerLadder, result: MatchResult): PlayerLadder {
-  return updateRankedSnapshot(ladder, result);
+function rankedRewardEconomy(state: StoredPlayerState): RankedRewardEconomy {
+  return {
+    ladder: state.ladder,
+    rankedRewards: state.rankedRewards,
+    collection: state.collection,
+    packsAvailable: state.packsAvailable,
+  };
+}
+
+function mergeRankedRewardEconomy(
+  state: StoredPlayerState,
+  economy: RankedRewardEconomy,
+): StoredPlayerState {
+  return {
+    ...state,
+    ladder: economy.ladder,
+    rankedRewards: economy.rankedRewards,
+    collection: economy.collection,
+    packsAvailable: economy.packsAvailable,
+  };
 }
 
 function advanceMatchTasks(
@@ -3486,13 +3549,17 @@ function refreshTaskCycle(state: StoredPlayerState, now: string): StoredPlayerSt
   const dayKey = utcDayKey(now);
   const weekKey = utcWeekKey(now);
   const seasonKey = utcSeasonKey(now);
-  const firstLoad = !state.taskCycle.dayKey || !state.taskCycle.weekKey;
-  const dayChanged = !firstLoad && state.taskCycle.dayKey !== dayKey;
-  const weekChanged = !firstLoad && state.taskCycle.weekKey !== weekKey;
+  const base = mergeRankedRewardEconomy(
+    state,
+    rollRankedSeason(rankedRewardEconomy(state), CARD_CATALOG, seasonKey, now),
+  );
+  const firstLoad = !base.taskCycle.dayKey || !base.taskCycle.weekKey;
+  const dayChanged = !firstLoad && base.taskCycle.dayKey !== dayKey;
+  const weekChanged = !firstLoad && base.taskCycle.weekKey !== weekKey;
   const seasonChanged = state.ladder.seasonKey !== seasonKey;
-  if (!dayChanged && !weekChanged && !seasonChanged && !firstLoad) return state;
+  if (!dayChanged && !weekChanged && !seasonChanged && !firstLoad) return base;
 
-  let tasks = state.tasks.map(cloneTask);
+  let tasks = base.tasks.map(cloneTask);
   if (dayChanged || firstLoad) {
     const daily = createDailyTasks();
     tasks = [...tasks.filter((task) => task.period !== "daily"), ...daily];
@@ -3502,21 +3569,16 @@ function refreshTaskCycle(state: StoredPlayerState, now: string): StoredPlayerSt
     tasks = [...tasks.filter((task) => task.period !== "weekly"), ...weekly];
   }
   return {
-    ...state,
+    ...base,
     tasks,
     taskCycle: {
       dayKey,
       weekKey,
-      dailyRerollsRemaining: dayChanged || firstLoad ? DAILY_REROLL_LIMIT : state.taskCycle.dailyRerollsRemaining,
-      packsBoughtToday: dayChanged || firstLoad ? 0 : state.taskCycle.packsBoughtToday,
-      aiRewardsToday: dayChanged || firstLoad ? 0 : state.taskCycle.aiRewardsToday,
-      weeklyFreePackClaimed: weekChanged || firstLoad ? false : state.taskCycle.weeklyFreePackClaimed,
+      dailyRerollsRemaining: dayChanged || firstLoad ? DAILY_REROLL_LIMIT : base.taskCycle.dailyRerollsRemaining,
+      packsBoughtToday: dayChanged || firstLoad ? 0 : base.taskCycle.packsBoughtToday,
+      aiRewardsToday: dayChanged || firstLoad ? 0 : base.taskCycle.aiRewardsToday,
+      weeklyFreePackClaimed: weekChanged || firstLoad ? false : base.taskCycle.weeklyFreePackClaimed,
     },
-    // Missing legacy task-cycle fields may refresh quests, but must never
-    // masquerade as a new ladder season and wipe visible rank progress.
-    ladder: seasonChanged
-      ? resetRankedSnapshotForSeason(state.ladder, seasonKey)
-      : state.ladder,
   };
 }
 
