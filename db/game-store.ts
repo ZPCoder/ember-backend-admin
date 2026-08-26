@@ -38,13 +38,16 @@ import {
   BULK_PACK_MAX_COUNT,
   BULK_PACK_MIN_COUNT,
   EXPANSION_PACK_SET_IDS,
+  GOLDEN_BULK_PACK_MAX_COUNT,
+  PACK_TYPES,
   PACK_LEGENDARY_PITY_LIMIT,
   drawPackBatch,
   isPackType,
+  packLabel,
   packTypeAvailable,
   packTypeLabel,
 } from "../lib/game/pack.ts";
-import type { ExpansionPackSetId, PackType } from "../lib/game/pack.ts";
+import type { CardQuality, ExpansionPackSetId, PackType } from "../lib/game/pack.ts";
 import {
   APPRENTICE_MILESTONES,
   REWARD_TRACK,
@@ -52,6 +55,8 @@ import {
   craftCost,
   disenchantValue,
   extraCardDisenchantPlan,
+  goldenCraftCost,
+  goldenDisenchantValue,
   type ApprenticeMilestoneId,
 } from "../lib/game/economy.ts";
 import {
@@ -130,6 +135,8 @@ export type PackPityState = {
 
 export type ExpansionPackInventory = Record<ExpansionPackSetId, number>;
 export type ExpansionPackPity = Record<ExpansionPackSetId, PackPityState>;
+export type GoldenPackInventory = Record<PackType, number>;
+export type GoldenPackPity = Record<PackType, PackPityState>;
 
 export type PlayerProgression = {
   xp: number;
@@ -218,7 +225,10 @@ export type PlayerState = {
   packPity: PackPityState;
   expansionPacks: ExpansionPackInventory;
   expansionPackPity: ExpansionPackPity;
+  goldenPacks: GoldenPackInventory;
+  goldenPackPity: GoldenPackPity;
   collection: Record<string, number>;
+  goldenCollection: Record<string, number>;
   decks: PlayerDeck[];
   activeDeckId: string;
   tasks: PlayerTask[];
@@ -269,6 +279,7 @@ export type OpenPackResult = {
   openedCards: Array<{ cardId: string; count: number }>;
   packsOpened: number;
   packType: PackType;
+  quality: CardQuality;
   replayed: boolean;
 };
 
@@ -305,6 +316,7 @@ export type BuyPackResult = {
   player: PlayerState;
   costGold: number;
   packType: PackType;
+  quality: CardQuality;
   replayed: boolean;
 };
 
@@ -319,6 +331,7 @@ export type CardEconomyResult = {
   cardId: string;
   amount: number;
   kind: "craft" | "disenchant";
+  quality: CardQuality;
   replayed: boolean;
 };
 
@@ -513,6 +526,7 @@ const STARTING_PACKS = 3;
 const WIN_REWARD_GOLD = 60;
 const LOSS_REWARD_GOLD = 20;
 const PACK_PRICE_GOLD = 100;
+const GOLDEN_PACK_PRICE_GOLD = 400;
 const DAILY_PACK_PURCHASE_LIMIT = 10;
 const DAILY_AI_REWARD_LIMIT = 20;
 const MATCH_REWARD_XP = 100;
@@ -532,26 +546,54 @@ function emptyExpansionPackPity(): ExpansionPackPity {
   ])) as ExpansionPackPity;
 }
 
-function selectedPackCount(state: StoredPlayerState, packType: PackType): number {
+function emptyGoldenPacks(): GoldenPackInventory {
+  return Object.fromEntries(PACK_TYPES.map((packType) => [packType, 0])) as GoldenPackInventory;
+}
+
+function emptyGoldenPackPity(): GoldenPackPity {
+  return Object.fromEntries(PACK_TYPES.map((packType) => [
+    packType,
+    { packsOpened: 0, packsSinceLegendary: 0 },
+  ])) as GoldenPackPity;
+}
+
+function selectedPackCount(state: StoredPlayerState, packType: PackType, quality: CardQuality): number {
+  if (quality === "golden") return state.goldenPacks[packType];
   return packType === "standard" ? state.packsAvailable : state.expansionPacks[packType];
 }
 
-function selectedPackPity(state: StoredPlayerState, packType: PackType): PackPityState {
+function selectedPackPity(state: StoredPlayerState, packType: PackType, quality: CardQuality): PackPityState {
+  if (quality === "golden") return state.goldenPackPity[packType];
   return packType === "standard" ? state.packPity : state.expansionPackPity[packType];
 }
 
 function withSelectedPackState(
   state: StoredPlayerState,
   packType: PackType,
+  quality: CardQuality,
   count: number,
   pity?: PackPityState,
-): Pick<StoredPlayerState, "packsAvailable" | "packPity" | "expansionPacks" | "expansionPackPity"> {
+): Pick<StoredPlayerState, "packsAvailable" | "packPity" | "expansionPacks" | "expansionPackPity" | "goldenPacks" | "goldenPackPity"> {
+  if (quality === "golden") {
+    return {
+      packsAvailable: state.packsAvailable,
+      packPity: state.packPity,
+      expansionPacks: state.expansionPacks,
+      expansionPackPity: state.expansionPackPity,
+      goldenPacks: { ...state.goldenPacks, [packType]: count },
+      goldenPackPity: pity
+        ? { ...state.goldenPackPity, [packType]: pity }
+        : state.goldenPackPity,
+    };
+  }
   if (packType === "standard") {
     return {
       packsAvailable: count,
       packPity: pity ?? state.packPity,
       expansionPacks: state.expansionPacks,
       expansionPackPity: state.expansionPackPity,
+      goldenPacks: state.goldenPacks,
+      goldenPackPity: state.goldenPackPity,
     };
   }
   return {
@@ -561,7 +603,15 @@ function withSelectedPackState(
     expansionPackPity: pity
       ? { ...state.expansionPackPity, [packType]: pity }
       : state.expansionPackPity,
+    goldenPacks: state.goldenPacks,
+    goldenPackPity: state.goldenPackPity,
   };
+}
+
+function requireCardQuality(value: unknown): CardQuality {
+  if (value === undefined || value === "normal") return "normal";
+  if (value === "golden") return "golden";
+  throw new GameStoreError("INVALID_CARD_QUALITY", "卡牌品质无效。", 400);
 }
 
 function requireAvailablePackType(value: unknown): PackType {
@@ -1080,9 +1130,10 @@ export async function claimTask(
 
 export async function openPack(
   identity: GameIdentity,
-  input: { idempotencyKey: string; packType?: PackType },
+  input: { idempotencyKey: string; packType?: PackType; quality?: CardQuality },
 ): Promise<OpenPackResult> {
   const packType = requireAvailablePackType(input.packType);
+  const quality = requireCardQuality(input.quality);
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
@@ -1091,13 +1142,13 @@ export async function openPack(
     player,
     "open_pack",
     input.idempotencyKey,
-    { packType },
+    { packType, quality },
     (current) => {
-      const available = selectedPackCount(current, packType);
+      const available = selectedPackCount(current, packType, quality);
       if (available < 1) {
         throw new GameStoreError(
           "NO_PACKS_AVAILABLE",
-          `没有可开启的${packTypeLabel(packType)}。`,
+          `没有可开启的${packLabel(packType, quality)}。`,
           409,
         );
       }
@@ -1111,7 +1162,7 @@ export async function openPack(
           503,
         );
       }
-      const batch = drawPackBatch(current.collection, selectedPackPity(current, packType), 1, {
+      const batch = drawPackBatch(current.collection, selectedPackPity(current, packType, quality), 1, {
         duplicateProtectionCollection: current.catchUpPack.receivedCopiesByCard,
         packType,
       });
@@ -1119,20 +1170,27 @@ export async function openPack(
         current.catchUpPack,
         batch.openedCards.flatMap((opened) => Array.from({ length: opened.count }, () => opened.cardId)),
       );
+      const goldenCollection = { ...current.goldenCollection };
+      if (quality === "golden") {
+        for (const opened of batch.openedCards) {
+          goldenCollection[opened.cardId] = (goldenCollection[opened.cardId] ?? 0) + opened.count;
+        }
+      }
 
       return {
         nextState: {
           ...current,
-          ...withSelectedPackState(current, packType, available - 1, {
+          ...withSelectedPackState(current, packType, quality, available - 1, {
             packsOpened: batch.packsOpened,
             packsSinceLegendary: batch.packsSinceLegendary,
           }),
           catchUpPack: { ...current.catchUpPack, ...catchUpProgress },
           collection: batch.collection,
+          goldenCollection,
           tasks: advanceTasksMatching(current.tasks, (task) => task.description.includes("卡包"), 1),
           progression: awardXp(current.progression, PACK_REWARD_XP),
         },
-        result: { openedCards: batch.openedCards, packsOpened: 1, packType },
+        result: { openedCards: batch.openedCards, packsOpened: 1, packType, quality },
       };
     },
   ).then(({ player: nextPlayer, result, replayed }) => ({
@@ -1140,18 +1198,21 @@ export async function openPack(
     openedCards: result.openedCards,
     packsOpened: result.packsOpened,
     packType: result.packType,
+    quality: result.quality,
     replayed,
   }));
 }
 
 export async function openPacks(
   identity: GameIdentity,
-  input: { idempotencyKey: string; count: number; packType?: PackType },
+  input: { idempotencyKey: string; count: number; packType?: PackType; quality?: CardQuality },
 ): Promise<OpenPackResult> {
-  if (!Number.isInteger(input.count) || input.count < BULK_PACK_MIN_COUNT || input.count > BULK_PACK_MAX_COUNT) {
+  const quality = requireCardQuality(input.quality);
+  const maxCount = quality === "golden" ? GOLDEN_BULK_PACK_MAX_COUNT : BULK_PACK_MAX_COUNT;
+  if (!Number.isInteger(input.count) || input.count < BULK_PACK_MIN_COUNT || input.count > maxCount) {
     throw new GameStoreError(
       "INVALID_PACK_COUNT",
-      `批量开包数量必须是 ${BULK_PACK_MIN_COUNT}–${BULK_PACK_MAX_COUNT} 的整数。`,
+      `批量开包数量必须是 ${BULK_PACK_MIN_COUNT}–${maxCount} 的整数。`,
       400,
     );
   }
@@ -1165,13 +1226,13 @@ export async function openPacks(
     player,
     "open_packs",
     input.idempotencyKey,
-    { count: input.count, packType },
+    { count: input.count, packType, quality },
     (current) => {
-      const available = selectedPackCount(current, packType);
+      const available = selectedPackCount(current, packType, quality);
       if (available < input.count) {
         throw new GameStoreError(
           "INSUFFICIENT_PACKS",
-          `当前只有 ${available} 个可开启${packTypeLabel(packType)}。`,
+          `当前只有 ${available} 个可开启${packLabel(packType, quality)}。`,
           409,
         );
       }
@@ -1179,22 +1240,29 @@ export async function openPacks(
         throw new GameStoreError("CARD_CATALOG_EMPTY", "卡牌目录尚未就绪。", 503);
       }
 
-      const batch = drawPackBatch(current.collection, selectedPackPity(current, packType), input.count, {
+      const batch = drawPackBatch(current.collection, selectedPackPity(current, packType, quality), input.count, {
         duplicateProtectionCollection: current.catchUpPack.receivedCopiesByCard,
         packType,
       });
       const grantedCardIds = batch.openedCards.flatMap((opened) =>
         Array.from({ length: opened.count }, () => opened.cardId));
       const catchUpProgress = recordCatchUpCards(current.catchUpPack, grantedCardIds);
+      const goldenCollection = { ...current.goldenCollection };
+      if (quality === "golden") {
+        for (const opened of batch.openedCards) {
+          goldenCollection[opened.cardId] = (goldenCollection[opened.cardId] ?? 0) + opened.count;
+        }
+      }
       return {
         nextState: {
           ...current,
-          ...withSelectedPackState(current, packType, available - input.count, {
+          ...withSelectedPackState(current, packType, quality, available - input.count, {
             packsOpened: batch.packsOpened,
             packsSinceLegendary: batch.packsSinceLegendary,
           }),
           catchUpPack: { ...current.catchUpPack, ...catchUpProgress },
           collection: batch.collection,
+          goldenCollection,
           tasks: advanceTasksMatching(
             current.tasks,
             (task) => task.description.includes("卡包"),
@@ -1202,7 +1270,7 @@ export async function openPacks(
           ),
           progression: awardXp(current.progression, PACK_REWARD_XP * input.count),
         },
-        result: { openedCards: batch.openedCards, packsOpened: input.count, packType },
+        result: { openedCards: batch.openedCards, packsOpened: input.count, packType, quality },
       };
     },
   ).then(({ player: nextPlayer, result, replayed }) => ({
@@ -1210,6 +1278,7 @@ export async function openPacks(
     openedCards: result.openedCards,
     packsOpened: result.packsOpened,
     packType: result.packType,
+    quality: result.quality,
     replayed,
   }));
 }
@@ -1565,9 +1634,11 @@ export async function reportPlayer(
 
 export async function buyPack(
   identity: GameIdentity,
-  input: { idempotencyKey: string; packType?: PackType },
+  input: { idempotencyKey: string; packType?: PackType; quality?: CardQuality },
 ): Promise<BuyPackResult> {
   const packType = requireAvailablePackType(input.packType);
+  const quality = requireCardQuality(input.quality);
+  const costGold = quality === "golden" ? GOLDEN_PACK_PRICE_GOLD : PACK_PRICE_GOLD;
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
@@ -1577,9 +1648,9 @@ export async function buyPack(
     player,
     "buy_pack",
     input.idempotencyKey,
-    { costGold: PACK_PRICE_GOLD, packType },
+    { costGold, packType, quality },
     (current) => {
-      if (current.currencies.gold < PACK_PRICE_GOLD) {
+      if (current.currencies.gold < costGold) {
         throw new GameStoreError("INSUFFICIENT_GOLD", "金币不足，无法购买卡包。", 409);
       }
       if (current.taskCycle.packsBoughtToday >= DAILY_PACK_PURCHASE_LIMIT) {
@@ -1590,21 +1661,22 @@ export async function buyPack(
           ...current,
           currencies: {
             ...current.currencies,
-            gold: current.currencies.gold - PACK_PRICE_GOLD,
+            gold: current.currencies.gold - costGold,
           },
-          ...withSelectedPackState(current, packType, selectedPackCount(current, packType) + 1),
+          ...withSelectedPackState(current, packType, quality, selectedPackCount(current, packType, quality) + 1),
           taskCycle: {
             ...current.taskCycle,
             packsBoughtToday: current.taskCycle.packsBoughtToday + 1,
           },
         },
-        result: { costGold: PACK_PRICE_GOLD, packType },
+        result: { costGold, packType, quality },
       };
     },
   ).then(({ player: nextPlayer, result, replayed }) => ({
     player: nextPlayer,
     costGold: result.costGold,
     packType: result.packType,
+    quality: result.quality,
     replayed,
   }));
 }
@@ -1657,7 +1729,7 @@ export async function rerollTask(
 
 export async function craftCard(
   identity: GameIdentity,
-  input: { idempotencyKey: string; cardId: string },
+  input: { idempotencyKey: string; cardId: string; quality?: CardQuality },
 ): Promise<CardEconomyResult> {
   const db = getD1();
   await ensureSchema(db);
@@ -1667,16 +1739,25 @@ export async function craftCard(
   if (!cardAvailableInRankedFormat(card, "wild")) {
     throw new GameStoreError("CARD_NOT_RELEASED", "该卡牌尚未发布，暂时不能制作。", 409);
   }
-  const cost = craftCost(card.rarity);
+  const quality = requireCardQuality(input.quality);
+  const cost = quality === "golden" ? goldenCraftCost(card.rarity) : craftCost(card.rarity);
   return commitMutation(
     db,
     player,
     "craft_card",
     input.idempotencyKey,
-    { cardId: input.cardId, costDust: cost },
+    { cardId: input.cardId, costDust: cost, quality },
     (current) => {
       if (current.currencies.dust < cost) {
         throw new GameStoreError("INSUFFICIENT_DUST", "星尘不足，无法制作这张卡。", 409);
+      }
+      const goldenOwned = current.goldenCollection[input.cardId] ?? 0;
+      const qualityOwned = quality === "golden"
+        ? goldenOwned
+        : Math.max(0, (current.collection[input.cardId] ?? 0) - goldenOwned);
+      const copyLimit = card.rarity === "传说" ? 1 : 2;
+      if (qualityOwned >= copyLimit) {
+        throw new GameStoreError("CARD_COPY_LIMIT", `该品质最多制作 ${copyLimit} 张。`, 409);
       }
       // Crafting counts as having received the card even if it is later
       // disenchanted, matching Catch-Up Pack collection accounting.
@@ -1688,12 +1769,15 @@ export async function craftCard(
             ...current.collection,
             [input.cardId]: (current.collection[input.cardId] ?? 0) + 1,
           },
+          goldenCollection: quality === "golden"
+            ? { ...current.goldenCollection, [input.cardId]: goldenOwned + 1 }
+            : current.goldenCollection,
           catchUpPack: {
             ...current.catchUpPack,
             ...recordCatchUpCards(current.catchUpPack, [input.cardId]),
           },
         },
-        result: { cardId: input.cardId, amount: cost, kind: "craft" as const },
+        result: { cardId: input.cardId, amount: cost, kind: "craft" as const, quality },
       };
     },
   ).then(({ player: nextPlayer, result, replayed }) => ({
@@ -1701,32 +1785,36 @@ export async function craftCard(
     cardId: result.cardId,
     amount: result.amount,
     kind: result.kind,
+    quality: result.quality,
     replayed,
   }));
 }
 
 export async function disenchantCard(
   identity: GameIdentity,
-  input: { idempotencyKey: string; cardId: string },
+  input: { idempotencyKey: string; cardId: string; quality?: CardQuality },
 ): Promise<CardEconomyResult> {
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
   const card = CARD_CATALOG.find((candidate) => candidate.id === input.cardId);
   if (!card) throw new GameStoreError("CARD_NOT_FOUND", "卡牌不存在。", 404);
-  const value = disenchantValue(card.rarity);
+  const quality = requireCardQuality(input.quality);
+  const value = quality === "golden" ? goldenDisenchantValue(card.rarity) : disenchantValue(card.rarity);
   return commitMutation(
     db,
     player,
     "disenchant_card",
     input.idempotencyKey,
-    { cardId: input.cardId, dust: value },
+    { cardId: input.cardId, dust: value, quality },
     (current) => {
       const owned = current.collection[input.cardId] ?? 0;
+      const goldenOwned = current.goldenCollection[input.cardId] ?? 0;
+      const qualityOwned = quality === "golden" ? goldenOwned : Math.max(0, owned - goldenOwned);
       const deckUse = Math.max(0, ...current.decks.map(
         (deck) => deck.cardIds.filter((cardId) => cardId === input.cardId).length,
       ));
-      if (owned < 1 || owned <= deckUse) {
+      if (qualityOwned < 1 || owned <= deckUse) {
         throw new GameStoreError("CARD_IN_USE", "卡牌正在卡组中使用，至少保留卡组所需数量。", 409);
       }
       return {
@@ -1734,8 +1822,11 @@ export async function disenchantCard(
           ...current,
           currencies: { ...current.currencies, dust: current.currencies.dust + value },
           collection: { ...current.collection, [input.cardId]: owned - 1 },
+          goldenCollection: quality === "golden"
+            ? { ...current.goldenCollection, [input.cardId]: goldenOwned - 1 }
+            : current.goldenCollection,
         },
-        result: { cardId: input.cardId, amount: value, kind: "disenchant" as const },
+        result: { cardId: input.cardId, amount: value, kind: "disenchant" as const, quality },
       };
     },
   ).then(({ player: nextPlayer, result, replayed }) => ({
@@ -1743,6 +1834,7 @@ export async function disenchantCard(
     cardId: result.cardId,
     amount: result.amount,
     kind: result.kind,
+    quality: result.quality,
     replayed,
   }));
 }
@@ -1761,24 +1853,41 @@ export async function disenchantExtraCards(
     input.idempotencyKey,
     {},
     (current) => {
-      const plan = extraCardDisenchantPlan(current.collection, CARD_CATALOG);
-      if (plan.totalCopies === 0) {
+      const normalCollection = Object.fromEntries(Object.entries(current.collection).map(([cardId, count]) => [
+        cardId,
+        Math.max(0, count - (current.goldenCollection[cardId] ?? 0)),
+      ]));
+      const normalPlan = extraCardDisenchantPlan(normalCollection, CARD_CATALOG);
+      const goldenPlan = extraCardDisenchantPlan(current.goldenCollection, CARD_CATALOG);
+      const goldenDust = goldenPlan.entries.reduce((sum, entry) => {
+        const rarity = CARD_CATALOG.find((card) => card.id === entry.cardId)?.rarity;
+        return sum + entry.copies * (rarity ? goldenDisenchantValue(rarity) : 0);
+      }, 0);
+      const totalCopies = normalPlan.totalCopies + goldenPlan.totalCopies;
+      const totalDust = normalPlan.totalDust + goldenDust;
+      if (totalCopies === 0) {
         throw new GameStoreError("NO_EXTRA_CARDS", "收藏中没有超过可用套数的多余卡牌。", 409);
       }
       const collection = { ...current.collection };
-      for (const entry of plan.entries) {
+      const goldenCollection = { ...current.goldenCollection };
+      for (const entry of normalPlan.entries) {
         collection[entry.cardId] = Math.max(0, (collection[entry.cardId] ?? 0) - entry.copies);
+      }
+      for (const entry of goldenPlan.entries) {
+        collection[entry.cardId] = Math.max(0, (collection[entry.cardId] ?? 0) - entry.copies);
+        goldenCollection[entry.cardId] = Math.max(0, (goldenCollection[entry.cardId] ?? 0) - entry.copies);
       }
       return {
         nextState: {
           ...current,
-          currencies: { ...current.currencies, dust: current.currencies.dust + plan.totalDust },
+          currencies: { ...current.currencies, dust: current.currencies.dust + totalDust },
           collection,
+          goldenCollection,
         },
         result: {
-          amount: plan.totalDust,
-          cards: plan.totalCards,
-          copies: plan.totalCopies,
+          amount: totalDust,
+          cards: normalPlan.totalCards + goldenPlan.totalCards,
+          copies: totalCopies,
         },
       };
     },
@@ -3700,7 +3809,10 @@ function createDefaultState(now: string): StoredPlayerState {
     packPity: { packsOpened: 0, packsSinceLegendary: 0 },
     expansionPacks: emptyExpansionPacks(),
     expansionPackPity: emptyExpansionPackPity(),
+    goldenPacks: emptyGoldenPacks(),
+    goldenPackPity: emptyGoldenPackPity(),
     collection,
+    goldenCollection: {},
     decks: [
       {
         id: "starter-sun",
@@ -3873,6 +3985,29 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
         : 0,
     }];
   })) as ExpansionPackPity;
+  const goldenPacks = Object.fromEntries(PACK_TYPES.map((packType) => [
+    packType,
+    isRecord(value.goldenPacks) && isFiniteNonNegativeInteger(value.goldenPacks[packType])
+      ? value.goldenPacks[packType]
+      : 0,
+  ])) as GoldenPackInventory;
+  const goldenPackPity = Object.fromEntries(PACK_TYPES.map((packType) => {
+    const stored = isRecord(value.goldenPackPity) && isRecord(value.goldenPackPity[packType])
+      ? value.goldenPackPity[packType]
+      : null;
+    return [packType, {
+      packsOpened: stored && isFiniteNonNegativeInteger(stored.packsOpened) ? stored.packsOpened : 0,
+      packsSinceLegendary: stored && isFiniteNonNegativeInteger(stored.packsSinceLegendary)
+        ? Math.min(stored.packsSinceLegendary, LEGENDARY_PITY_LIMIT - 1)
+        : 0,
+    }];
+  })) as GoldenPackPity;
+  const goldenCollection = isRecord(value.goldenCollection)
+    ? Object.fromEntries(Object.entries(value.goldenCollection).filter(([cardId, count]) =>
+        isCardId(cardId) && isFiniteNonNegativeInteger(count)
+        && isRecord(value.collection) && isFiniteNonNegativeInteger(value.collection[cardId])
+        && count <= value.collection[cardId]))
+    : {};
   const legacyMatches = isRecord(value.stats) && isFiniteNonNegativeInteger(value.stats.matchesPlayed)
     ? value.stats.matchesPlayed
     : 0;
@@ -3978,7 +4113,7 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
     utcSeasonKey(new Date().toISOString()),
   );
   const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
-  return { ...value, decks, tasks, taskCycle, packPity, expansionPacks, expansionPackPity, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, returnJourney, trainingCampaign, rankedLadders, rankedRewards } as StoredPlayerState;
+  return { ...value, decks, tasks, taskCycle, packPity, expansionPacks, expansionPackPity, goldenPacks, goldenPackPity, goldenCollection, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, returnJourney, trainingCampaign, rankedLadders, rankedRewards } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -3991,7 +4126,10 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     !isPackPity(value.packPity) ||
     !isExpansionPacks(value.expansionPacks) ||
     !isExpansionPackPity(value.expansionPackPity) ||
+    !isGoldenPacks(value.goldenPacks) ||
+    !isGoldenPackPity(value.goldenPackPity) ||
     !isRecord(value.collection) ||
+    !isRecord(value.goldenCollection) ||
     !Array.isArray(value.decks) ||
     !Array.isArray(value.tasks) ||
     !isRecord(value.stats)
@@ -4017,6 +4155,9 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     Object.entries(value.collection).every(
       ([cardId, count]) =>
         isCardId(cardId) && isFiniteNonNegativeInteger(count),
+    ) &&
+    Object.entries(value.goldenCollection).every(
+      ([cardId, count]) => isCardId(cardId) && isFiniteNonNegativeInteger(count) && count <= (value.collection[cardId] ?? 0),
     ) &&
     isFiniteNonNegativeInteger(value.stats.wins) &&
     isFiniteNonNegativeInteger(value.stats.losses) &&
@@ -4050,6 +4191,14 @@ function isExpansionPacks(value: unknown): value is ExpansionPackInventory {
 
 function isExpansionPackPity(value: unknown): value is ExpansionPackPity {
   return isRecord(value) && EXPANSION_PACK_SET_IDS.every((setId) => isPackPity(value[setId]));
+}
+
+function isGoldenPacks(value: unknown): value is GoldenPackInventory {
+  return isRecord(value) && PACK_TYPES.every((packType) => isFiniteNonNegativeInteger(value[packType]));
+}
+
+function isGoldenPackPity(value: unknown): value is GoldenPackPity {
+  return isRecord(value) && PACK_TYPES.every((packType) => isPackPity(value[packType]));
 }
 
 function isProgression(value: unknown): value is PlayerProgression {
@@ -4210,7 +4359,13 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
       setId,
       { ...state.expansionPackPity[setId] },
     ])) as ExpansionPackPity,
+    goldenPacks: { ...state.goldenPacks },
+    goldenPackPity: Object.fromEntries(PACK_TYPES.map((packType) => [
+      packType,
+      { ...state.goldenPackPity[packType] },
+    ])) as GoldenPackPity,
     collection: { ...state.collection },
+    goldenCollection: { ...state.goldenCollection },
     decks: state.decks.map(cloneDeck),
     activeDeckId: state.activeDeckId,
     tasks: state.tasks.map(cloneTask),
@@ -4263,7 +4418,10 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.packPity.packsOpened === 0 &&
     state.packPity.packsSinceLegendary === 0 &&
     EXPANSION_PACK_SET_IDS.every((setId) => state.expansionPacks[setId] === 0) &&
-    EXPANSION_PACK_SET_IDS.every((setId) => state.expansionPackPity[setId].packsOpened === 0) &&
+    EXPANSION_PACK_SET_IDS.every((setId) => state.expansionPackPity[setId].packsOpened === 0 && state.expansionPackPity[setId].packsSinceLegendary === 0) &&
+    PACK_TYPES.every((packType) => state.goldenPacks[packType] === 0) &&
+    PACK_TYPES.every((packType) => state.goldenPackPity[packType].packsOpened === 0 && state.goldenPackPity[packType].packsSinceLegendary === 0) &&
+    Object.keys(state.goldenCollection).length === 0 &&
     collectionKeys.length === starter.size &&
     collectionKeys.every((cardId) => state.collection[cardId] === starter.get(cardId)) &&
     state.decks.length === 1 &&

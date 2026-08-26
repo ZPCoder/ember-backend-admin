@@ -48,6 +48,7 @@ import {
   getTrainingChapter,
   isPackType,
   type PackType,
+  type CardQuality,
   type TrainingChapterId,
 } from "../../../lib/game";
 
@@ -119,12 +120,14 @@ type GameAction =
       action: "open_pack";
       idempotencyKey: string;
       packType?: PackType;
+      quality?: CardQuality;
     }
   | {
       action: "open_packs";
       idempotencyKey: string;
       count: number;
       packType?: PackType;
+      quality?: CardQuality;
     }
   | {
       action: "claim_weekly_pack";
@@ -134,6 +137,7 @@ type GameAction =
       action: "buy_pack";
       idempotencyKey: string;
       packType?: PackType;
+      quality?: CardQuality;
     }
   | {
       action: "reroll_task";
@@ -144,6 +148,7 @@ type GameAction =
       action: "craft_card" | "disenchant_card";
       idempotencyKey: string;
       cardId: string;
+      quality?: CardQuality;
     }
   | {
       action: "disenchant_extras";
@@ -345,6 +350,7 @@ export async function POST(request: Request): Promise<Response> {
           openedCards: result.openedCards,
           packsOpened: result.packsOpened,
           packType: result.packType,
+          quality: result.quality,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -357,6 +363,7 @@ export async function POST(request: Request): Promise<Response> {
           openedCards: result.openedCards,
           packsOpened: result.packsOpened,
           packType: result.packType,
+          quality: result.quality,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -377,6 +384,7 @@ export async function POST(request: Request): Promise<Response> {
           player: result.player,
           costGold: result.costGold,
           packType: result.packType,
+          quality: result.quality,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -402,6 +410,7 @@ export async function POST(request: Request): Promise<Response> {
           cardId: result.cardId,
           amount: result.amount,
           kind: result.kind,
+          quality: result.quality,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -777,14 +786,15 @@ function parseAction(value: unknown): GameAction {
         taskId: parseIdentifier(value.taskId, "taskId"),
       };
     case "open_pack":
-      assertExactKeys(value, ["action", "idempotencyKey"], ["action", "idempotencyKey", "packType"]);
+      assertExactKeys(value, ["action", "idempotencyKey"], ["action", "idempotencyKey", "packType", "quality"]);
       return {
         action: "open_pack",
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
         ...(value.packType === undefined ? {} : { packType: parsePackType(value.packType) }),
+        ...(value.quality === undefined ? {} : { quality: parseCardQuality(value.quality) }),
       };
     case "open_packs":
-      assertExactKeys(value, ["action", "idempotencyKey", "count"], ["action", "idempotencyKey", "count", "packType"]);
+      assertExactKeys(value, ["action", "idempotencyKey", "count"], ["action", "idempotencyKey", "count", "packType", "quality"]);
       if (!Number.isInteger(value.count)) {
         throw new PayloadError("count 必须是整数。");
       }
@@ -793,6 +803,7 @@ function parseAction(value: unknown): GameAction {
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
         count: value.count as number,
         ...(value.packType === undefined ? {} : { packType: parsePackType(value.packType) }),
+        ...(value.quality === undefined ? {} : { quality: parseCardQuality(value.quality) }),
       };
     case "claim_weekly_pack":
       assertExactKeys(value, ["action", "idempotencyKey"]);
@@ -801,11 +812,12 @@ function parseAction(value: unknown): GameAction {
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
       };
     case "buy_pack":
-      assertExactKeys(value, ["action", "idempotencyKey"], ["action", "idempotencyKey", "packType"]);
+      assertExactKeys(value, ["action", "idempotencyKey"], ["action", "idempotencyKey", "packType", "quality"]);
       return {
         action: "buy_pack",
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
         ...(value.packType === undefined ? {} : { packType: parsePackType(value.packType) }),
+        ...(value.quality === undefined ? {} : { quality: parseCardQuality(value.quality) }),
       };
     case "reroll_task":
       assertExactKeys(value, ["action", "idempotencyKey", "taskId"]);
@@ -816,11 +828,12 @@ function parseAction(value: unknown): GameAction {
       };
     case "craft_card":
     case "disenchant_card":
-      assertExactKeys(value, ["action", "idempotencyKey", "cardId"]);
+      assertExactKeys(value, ["action", "idempotencyKey", "cardId"], ["action", "idempotencyKey", "cardId", "quality"]);
       return {
         action: value.action,
         idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
         cardId: parseIdentifier(value.cardId, "cardId"),
+        ...(value.quality === undefined ? {} : { quality: parseCardQuality(value.quality) }),
       };
     case "disenchant_extras":
       assertExactKeys(value, ["action", "idempotencyKey"]);
@@ -1069,6 +1082,11 @@ function assertExactKeys(
 
 function parsePackType(value: unknown): PackType {
   if (!isPackType(value)) throw new PayloadError("packType 不是有效的卡包类型。");
+  return value;
+}
+
+function parseCardQuality(value: unknown): CardQuality {
+  if (value !== "normal" && value !== "golden") throw new PayloadError("quality 不是有效的卡牌品质。");
   return value;
 }
 
