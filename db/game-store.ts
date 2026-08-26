@@ -3535,6 +3535,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     rankedRewards: {
       claimedFirstTimeFloors: [...state.rankedRewards.claimedFirstTimeFloors],
       earnedCardBackSeasons: [...state.rankedRewards.earnedCardBackSeasons],
+      legendSeasons: [...state.rankedRewards.legendSeasons],
       seasonChests: state.rankedRewards.seasonChests.map((chest) => ({ ...chest })),
     },
     stats: { ...state.stats },
@@ -3575,6 +3576,7 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.rankedLadders.wild.rankProgress === 0 &&
     state.rankedRewards.claimedFirstTimeFloors.length === 0 &&
     state.rankedRewards.earnedCardBackSeasons.length === 0 &&
+    state.rankedRewards.legendSeasons.length === 0 &&
     state.rankedRewards.seasonChests.length === 0 &&
     state.tasks.every((task) => task.progress === 0 && !task.claimed)
   );
