@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   index,
   integer,
+  primaryKey,
   sqliteTable,
   text,
   uniqueIndex,
@@ -176,4 +177,49 @@ export const pvpMatchParticipants = sqliteTable(
       table.createdAt,
     ),
   ],
+);
+
+// Hidden skill rating is deliberately outside player_states so it is never
+// serialized into the public player payload. Visible ladder progress can reset
+// each season while these per-format ratings persist.
+export const pvpMatchmakingRatings = sqliteTable(
+  "pvp_matchmaking_ratings",
+  {
+    identityKey: text("identity_key").notNull(),
+    format: text("format", { enum: ["ranked", "casual"] }).notNull(),
+    rating: integer("rating").notNull().default(1500),
+    games: integer("games").notNull().default(0),
+    updatedAt: integer("updated_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.identityKey, table.format] }),
+    index("pvp_matchmaking_ratings_format_rating_idx").on(
+      table.format,
+      table.rating,
+    ),
+  ],
+);
+
+// One immutable row proves that a terminal match updated both participants at
+// most once. Before/after values make an interrupted settlement recoverable.
+export const pvpMmrSettlements = sqliteTable(
+  "pvp_mmr_settlements",
+  {
+    matchToken: text("match_token").primaryKey(),
+    format: text("format", { enum: ["ranked", "casual"] }).notNull(),
+    hostIdentity: text("host_identity").notNull(),
+    guestIdentity: text("guest_identity").notNull(),
+    winner: integer("winner"),
+    hostRatingBefore: integer("host_rating_before").notNull(),
+    guestRatingBefore: integer("guest_rating_before").notNull(),
+    hostGamesBefore: integer("host_games_before").notNull(),
+    guestGamesBefore: integer("guest_games_before").notNull(),
+    hostRatingAfter: integer("host_rating_after").notNull(),
+    guestRatingAfter: integer("guest_rating_after").notNull(),
+    hostGamesAfter: integer("host_games_after").notNull(),
+    guestGamesAfter: integer("guest_games_after").notNull(),
+    applied: integer("applied").notNull().default(0),
+    createdAt: integer("created_at").notNull(),
+  },
+  (table) => [index("pvp_mmr_settlements_created_idx").on(table.createdAt)],
 );
