@@ -14,11 +14,13 @@ import {
   runAiTurn,
   getLadderReadyDeck,
   generateCatchUpPack,
+  collectionWithTrialCards,
+  TRIAL_CARD_ACCESS_MS,
   ladderReadyTrialIsActive,
   validateDeck,
   validateDeckForFormat,
 } from "../lib/game";
-import type { BattleCommand, LadderReadyDeckId, MatchState, RankedFormat } from "../lib/game";
+import type { BattleCommand, LadderReadyDeckId, MatchState, RankedFormat, TrialCardAccess } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
 import {
   APPRENTICE_MILESTONES,
@@ -196,6 +198,7 @@ export type PlayerState = {
   apprenticeTrack: ApprenticeTrackState;
   ladderReady: LadderReadyState;
   catchUpPack: CatchUpPackState;
+  trialCards: TrialCardAccess;
   rankedLadders: RankedLadders;
   rankedRewards: RankedRewardState;
   friends?: FriendSummary[];
@@ -551,7 +554,10 @@ export async function createAiMatch(
     if (!deck) {
       throw new GameStoreError("AI_DECK_NOT_SAVED", "AI 对局必须使用当前账号已保存的卡组或有效试玩套牌。", 400);
     }
-    assertCardsOwned(deck.cardIds, state.collection);
+    assertCardsOwned(
+      deck.cardIds,
+      collectionWithTrialCards(state.collection, state.trialCards, CARD_CATALOG, now),
+    );
     selectedDeckId = deck.id;
     selectedCardIds = deck.cardIds;
     selectedRankedFormat = deck.format === "wild" ? "wild" : "standard";
@@ -705,7 +711,10 @@ export async function saveDeck(
           validation.errors,
         );
       }
-      assertCardsOwned(requestedDeck.cardIds, current.collection);
+      assertCardsOwned(
+        requestedDeck.cardIds,
+        collectionWithTrialCards(current.collection, current.trialCards, CARD_CATALOG, new Date(now)),
+      );
 
       const existingIndex = current.decks.findIndex(
         (deck) => deck.id === requestedDeck.id,
@@ -1562,6 +1571,10 @@ export async function activateLadderReady(
             activatedAt: activatedAt.toISOString(),
             expiresAt: new Date(activatedAt.getTime() + LADDER_READY_TRIAL_MS).toISOString(),
             claimedDeckId: null,
+          },
+          trialCards: {
+            activatedAt: activatedAt.toISOString(),
+            expiresAt: new Date(activatedAt.getTime() + TRIAL_CARD_ACCESS_MS).toISOString(),
           },
         },
         result: {},
@@ -3309,6 +3322,7 @@ function createDefaultState(now: string): StoredPlayerState {
     apprenticeTrack: { claimedMilestones: [] },
     ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null },
     catchUpPack: { claimedAt: null, cardsGranted: 0 },
+    trialCards: { activatedAt: null, expiresAt: null },
     rankedLadders: createRankedLadders(utcSeasonKey(now)),
     rankedRewards: createRankedRewardState(),
     stats: {
@@ -3437,13 +3451,18 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
           : 0,
       }
     : { claimedAt: null, cardsGranted: 0 };
+  const trialCards = isTrialCardAccess(value.trialCards)
+    ? { activatedAt: value.trialCards.activatedAt, expiresAt: value.trialCards.expiresAt }
+    : ladderReady.activatedAt && ladderReady.expiresAt
+      ? { activatedAt: ladderReady.activatedAt, expiresAt: ladderReady.expiresAt }
+      : { activatedAt: null, expiresAt: null };
   const rankedLadders = normalizeRankedLadders(
     value.rankedLadders,
     value.ladder,
     utcSeasonKey(new Date().toISOString()),
   );
   const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
-  return { ...value, decks, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, rankedLadders, rankedRewards } as StoredPlayerState;
+  return { ...value, decks, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, rankedLadders, rankedRewards } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -3470,6 +3489,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isApprenticeTrack(value.apprenticeTrack) &&
     isLadderReadyState(value.ladderReady) &&
     isCatchUpPackState(value.catchUpPack) &&
+    isTrialCardAccess(value.trialCards) &&
     isRankedLadders(value.rankedLadders) &&
     isRankedRewardState(value.rankedRewards) &&
     value.decks.every(isDeck) &&
@@ -3538,6 +3558,16 @@ function isCatchUpPackState(value: unknown): value is CatchUpPackState {
     && (value.claimedAt === null
       || (typeof value.claimedAt === "string" && Number.isFinite(Date.parse(value.claimedAt))))
     && isFiniteNonNegativeInteger(value.cardsGranted);
+}
+
+function isTrialCardAccess(value: unknown): value is TrialCardAccess {
+  if (!isRecord(value)) return false;
+  if (value.activatedAt === null && value.expiresAt === null) return true;
+  return typeof value.activatedAt === "string"
+    && typeof value.expiresAt === "string"
+    && Number.isFinite(Date.parse(value.activatedAt))
+    && Number.isFinite(Date.parse(value.expiresAt))
+    && Date.parse(value.expiresAt) > Date.parse(value.activatedAt);
 }
 
 function isLadder(value: unknown): value is PlayerLadder {
@@ -3628,6 +3658,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     apprenticeTrack: { claimedMilestones: [...state.apprenticeTrack.claimedMilestones] },
     ladderReady: { ...state.ladderReady },
     catchUpPack: { ...state.catchUpPack },
+    trialCards: { ...state.trialCards },
     rankedLadders: cloneRankedLadders(state.rankedLadders),
     rankedRewards: {
       claimedFirstTimeFloors: [...state.rankedRewards.claimedFirstTimeFloors],
@@ -3670,6 +3701,7 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.ladderReady.activatedAt === null &&
     state.ladderReady.claimedDeckId === null &&
     state.catchUpPack.claimedAt === null &&
+    state.trialCards.activatedAt === null &&
     state.rankedLadders.standard.rankProgress === 0 &&
     state.rankedLadders.wild.rankProgress === 0 &&
     state.rankedRewards.claimedFirstTimeFloors.length === 0 &&

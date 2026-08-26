@@ -3,6 +3,7 @@ import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } fr
 import handler from "vinext/server/app-router-entry";
 import {
   CARD_BY_ID,
+  CARD_CATALOG,
   HIDDEN_MMR_START,
   MATCHMAKING_WINDOW_INITIAL,
   MATCHMAKING_WINDOW_MAX,
@@ -13,6 +14,7 @@ import {
   applyCommand,
   apprenticeMatchPoolForFacts,
   createMatch,
+  collectionWithTrialCards,
   initialHiddenMmrForVisibleRating,
   ladderReadyDeckMatches,
   ladderReadyTrialIsActive,
@@ -940,9 +942,17 @@ function pvpAccountStateAllowsDeck(
     return false;
   }
   const collection = raw.collection as Record<string, unknown>;
+  const numericCollection = Object.fromEntries(Object.entries(collection).flatMap(([cardId, count]) =>
+    typeof count === "number" && Number.isSafeInteger(count) && count >= 0
+      ? [[cardId, count]]
+      : []));
+  const effectiveCollection = collectionWithTrialCards(
+    numericCollection,
+    (raw.trialCards ?? raw.ladderReady) as { activatedAt: string | null; expiresAt: string | null } | undefined,
+    CARD_CATALOG,
+  );
   const ownsRequestedCards = [...pvpCardCounts(deckIds)].every(([cardId, count]) => {
-    const owned = collection[cardId];
-    return typeof owned === "number" && Number.isSafeInteger(owned) && owned >= count;
+    return (effectiveCollection[cardId] ?? 0) >= count;
   });
   const ownsSavedDeck = ownsRequestedCards && raw.decks.some((deck) => {
     if (!deck || typeof deck !== "object" || Array.isArray(deck)) return false;
