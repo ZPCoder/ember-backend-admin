@@ -5,6 +5,7 @@ import {
   DEFAULT_STARTER_DECK,
   LADDER_READY_TRIAL_MS,
   MAX_SAVED_DECKS,
+  removeSavedDeck,
   aiMatchTicketMatchesProof,
   applyCommand,
   chooseAiMulliganIndexes,
@@ -203,6 +204,12 @@ export type PlayerState = {
 export type SaveDeckResult = {
   player: PlayerState;
   savedDeck: PlayerDeck;
+  replayed: boolean;
+};
+
+export type DeleteDeckResult = {
+  player: PlayerState;
+  deletedDeckId: string;
   replayed: boolean;
 };
 
@@ -708,6 +715,46 @@ export async function saveDeck(
   ).then(({ player: nextPlayer, result, replayed }) => ({
     player: nextPlayer,
     savedDeck: result.savedDeck,
+    replayed,
+  }));
+}
+
+export async function deleteDeck(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; deckId: string },
+): Promise<DeleteDeckResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+
+  return commitMutation(
+    db,
+    player,
+    "delete_deck",
+    input.idempotencyKey,
+    { deckId: input.deckId },
+    (current) => {
+      const removal = removeSavedDeck(
+        current.decks,
+        current.activeDeckId,
+        input.deckId,
+      );
+      if (!removal) {
+        throw new GameStoreError(
+          "DECK_NOT_FOUND",
+          "要删除的卡组不存在。",
+          404,
+        );
+      }
+      const decks = removal.decks.map(cloneDeck);
+      return {
+        nextState: { ...current, decks, activeDeckId: removal.activeDeckId },
+        result: { deletedDeckId: input.deckId },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    deletedDeckId: result.deletedDeckId,
     replayed,
   }));
 }

@@ -11,6 +11,7 @@ import {
   blockPlayer,
   buyPack,
   craftCard,
+  deleteDeck,
   disenchantCard,
   GameStoreError,
   getPlayerState,
@@ -82,6 +83,11 @@ type GameAction =
         format: RankedFormat;
         cardIds: string[];
       };
+    }
+  | {
+      action: "delete_deck";
+      idempotencyKey: string;
+      deckId: string;
     }
   | {
       action: "claim_task";
@@ -236,6 +242,16 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           savedDeck: result.savedDeck,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "delete_deck": {
+        const result = await deleteDeck(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          deletedDeckId: result.deletedDeckId,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -598,6 +614,13 @@ function parseAction(value: unknown): GameAction {
         deck: { ...(id ? { id } : {}), name, format, cardIds },
       };
     }
+    case "delete_deck":
+      assertExactKeys(value, ["action", "idempotencyKey", "deckId"]);
+      return {
+        action: "delete_deck",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        deckId: parseIdentifier(value.deckId, "deckId"),
+      };
     case "claim_task":
       assertExactKeys(value, ["action", "idempotencyKey", "taskId"]);
       return {
