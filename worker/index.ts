@@ -152,6 +152,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
   // createMatch's default id embeds the seed in hexadecimal form.
   snapshot.id = "public-match";
   snapshot.players = snapshot.players.map((player, index) => {
+    const coinIndex = player.hand.indexOf("the-coin");
     const privateCards = index === viewer
       ? player.hand
       : (player.hand ?? []).map(() => "__hidden-card__");
@@ -183,7 +184,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       handStartedInDeck: privateCards.map(() => true),
       handEnteredTurns: privateCards.map(() => 0),
       handEntityIds: privateCards.map((_, index) => `hidden-hand-${index}`),
-      coinEntityId: player.coinAvailable ? "hidden-coin" : undefined,
+      coinEntityId: coinIndex >= 0 ? `hidden-hand-${coinIndex}` : undefined,
       // The ordered spell identity history can reveal an untriggered Secret.
       // Keep the complete list server-side for recast effects.
       spellsPlayedThisGame: [],
