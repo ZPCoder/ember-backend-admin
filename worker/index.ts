@@ -11,13 +11,14 @@ import {
   MATCHMAKING_WINDOW_STEP,
   MATCHMAKING_WINDOW_STEP_MS,
   MAX_HAND_SIZE,
-  LADDER_READY_DECKS,
   applyCommand,
   apprenticeMatchPoolForFacts,
   createMatch,
   collectionWithTrialCards,
   initialHiddenMmrForVisibleRating,
+  getLadderReadyCatalog,
   ladderReadyDeckMatches,
+  ladderReadyDecksForTrial,
   ladderReadyTrialIsActive,
   isCardBackId,
   matchQualityForGap,
@@ -980,12 +981,21 @@ function pvpAccountStateAllowsDeck(
   ) {
     return false;
   }
+  const catalogVersionId = typeof ladderReady.catalogVersionId === "string"
+    ? getLadderReadyCatalog(ladderReady.catalogVersionId)?.id ?? null
+    : null;
   if (!ladderReadyTrialIsActive({
     activatedAt: ladderReady.activatedAt,
     expiresAt: ladderReady.expiresAt,
     claimedDeckId: null,
+    catalogVersionId,
   })) return false;
-  return LADDER_READY_DECKS.some((deck) => ladderReadyDeckMatches(deck.deck, deckIds));
+  return ladderReadyDecksForTrial({
+    activatedAt: ladderReady.activatedAt,
+    expiresAt: ladderReady.expiresAt,
+    claimedDeckId: null,
+    catalogVersionId,
+  }).some((deck) => ladderReadyDeckMatches(deck.deck, deckIds));
 }
 
 function pvpAccountStateAuthorizesCardBack(

@@ -14,6 +14,9 @@ import {
   derivePvpSettlement,
   runAiTurn,
   getLadderReadyDeck,
+  getLadderReadyCatalog,
+  ladderReadyCatalogAt,
+  ladderReadyCatalogForTrial,
   generateCatchUpPackReward,
   catchUpProgressFromCollection,
   recordCatchUpCards,
@@ -38,7 +41,7 @@ import {
   normalizeOwnedCardBackId,
   normalizeFavoriteCardBackIds,
 } from "../lib/game";
-import type { BattleCommand, CatchUpPackProgress, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrainingCampaignState, TrainingChapterId, TrialCardAccess } from "../lib/game";
+import type { BattleCommand, CatchUpPackProgress, LadderReadyCatalogVersionId, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrainingCampaignState, TrainingChapterId, TrialCardAccess } from "../lib/game";
 import {
   BULK_PACK_MAX_COUNT,
   BULK_PACK_MIN_COUNT,
@@ -161,6 +164,7 @@ export type LadderReadyState = {
   activatedAt: string | null;
   expiresAt: string | null;
   claimedDeckId: LadderReadyDeckId | null;
+  catalogVersionId: LadderReadyCatalogVersionId | null;
 };
 
 export type CatchUpPackState = CatchUpPackProgress & {
@@ -715,8 +719,9 @@ export async function createAiMatch(
   }
 
   const state = parseStoredState((await loadStateRow(db, player.id)).stateJson);
+  const trialCatalog = ladderReadyCatalogForTrial(state.ladderReady, now);
   const trialDeck = input.ladderReadyDeckId
-    ? getLadderReadyDeck(input.ladderReadyDeckId)
+    ? getLadderReadyDeck(input.ladderReadyDeckId, trialCatalog.id)
     : undefined;
   let selectedDeckId: string;
   let selectedCardIds: readonly string[];
@@ -2067,6 +2072,7 @@ export async function activateLadderReady(
         throw new GameStoreError("LADDER_READY_ALREADY_ACTIVATED", "七日试玩已经激活。", 409);
       }
       const activatedAt = new Date();
+      const catalogVersionId = ladderReadyCatalogAt(activatedAt).id;
       return {
         nextState: {
           ...current,
@@ -2074,6 +2080,7 @@ export async function activateLadderReady(
             activatedAt: activatedAt.toISOString(),
             expiresAt: new Date(activatedAt.getTime() + LADDER_READY_TRIAL_MS).toISOString(),
             claimedDeckId: null,
+            catalogVersionId,
           },
           trialCards: {
             activatedAt: activatedAt.toISOString(),
@@ -2094,8 +2101,6 @@ export async function claimLadderReadyDeck(
   identity: GameIdentity,
   input: { idempotencyKey: string; deckId: LadderReadyDeckId },
 ): Promise<ClaimLadderReadyDeckResult> {
-  const offer = getLadderReadyDeck(input.deckId);
-  if (!offer) throw new GameStoreError("LADDER_READY_DECK_NOT_FOUND", "天梯预备套牌不存在。", 404);
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
@@ -2105,7 +2110,7 @@ export async function claimLadderReadyDeck(
     player,
     "claim_ladder_ready_deck",
     input.idempotencyKey,
-    { deckId: offer.id },
+    { deckId: input.deckId },
     (current) => {
       if (!current.ladderReady.activatedAt) {
         throw new GameStoreError("LADDER_READY_NOT_ACTIVATED", "请先激活七日试玩，再选择永久领取的套牌。", 409);
@@ -2113,6 +2118,9 @@ export async function claimLadderReadyDeck(
       if (current.ladderReady.claimedDeckId) {
         throw new GameStoreError("LADDER_READY_ALREADY_CLAIMED", "本账号已经领取过一套天梯预备套牌。", 409);
       }
+      const catalog = ladderReadyCatalogForTrial(current.ladderReady);
+      const offer = getLadderReadyDeck(input.deckId, catalog.id);
+      if (!offer) throw new GameStoreError("LADDER_READY_DECK_NOT_FOUND", "天梯预备套牌不存在。", 404);
       const validation = validateDeck(offer.deck);
       if (!validation.valid) {
         throw new GameStoreError("INVALID_DECK", "天梯预备套牌当前不可用。", 500, validation.errors);
@@ -2150,7 +2158,7 @@ export async function claimLadderReadyDeck(
           },
           decks,
           activeDeckId: claimedDeck.id,
-          ladderReady: { ...current.ladderReady, claimedDeckId: offer.id },
+          ladderReady: { ...current.ladderReady, claimedDeckId: offer.id, catalogVersionId: catalog.id },
         },
         result: { claimedLadderReadyDeck: claimedDeck },
       };
@@ -3927,7 +3935,7 @@ function createDefaultState(now: string): StoredPlayerState {
     progression: { xp: 0, level: 1 },
     rewardTrack: { claimedLevels: [] },
     apprenticeTrack: { claimedMilestones: [] },
-    ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null },
+    ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null },
     catchUpPack: { claimedAt: null, cardsGranted: 0, ...catchUpProgress },
     trialCards: { activatedAt: null, expiresAt: null },
     returnJourney: { claimedStageIds: [], matchesPlayedAtActivation: 0 },
@@ -4090,15 +4098,23 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
         ),
       }
     : { claimedMilestones: [] };
+  const ladderReadyActivatedAt = isRecord(value.ladderReady) && typeof value.ladderReady.activatedAt === "string"
+    ? value.ladderReady.activatedAt
+    : null;
+  const ladderReadyCatalog = isRecord(value.ladderReady)
+    ? getLadderReadyCatalog(typeof value.ladderReady.catalogVersionId === "string" ? value.ladderReady.catalogVersionId : null)
+      ?? (ladderReadyActivatedAt ? ladderReadyCatalogAt(ladderReadyActivatedAt) : null)
+    : null;
   const ladderReady = isRecord(value.ladderReady)
     ? {
-        activatedAt: typeof value.ladderReady.activatedAt === "string" ? value.ladderReady.activatedAt : null,
+        activatedAt: ladderReadyActivatedAt,
         expiresAt: typeof value.ladderReady.expiresAt === "string" ? value.ladderReady.expiresAt : null,
-        claimedDeckId: typeof value.ladderReady.claimedDeckId === "string" && getLadderReadyDeck(value.ladderReady.claimedDeckId)
+        claimedDeckId: typeof value.ladderReady.claimedDeckId === "string" && getLadderReadyDeck(value.ladderReady.claimedDeckId, ladderReadyCatalog?.id)
           ? value.ladderReady.claimedDeckId as LadderReadyDeckId
           : null,
+        catalogVersionId: ladderReadyCatalog?.id ?? null,
       }
-    : { activatedAt: null, expiresAt: null, claimedDeckId: null };
+    : { activatedAt: null, expiresAt: null, claimedDeckId: null, catalogVersionId: null };
   const migratedCatchUpProgress = catchUpProgressFromCollection(
     isRecord(value.collection)
       ? Object.fromEntries(Object.entries(value.collection).filter((entry): entry is [string, number] => typeof entry[1] === "number"))
@@ -4285,12 +4301,15 @@ function isLadderReadyState(value: unknown): value is LadderReadyState {
   const activatedAt = value.activatedAt;
   const expiresAt = value.expiresAt;
   const claimedDeckId = value.claimedDeckId;
+  const catalogVersionId = value.catalogVersionId;
   const noTrial = activatedAt === null && expiresAt === null;
   const validTrial = typeof activatedAt === "string" && Number.isFinite(Date.parse(activatedAt))
     && typeof expiresAt === "string" && Number.isFinite(Date.parse(expiresAt))
     && Date.parse(expiresAt) > Date.parse(activatedAt);
   return (noTrial || validTrial)
-    && (claimedDeckId === null || (typeof claimedDeckId === "string" && Boolean(getLadderReadyDeck(claimedDeckId))));
+    && (catalogVersionId === null || (typeof catalogVersionId === "string" && Boolean(getLadderReadyCatalog(catalogVersionId))))
+    && (activatedAt === null ? catalogVersionId === null : catalogVersionId !== null)
+    && (claimedDeckId === null || (typeof claimedDeckId === "string" && Boolean(getLadderReadyDeck(claimedDeckId, typeof catalogVersionId === "string" ? catalogVersionId : null))));
 }
 
 function isCatchUpPackState(value: unknown): value is CatchUpPackState {
