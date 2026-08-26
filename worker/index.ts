@@ -160,6 +160,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
         ...player,
         // Even the owner must not receive the authoritative future draw order.
         deck: (player.deck ?? []).map(() => "__hidden-card__"),
+        deckStartedInDeck: (player.deck ?? []).map(() => true),
         hand: privateCards,
         handCostReductions: [...(player.handCostReductions ?? player.hand.map(() => 0))],
         handFragments: (player.handFragments ?? player.hand.map(() => null)).map((fragment) =>
@@ -171,12 +172,15 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       // Counts are enough for the opponent UI; card identities must remain
       // server-side until a card is publicly played.
       deck: (player.deck ?? []).map(() => "__hidden-card__"),
+      deckStartedInDeck: (player.deck ?? []).map(() => true),
       hand: privateCards,
       handCostReductions: privateCards.map(() => 0),
       handFragments: privateCards.map(() => null),
+      handStartedInDeck: privateCards.map(() => true),
       // The ordered spell identity history can reveal an untriggered Secret.
       // Keep the complete list server-side for recast effects.
       spellsPlayedThisGame: [],
+      spellsPlayedFromStartingDeck: [],
       secrets: (player.secrets ?? []).map((_, secretIndex) => ({
         cardId: `hidden-secret-${secretIndex}`,
         secretId: `hidden-secret-${secretIndex}`,
