@@ -3572,6 +3572,17 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
         value.catchUpPack.legendarySeenSets.includes(set)
         || migratedCatchUpProgress.legendarySeenSets.includes(set))
     : migratedCatchUpProgress.legendarySeenSets;
+  const storedReceivedCopies = { ...migratedCatchUpProgress.receivedCopiesByCard };
+  if (isRecord(value.catchUpPack) && isRecord(value.catchUpPack.receivedCopiesByCard)) {
+    for (const [cardId, count] of Object.entries(value.catchUpPack.receivedCopiesByCard)) {
+      const card = CARD_CATALOG.find((candidate) => candidate.id === cardId);
+      if (!card?.set || card.collectible === false || !CATCH_UP_PACK_SETS.includes(card.set)) continue;
+      const limit = card.rarity === "传说" ? 1 : 2;
+      if (isFiniteNonNegativeInteger(count)) {
+        storedReceivedCopies[cardId] = Math.max(storedReceivedCopies[cardId] ?? 0, Math.min(limit, count));
+      }
+    }
+  }
   const catchUpPack: CatchUpPackState = {
     claimedAt: isRecord(value.catchUpPack) && typeof value.catchUpPack.claimedAt === "string" ? value.catchUpPack.claimedAt : null,
     cardsGranted: isRecord(value.catchUpPack) && isFiniteNonNegativeInteger(value.catchUpPack.cardsGranted)
@@ -3579,6 +3590,7 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
       : 0,
     cardsSeenBySet: storedCardsSeen,
     legendarySeenSets: storedLegendarySets,
+    receivedCopiesByCard: storedReceivedCopies,
   };
   const trialCards = isTrialCardAccess(value.trialCards)
     ? { activatedAt: value.trialCards.activatedAt, expiresAt: value.trialCards.expiresAt }
@@ -3711,7 +3723,14 @@ function isCatchUpPackState(value: unknown): value is CatchUpPackState {
       CATCH_UP_PACK_SETS.includes(set as (typeof CATCH_UP_PACK_SETS)[number]) && isFiniteNonNegativeInteger(count))
     && Array.isArray(value.legendarySeenSets)
     && value.legendarySeenSets.every((set) => typeof set === "string" && CATCH_UP_PACK_SETS.includes(set as (typeof CATCH_UP_PACK_SETS)[number]))
-    && new Set(value.legendarySeenSets).size === value.legendarySeenSets.length;
+    && new Set(value.legendarySeenSets).size === value.legendarySeenSets.length
+    && isRecord(value.receivedCopiesByCard)
+    && Object.entries(value.receivedCopiesByCard).every(([cardId, count]) => {
+      const card = CARD_CATALOG.find((candidate) => candidate.id === cardId);
+      return Boolean(card?.set && card.collectible !== false && CATCH_UP_PACK_SETS.includes(card.set))
+        && isFiniteNonNegativeInteger(count)
+        && count <= (card?.rarity === "传说" ? 1 : 2);
+    });
 }
 
 function isTrialCardAccess(value: unknown): value is TrialCardAccess {
@@ -3824,6 +3843,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
       ...state.catchUpPack,
       cardsSeenBySet: { ...state.catchUpPack.cardsSeenBySet },
       legendarySeenSets: [...state.catchUpPack.legendarySeenSets],
+      receivedCopiesByCard: { ...state.catchUpPack.receivedCopiesByCard },
     },
     trialCards: { ...state.trialCards },
     returnJourney: {
