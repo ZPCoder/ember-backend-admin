@@ -3,21 +3,35 @@ import {
   AI_ARCHETYPES,
   CARD_CATALOG,
   DEFAULT_STARTER_DECK,
+  aiMatchTicketMatchesProof,
   applyCommand,
+  chooseAiMulliganIndexes,
   createMatch,
+  derivePvpSettlement,
+  runAiTurn,
   validateDeck,
 } from "../lib/game";
-import type { BattleCommand } from "../lib/game";
+import type { BattleCommand, MatchState } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
 import {
   REWARD_TRACK,
   craftCost,
   disenchantValue,
 } from "../lib/game/economy.ts";
+import {
+  LADDER_START_RATING,
+  ladderStarsForRating,
+  ladderTierForRating,
+  updateRankedSnapshot,
+} from "../lib/game/ranked.ts";
 
-export type MatchResult = "win" | "loss";
+export type MatchResult = "win" | "loss" | "draw";
 export type MatchMode = "ai" | "pvp";
 export type MatchFormat = "ranked" | "casual";
+// A full 89-turn match can legitimately contain well over 400 attacks and
+// other actions. Keep the transcript bounded for replay cost, but large
+// enough that the rules engine's own turn limit remains reachable.
+export const MAX_AI_PROOF_COMMANDS = 2_048;
 
 export type GameIdentity = {
   email: string;
@@ -78,6 +92,7 @@ export type PlayerLadder = {
   wins: number;
   losses: number;
   highestRating: number;
+  winStreak?: number;
 };
 
 export type FriendSummary = {
@@ -108,11 +123,21 @@ export type MatchRecord = {
 
 /** Client transcript that the server replays before granting AI rewards. */
 export type AiMatchProof = {
+  ticketToken: string;
   seed: number;
   startingPlayer: 0 | 1;
   playerDeck: string[];
   opponentArchetypeId: string;
   commands: BattleCommand[];
+};
+
+export type AiMatchTicket = {
+  token: string;
+  seed: number;
+  startingPlayer: 0 | 1;
+  playerDeck: string[];
+  opponentArchetypeId: string;
+  expiresAt: string;
 };
 
 export type PlayerState = {
@@ -226,6 +251,12 @@ export type RecordMatchResult = {
   replayed: boolean;
 };
 
+export type CreateAiMatchResult = {
+  player: PlayerState;
+  aiMatch: AiMatchTicket;
+  replayed: boolean;
+};
+
 type StoredPlayerState = Omit<
   PlayerState,
   "id" | "email" | "displayName" | "recentMatches" | "updatedAt"
@@ -275,15 +306,37 @@ type SocialMessageRow = {
   createdAt: string;
 };
 
-type PvpMatchRow = {
+type PvpSettlementCandidateRow = {
   matchToken: string;
   stateJson: string;
   format?: MatchFormat | null;
-};
-
-type PvpParticipantRow = {
+  createdAt: number | string;
+  updatedAt: number | string;
   hostIdentity: string;
   guestIdentity: string;
+};
+
+type DerivedPvpSettlement = {
+  matchToken: string;
+  player: 0 | 1;
+  result: MatchResult;
+  format: MatchFormat;
+  opponentIdentity: string;
+  opponent: string;
+  createdAt: string;
+};
+
+type AiMatchTicketRow = {
+  token: string;
+  playerId: string;
+  deckId: string;
+  deckJson: string;
+  opponentArchetypeId: string;
+  seed: number;
+  startingPlayer: number;
+  expiresAt: string;
+  consumedAt?: string | null;
+  consumedByIdempotencyKey?: string | null;
 };
 
 type D1RunResultLike = {
@@ -317,6 +370,14 @@ type MutationOutput<T> = {
   match?: MatchRecord;
 };
 
+type AiTicketConsumption = {
+  token: string;
+  seed: number;
+  startingPlayer: 0 | 1;
+  opponentArchetypeId: string;
+  deckJson: string;
+};
+
 const STARTING_GOLD = 260;
 const STARTING_PACKS = 3;
 const WIN_REWARD_GOLD = 60;
@@ -330,6 +391,8 @@ const TASK_REWARD_XP = 150;
 const DAILY_REROLL_LIMIT = 1;
 const LEGENDARY_PITY_LIMIT = 40;
 const MAX_MUTATION_ATTEMPTS = 4;
+const AI_MATCH_TICKET_TTL_MS = 2 * 60 * 60 * 1_000;
+const MAX_PVP_RECONCILIATIONS_PER_REQUEST = 10;
 
 let schemaReady: Promise<void> | null = null;
 
@@ -352,7 +415,109 @@ export async function getPlayerState(
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
   await refreshPlayerCycle(db, player);
+  await reconcilePvpSettlements(db, player, identity);
   return loadPublicPlayer(db, player);
+}
+
+/**
+ * Issue (or recover) the sole active AI match ticket for a player. A valid
+ * unconsumed ticket always wins over newly requested parameters so repeatedly
+ * opening the battle screen cannot be used to reroll the seed or first player.
+ */
+export async function createAiMatch(
+  identity: GameIdentity,
+  input: { deckId: string; opponentArchetypeId: string },
+): Promise<CreateAiMatchResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const now = new Date();
+  const nowIso = now.toISOString();
+
+  const existing = await loadActiveAiTicket(db, player.id);
+  if (existing && existing.expiresAt > nowIso) {
+    return {
+      player: await loadPublicPlayer(db, player),
+      aiMatch: parseAiMatchTicketRow(existing),
+      replayed: true,
+    };
+  }
+  if (existing) {
+    await db
+      .prepare(
+        `UPDATE ai_match_tickets
+         SET active_slot = NULL
+         WHERE token = ? AND player_id = ? AND consumed_at IS NULL`,
+      )
+      .bind(existing.token, player.id)
+      .run();
+  }
+
+  const state = parseStoredState((await loadStateRow(db, player.id)).stateJson);
+  const deck = state.decks.find((candidate) => candidate.id === input.deckId);
+  if (!deck) {
+    throw new GameStoreError("AI_DECK_NOT_SAVED", "AI 对局必须使用当前账号已保存的卡组。", 400);
+  }
+  const validation = validateDeck(deck.cardIds);
+  if (!validation.valid) {
+    throw new GameStoreError("INVALID_DECK", "卡组不符合组牌规则。", 400, validation.errors);
+  }
+  assertCardsOwned(deck.cardIds, state.collection);
+  const archetype = AI_ARCHETYPES.find((candidate) => candidate.id === input.opponentArchetypeId);
+  if (!archetype) {
+    throw new GameStoreError("AI_ARCHETYPE_NOT_FOUND", "AI 对手原型不存在。", 400);
+  }
+
+  const randomness = new Uint32Array(2);
+  crypto.getRandomValues(randomness);
+  const ticket: AiMatchTicket = {
+    token: `ai-${crypto.randomUUID()}`,
+    seed: (randomness[0] ?? 0) & 0x7fffffff,
+    startingPlayer: ((randomness[1] ?? 0) & 1) as 0 | 1,
+    playerDeck: [...deck.cardIds],
+    opponentArchetypeId: archetype.id,
+    expiresAt: new Date(now.getTime() + AI_MATCH_TICKET_TTL_MS).toISOString(),
+  };
+
+  try {
+    await db
+      .prepare(
+        `INSERT INTO ai_match_tickets
+           (token, player_id, deck_id, deck_json, opponent_archetype_id,
+            seed, starting_player, active_slot, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+      )
+      .bind(
+        ticket.token,
+        player.id,
+        deck.id,
+        JSON.stringify(ticket.playerDeck),
+        ticket.opponentArchetypeId,
+        ticket.seed,
+        ticket.startingPlayer,
+        ticket.expiresAt,
+        nowIso,
+      )
+      .run();
+  } catch (error) {
+    // Concurrent starts race on the per-player active-slot index. Return the
+    // winner's ticket so both requests resume exactly the same match.
+    const winner = await loadActiveAiTicket(db, player.id);
+    if (winner && winner.expiresAt > new Date().toISOString()) {
+      return {
+        player: await loadPublicPlayer(db, player),
+        aiMatch: parseAiMatchTicketRow(winner),
+        replayed: true,
+      };
+    }
+    throw error;
+  }
+
+  return {
+    player: await loadPublicPlayer(db, player),
+    aiMatch: ticket,
+    replayed: false,
+  };
 }
 
 /**
@@ -746,6 +911,20 @@ async function mutateFriendLink(
   const action = `friend_${operation}`;
   const auditId = `audit-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 24)}`;
   const resultJson = JSON.stringify({ friendId: friend.id });
+  if (operation === "send") {
+    const recentSince = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const recentRequests = await db
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM friend_links
+         WHERE requested_by = ? AND created_at >= ?`,
+      )
+      .bind(player.id, recentSince)
+      .first<{ count: number | string }>();
+    if (Number(recentRequests?.count ?? 0) >= 20) {
+      throw new GameStoreError("FRIEND_REQUEST_RATE_LIMIT", "今日好友请求已达到上限，请明天再试。", 429);
+    }
+  }
   const socialStatement = operation === "accept"
     ? db.prepare(
         `UPDATE friend_links
@@ -799,6 +978,18 @@ export async function sendChatMessage(
     if (existingAudit.action !== "send_chat") throw new GameStoreError("IDEMPOTENCY_KEY_REUSED", "该幂等键已经用于其他操作。", 409);
     const message = parseChatAudit(existingAudit.resultJson);
     return { player: await loadPublicPlayer(db, player), message, replayed: true };
+  }
+  const recentSince = new Date(Date.now() - 60 * 1000).toISOString();
+  const recentMessages = await db
+    .prepare(
+      `SELECT COUNT(*) AS count
+       FROM social_messages
+       WHERE sender_id = ? AND created_at >= ?`,
+    )
+    .bind(player.id, recentSince)
+    .first<{ count: number | string }>();
+  if (Number(recentMessages?.count ?? 0) >= 20) {
+    throw new GameStoreError("CHAT_RATE_LIMIT", "消息发送过于频繁，请稍后再试。", 429);
   }
   const now = new Date().toISOString();
   const message: SocialMessage = {
@@ -1143,6 +1334,352 @@ export async function claimReward(
   }));
 }
 
+async function reconcilePvpSettlements(
+  db: D1DatabaseLike,
+  player: PlayerRow,
+  identity: GameIdentity,
+  excludeToken?: string,
+): Promise<void> {
+  const identityKey = stableIdentityKey(identity);
+  const candidates = await loadUnsettledPvpCandidates(db, player.id, identityKey);
+  for (const candidate of candidates) {
+    if (candidate.matchToken === excludeToken) continue;
+    let settlement: DerivedPvpSettlement;
+    try {
+      settlement = await derivePvpCandidate(db, identityKey, candidate);
+    } catch (error) {
+      // Reconciliation is background account maintenance. A legacy/corrupt
+      // snapshot must not permanently lock the player's profile; explicit
+      // settlement of the same token remains strict and reports the error.
+      if (
+        error instanceof GameStoreError &&
+        [
+          "PVP_NOT_FINISHED",
+          "PVP_PROOF_INVALID",
+          "PVP_PARTICIPANT_AMBIGUOUS",
+          "PVP_OWNER_MISMATCH",
+        ].includes(error.code)
+      ) continue;
+      throw error;
+    }
+    await settleDerivedPvpMatch(db, player, settlement);
+  }
+}
+
+async function settlePvpMatchByToken(
+  db: D1DatabaseLike,
+  player: PlayerRow,
+  identity: GameIdentity,
+  token: string,
+  claimed: {
+    result: MatchResult;
+    pvpPlayer?: 0 | 1;
+    format?: MatchFormat;
+  },
+): Promise<RecordMatchResult> {
+  const candidate = await loadPvpCandidateByToken(db, token);
+  const settlement = candidate
+    ? await derivePvpCandidate(db, stableIdentityKey(identity), candidate)
+    : null;
+  const existing = await loadPvpMatchRecord(db, player.id, token);
+  if (existing) {
+    return {
+      player: await loadPublicPlayer(db, player),
+      match: matchRecordFromRow(existing),
+      replayed: true,
+    };
+  }
+  if (!settlement) {
+    throw new GameStoreError("PVP_PROOF_INVALID", "联机对局凭证无效或缺少参赛身份。", 409);
+  }
+  if (claimed.pvpPlayer !== undefined && claimed.pvpPlayer !== settlement.player) {
+    throw new GameStoreError("PVP_PLAYER_MISMATCH", "客户端座位与服务器参赛身份不一致。", 409);
+  }
+  if (claimed.result !== settlement.result) {
+    throw new GameStoreError("PVP_RESULT_MISMATCH", "对局结果与服务器战报不一致。", 409);
+  }
+  if (claimed.format !== undefined && claimed.format !== settlement.format) {
+    throw new GameStoreError("PVP_FORMAT_MISMATCH", "对战模式与服务器房间不一致。", 409);
+  }
+  return settleDerivedPvpMatch(db, player, settlement);
+}
+
+async function settleDerivedPvpMatch(
+  db: D1DatabaseLike,
+  player: PlayerRow,
+  settlement: DerivedPvpSettlement,
+): Promise<RecordMatchResult> {
+  const existing = await loadPvpMatchRecord(db, player.id, settlement.matchToken);
+  if (existing) {
+    return {
+      player: await loadPublicPlayer(db, player),
+      match: matchRecordFromRow(existing),
+      replayed: true,
+    };
+  }
+
+  const digest = await stableId(`${player.id}|${settlement.matchToken}`);
+  const idempotencyKey = `pvp-settle-${digest.slice(0, 32)}`;
+  const match: MatchRecord = {
+    id: `match-${digest.slice(0, 20)}`,
+    result: settlement.result,
+    mode: "pvp",
+    format: settlement.format,
+    opponent: settlement.opponent,
+    rewardGold: settlement.result === "draw"
+      ? 0
+      : settlement.result === "win"
+        ? WIN_REWARD_GOLD
+        : LOSS_REWARD_GOLD,
+    pvpToken: settlement.matchToken,
+    createdAt: settlement.createdAt,
+  };
+
+  try {
+    return await commitMutation(
+      db,
+      player,
+      "record_match",
+      idempotencyKey,
+      {
+        source: "pvp-authoritative-reconciliation",
+        pvpToken: settlement.matchToken,
+        player: settlement.player,
+        result: settlement.result,
+        format: settlement.format,
+      },
+      (current) => ({
+        nextState: {
+          ...current,
+          currencies: {
+            ...current.currencies,
+            gold: current.currencies.gold + match.rewardGold,
+          },
+          stats: {
+            wins: current.stats.wins + (settlement.result === "win" ? 1 : 0),
+            losses: current.stats.losses + (settlement.result === "loss" ? 1 : 0),
+            matchesPlayed: current.stats.matchesPlayed + 1,
+          },
+          tasks: advanceReconciledPvpTasks(
+            current.tasks,
+            current.taskCycle,
+            settlement.result,
+            settlement.createdAt,
+          ),
+          progression: awardXp(current.progression, MATCH_REWARD_XP),
+          taskCycle: current.taskCycle,
+          ladder: settlement.format === "ranked" && current.ladder.seasonKey === utcSeasonKey(settlement.createdAt)
+            ? updateLadder(current.ladder, settlement.result)
+            : current.ladder,
+        },
+        result: { match },
+        match,
+      }),
+    ).then(({ player: nextPlayer, result, replayed }) => ({
+      player: nextPlayer,
+      match: result.match,
+      replayed,
+    }));
+  } catch (error) {
+    // A concurrent login/request can win through the pvp-token unique index
+    // even before this request observes its deterministic audit row.
+    const raced = await loadPvpMatchRecord(db, player.id, settlement.matchToken);
+    if (raced) {
+      return {
+        player: await loadPublicPlayer(db, player),
+        match: matchRecordFromRow(raced),
+        replayed: true,
+      };
+    }
+    throw error;
+  }
+}
+
+async function derivePvpCandidate(
+  db: D1DatabaseLike,
+  identityKey: string,
+  candidate: PvpSettlementCandidateRow,
+): Promise<DerivedPvpSettlement> {
+  let state: { phase?: string; result?: { winner?: number | null; reason?: string } };
+  try {
+    state = JSON.parse(candidate.stateJson) as typeof state;
+  } catch {
+    throw new GameStoreError("PVP_PROOF_INVALID", "联机对局状态无法验证。", 409);
+  }
+  const derived = derivePvpSettlement({
+    identity: identityKey,
+    hostIdentity: candidate.hostIdentity,
+    guestIdentity: candidate.guestIdentity,
+    phase: state.phase,
+    winner: state.result?.winner,
+    reason: state.result?.reason,
+  });
+  if (!derived.ok) {
+    switch (derived.reason) {
+      case "ambiguous-participant":
+        throw new GameStoreError("PVP_PARTICIPANT_AMBIGUOUS", "联机对局的双方身份不能相同。", 409);
+      case "not-participant":
+        throw new GameStoreError("PVP_OWNER_MISMATCH", "该对局不属于当前玩家身份。", 403);
+      case "not-finished":
+        throw new GameStoreError("PVP_NOT_FINISHED", "联机对局尚未结束。", 409);
+      case "invalid-result":
+        throw new GameStoreError("PVP_PROOF_INVALID", "联机对局结算状态无法验证。", 409);
+    }
+  }
+
+  const opponentRow = await db
+    .prepare("SELECT display_name AS displayName FROM players WHERE identity_key = ? LIMIT 1")
+    .bind(derived.opponentIdentity)
+    .first<{ displayName: string }>();
+  return {
+    matchToken: candidate.matchToken,
+    player: derived.player,
+    result: derived.result,
+    format: candidate.format === "casual" ? "casual" : "ranked",
+    opponentIdentity: derived.opponentIdentity,
+    opponent: opponentRow?.displayName?.trim() || "联机对手",
+    createdAt: pvpTimestampToIso(candidate.updatedAt),
+  };
+}
+
+async function loadUnsettledPvpCandidates(
+  db: D1DatabaseLike,
+  playerId: string,
+  identityKey: string,
+): Promise<PvpSettlementCandidateRow[]> {
+  const [current, archived] = await Promise.all([
+    loadPvpCandidatesFrom(db, "pvp_matches", playerId, identityKey),
+    loadPvpCandidatesFrom(db, "pvp_match_archives", playerId, identityKey),
+  ]);
+  const candidates = new Map<string, PvpSettlementCandidateRow>();
+  for (const row of current) candidates.set(row.matchToken, row);
+  // Archives are immutable terminal snapshots and take precedence when a
+  // current-room row for the same token still exists during cleanup.
+  for (const row of archived) candidates.set(row.matchToken, row);
+  return [...candidates.values()].sort((left, right) => {
+    const time = pvpTimestampToMillis(left.updatedAt) - pvpTimestampToMillis(right.updatedAt);
+    return time || left.matchToken.localeCompare(right.matchToken);
+  }).slice(0, MAX_PVP_RECONCILIATIONS_PER_REQUEST);
+}
+
+async function loadPvpCandidatesFrom(
+  db: D1DatabaseLike,
+  table: "pvp_matches" | "pvp_match_archives",
+  playerId: string,
+  identityKey: string,
+): Promise<PvpSettlementCandidateRow[]> {
+  const rows = await db
+    .prepare(
+      `SELECT snapshot.match_token AS matchToken,
+              snapshot.state_json AS stateJson,
+              snapshot.format,
+              snapshot.created_at AS createdAt,
+              snapshot.updated_at AS updatedAt,
+              participants.host_identity AS hostIdentity,
+              participants.guest_identity AS guestIdentity
+       FROM ${table} snapshot
+       JOIN pvp_match_participants participants
+         ON participants.match_token = snapshot.match_token
+       WHERE (participants.host_identity = ? OR participants.guest_identity = ?)
+         AND participants.host_identity <> participants.guest_identity
+         AND CASE WHEN json_valid(snapshot.state_json) THEN
+           json_extract(snapshot.state_json, '$.phase') = 'game-over'
+           AND (
+             json_extract(snapshot.state_json, '$.result.winner') IN (0, 1)
+             OR (
+               json_type(snapshot.state_json, '$.result.winner') = 'null'
+               AND json_extract(snapshot.state_json, '$.result.reason') = 'draw'
+             )
+           )
+         ELSE 0 END
+         AND NOT EXISTS (
+           SELECT 1 FROM match_records settled
+           WHERE settled.player_id = ?
+             AND settled.pvp_token = snapshot.match_token
+         )
+       ORDER BY snapshot.updated_at ASC, snapshot.match_token ASC
+       LIMIT ?`,
+    )
+    .bind(identityKey, identityKey, playerId, MAX_PVP_RECONCILIATIONS_PER_REQUEST)
+    .all<PvpSettlementCandidateRow>();
+  return rows.results;
+}
+
+async function loadPvpCandidateByToken(
+  db: D1DatabaseLike,
+  token: string,
+): Promise<PvpSettlementCandidateRow | null> {
+  for (const table of ["pvp_match_archives", "pvp_matches"] as const) {
+    const row = await db
+      .prepare(
+        `SELECT snapshot.match_token AS matchToken,
+                snapshot.state_json AS stateJson,
+                snapshot.format,
+                snapshot.created_at AS createdAt,
+                snapshot.updated_at AS updatedAt,
+                participants.host_identity AS hostIdentity,
+                participants.guest_identity AS guestIdentity
+         FROM ${table} snapshot
+         JOIN pvp_match_participants participants
+           ON participants.match_token = snapshot.match_token
+         WHERE snapshot.match_token = ?
+         LIMIT 1`,
+      )
+      .bind(token)
+      .first<PvpSettlementCandidateRow>();
+    if (row) return row;
+  }
+  return null;
+}
+
+async function loadPvpMatchRecord(
+  db: D1DatabaseLike,
+  playerId: string,
+  token: string,
+): Promise<MatchRow | null> {
+  return db
+    .prepare(
+      `SELECT id, result, mode, opponent, reward_gold AS rewardGold,
+              pvp_token AS pvpToken, format, created_at AS createdAt
+       FROM match_records
+       WHERE player_id = ? AND pvp_token = ?
+       LIMIT 1`,
+    )
+    .bind(playerId, token)
+    .first<MatchRow>();
+}
+
+function matchRecordFromRow(row: MatchRow): MatchRecord {
+  return {
+    id: row.id,
+    result: row.result,
+    mode: row.mode,
+    ...(row.mode === "pvp" ? { format: row.format === "casual" ? "casual" : "ranked" } : {}),
+    opponent: row.opponent,
+    rewardGold: row.rewardGold,
+    ...(row.pvpToken ? { pvpToken: row.pvpToken } : {}),
+    createdAt: row.createdAt,
+  };
+}
+
+function stableIdentityKey(identity: GameIdentity): string {
+  return identity.identityKey?.trim() || `email:${identity.email.trim().toLowerCase()}`;
+}
+
+function pvpTimestampToMillis(value: number | string): number {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric < 10_000_000_000 ? numeric * 1_000 : numeric;
+  }
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function pvpTimestampToIso(value: number | string): string {
+  const timestamp = pvpTimestampToMillis(value);
+  return timestamp > 0 ? new Date(timestamp).toISOString() : new Date().toISOString();
+}
+
 export async function recordMatch(
   identity: GameIdentity,
   input: {
@@ -1159,56 +1696,54 @@ export async function recordMatch(
   const db = getD1();
   await ensureSchema(db);
   const player = await ensurePlayer(db, identity);
-  let verifiedFormat: MatchFormat = "ranked";
+  await reconcilePvpSettlements(
+    db,
+    player,
+    identity,
+    input.mode === "pvp" ? input.pvpToken : undefined,
+  );
+  // Idempotent retries must replay before checking one-use credentials: after
+  // a successful settlement the ticket is intentionally already consumed.
+  const existingAudit = await findAudit(db, player.id, input.idempotencyKey);
+  if (existingAudit) {
+    const replay = await replayAudit<{ match: MatchRecord }>(
+      db,
+      player,
+      "record_match",
+      existingAudit,
+    );
+    return {
+      player: replay.player,
+      match: replay.result.match,
+      replayed: true,
+    };
+  }
   if (input.mode === "pvp") {
-    if (!input.pvpToken || input.pvpPlayer === undefined) {
+    if (!input.pvpToken) {
       throw new GameStoreError("PVP_PROOF_REQUIRED", "联机对局缺少服务器凭证。", 400);
     }
-    const row = await db
-      .prepare("SELECT match_token AS matchToken, state_json AS stateJson, format FROM pvp_matches WHERE match_token = ?")
-      .bind(input.pvpToken)
-      .first<PvpMatchRow>();
-    if (!row) {
-      throw new GameStoreError("PVP_PROOF_INVALID", "联机对局凭证无效或已过期。", 409);
-    }
-    verifiedFormat = row.format === "casual" ? "casual" : "ranked";
-    if (input.format !== undefined && input.format !== verifiedFormat) {
-      throw new GameStoreError("PVP_FORMAT_MISMATCH", "对战模式与服务器房间不一致。", 409);
-    }
-    let state: { phase?: string; result?: { winner?: number | null } };
-    try {
-      state = JSON.parse(row.stateJson) as typeof state;
-    } catch {
-      throw new GameStoreError("PVP_PROOF_INVALID", "联机对局状态无法验证。", 409);
-    }
-    const winner = state.phase === "game-over" ? state.result?.winner : null;
-    if (winner !== 0 && winner !== 1) {
-      throw new GameStoreError("PVP_NOT_FINISHED", "联机对局尚未结束。", 409);
-    }
-    const expectedResult: MatchResult = winner === input.pvpPlayer ? "win" : "loss";
-    if (input.result !== expectedResult) {
-      throw new GameStoreError("PVP_RESULT_MISMATCH", "对局结果与服务器战报不一致。", 409);
-    }
-    const participant = await db
-      .prepare("SELECT host_identity AS hostIdentity, guest_identity AS guestIdentity FROM pvp_match_participants WHERE match_token = ?")
-      .bind(input.pvpToken)
-      .first<PvpParticipantRow>();
-    const participantIdentity = input.pvpPlayer === 0
-      ? participant?.hostIdentity
-      : participant?.guestIdentity;
-    if (!participantIdentity || !identity.identityKey || participantIdentity !== identity.identityKey) {
-      throw new GameStoreError("PVP_OWNER_MISMATCH", "该对局不属于当前玩家身份。", 403);
-    }
-    const settled = await db
-      .prepare("SELECT id FROM match_records WHERE player_id = ? AND pvp_token = ? LIMIT 1")
-      .bind(player.id, input.pvpToken)
-      .first<{ id: string }>();
-    if (settled) {
-      throw new GameStoreError("PVP_ALREADY_SETTLED", "该联机对局已经结算过。", 409);
-    }
+    return settlePvpMatchByToken(db, player, identity, input.pvpToken, {
+      result: input.result,
+      pvpPlayer: input.pvpPlayer,
+      format: input.format,
+    });
   }
-  if (input.mode === "ai" && !input.aiProof) {
+  if (!input.aiProof) {
     throw new GameStoreError("AI_PROOF_REQUIRED", "AI 对局缺少服务端重放凭证。", 400);
+  }
+  const verifiedAiTicket = await loadAiTicket(db, input.aiProof.ticketToken);
+  if (!verifiedAiTicket || verifiedAiTicket.playerId !== player.id) {
+    throw new GameStoreError("AI_TICKET_INVALID", "AI 对局凭证无效。", 409);
+  }
+  if (verifiedAiTicket.consumedAt) {
+    throw new GameStoreError("AI_TICKET_CONSUMED", "该 AI 对局已经结算。", 409);
+  }
+  if (verifiedAiTicket.expiresAt <= new Date().toISOString()) {
+    throw new GameStoreError("AI_TICKET_EXPIRED", "AI 对局凭证已过期，请重新开始对局。", 409);
+  }
+  const ticket = parseAiMatchTicketRow(verifiedAiTicket);
+  if (!aiMatchTicketMatchesProof(ticket, input.aiProof)) {
+    throw new GameStoreError("AI_TICKET_MISMATCH", "AI 对局参数与服务端凭证不一致。", 409);
   }
   const matchId = `match-${(await stableId(`${player.id}|${input.idempotencyKey}`)).slice(0, 20)}`;
   const matchCreatedAt = new Date().toISOString();
@@ -1228,27 +1763,22 @@ export async function recordMatch(
       ...(input.aiProof ? { aiProof: input.aiProof } : {}),
     },
     (current) => {
-      if (input.mode === "ai") {
-        const verifiedResult = verifyAiMatchProof(current, input.aiProof as AiMatchProof);
-        if (verifiedResult !== input.result) {
-          throw new GameStoreError("AI_RESULT_MISMATCH", "对局结果与服务端重放结果不一致。", 409);
-        }
+      const verifiedResult = verifyAiMatchProof(input.aiProof as AiMatchProof, ticket);
+      if (verifiedResult !== input.result) {
+        throw new GameStoreError("AI_RESULT_MISMATCH", "对局结果与服务端重放结果不一致。", 409);
       }
-      const aiRewardEligible = input.mode !== "ai" || current.taskCycle.aiRewardsToday < DAILY_AI_REWARD_LIMIT;
-      const rewardGold = aiRewardEligible
-        ? input.result === "win" ? WIN_REWARD_GOLD : LOSS_REWARD_GOLD
-        : 0;
-      const matchFormat: MatchFormat | undefined = input.mode === "pvp"
-        ? (input.format ?? verifiedFormat)
-        : undefined;
+      const aiRewardEligible = current.taskCycle.aiRewardsToday < DAILY_AI_REWARD_LIMIT;
+      const rewardGold = input.result === "draw"
+        ? 0
+        : aiRewardEligible
+          ? input.result === "win" ? WIN_REWARD_GOLD : LOSS_REWARD_GOLD
+          : 0;
       const match: MatchRecord = {
         id: matchId,
         result: input.result,
-        mode: input.mode,
-        ...(matchFormat ? { format: matchFormat } : {}),
-        opponent: input.opponent,
+        mode: "ai",
+        opponent: AI_ARCHETYPES.find((candidate) => candidate.id === input.aiProof?.opponentArchetypeId)?.name ?? input.opponent,
         rewardGold,
-        ...(input.pvpToken ? { pvpToken: input.pvpToken } : {}),
         createdAt: matchCreatedAt,
       };
       const nextState: StoredPlayerState = {
@@ -1266,17 +1796,24 @@ export async function recordMatch(
         progression: aiRewardEligible ? awardXp(current.progression, MATCH_REWARD_XP) : current.progression,
         taskCycle: {
           ...current.taskCycle,
-          aiRewardsToday: input.mode === "ai"
-            ? Math.min(DAILY_AI_REWARD_LIMIT, current.taskCycle.aiRewardsToday + 1)
-            : current.taskCycle.aiRewardsToday,
+          aiRewardsToday: Math.min(DAILY_AI_REWARD_LIMIT, current.taskCycle.aiRewardsToday + 1),
         },
-        ladder: input.mode === "pvp" && matchFormat === "ranked" ? updateLadder(current.ladder, input.result) : current.ladder,
+        ladder: current.ladder,
       };
       return {
         nextState,
         result: { match },
         match,
       };
+    },
+    {
+      aiTicket: {
+        token: verifiedAiTicket.token,
+        seed: verifiedAiTicket.seed,
+        startingPlayer: verifiedAiTicket.startingPlayer as 0 | 1,
+        opponentArchetypeId: verifiedAiTicket.opponentArchetypeId,
+        deckJson: verifiedAiTicket.deckJson,
+      },
     },
   ).then(({ player: nextPlayer, result, replayed }) => ({
     player: nextPlayer,
@@ -1308,6 +1845,9 @@ export async function resetDemoPlayer(
       .prepare("DELETE FROM match_records WHERE player_id = ?")
       .bind(player.id),
     db
+      .prepare("DELETE FROM ai_match_tickets WHERE player_id = ?")
+      .bind(player.id),
+    db
       .prepare("DELETE FROM audit_events WHERE player_id = ?")
       .bind(player.id),
     db
@@ -1336,6 +1876,7 @@ async function commitMutation<T extends Record<string, unknown>>(
   idempotencyKey: string,
   payload: Record<string, unknown>,
   mutate: (current: StoredPlayerState) => MutationOutput<T>,
+  options?: { aiTicket?: AiTicketConsumption },
 ): Promise<{ player: PlayerState; result: T; replayed: boolean }> {
   const existing = await findAudit(db, player.id, idempotencyKey);
   if (existing) {
@@ -1355,15 +1896,42 @@ async function commitMutation<T extends Record<string, unknown>>(
     const resultJson = JSON.stringify(result);
     const now = new Date().toISOString();
     const nextVersion = row.version + 1;
+    const aiTicket = options?.aiTicket;
+    const aiTicketGuard = aiTicket
+      ? ` AND EXISTS (
+             SELECT 1 FROM ai_match_tickets
+             WHERE token = ? AND player_id = ? AND active_slot = 1
+               AND consumed_at IS NULL AND expires_at > ?
+               AND seed = ? AND starting_player = ?
+               AND opponent_archetype_id = ? AND deck_json = ?
+           )`
+      : "";
 
     const statements = [
       db
         .prepare(
           `UPDATE player_states
            SET state_json = ?, version = ?, updated_at = ?
-           WHERE player_id = ? AND version = ?`,
+           WHERE player_id = ? AND version = ?${aiTicketGuard}`,
         )
-        .bind(nextStateJson, nextVersion, now, player.id, row.version),
+        .bind(
+          nextStateJson,
+          nextVersion,
+          now,
+          player.id,
+          row.version,
+          ...(aiTicket
+            ? [
+                aiTicket.token,
+                player.id,
+                now,
+                aiTicket.seed,
+                aiTicket.startingPlayer,
+                aiTicket.opponentArchetypeId,
+                aiTicket.deckJson,
+              ]
+            : []),
+        ),
       db
         .prepare(
           `INSERT INTO audit_events
@@ -1409,8 +1977,35 @@ async function commitMutation<T extends Record<string, unknown>>(
             match.mode,
             match.opponent,
             match.rewardGold,
-            match.format ?? null,
+            match.format ?? "ranked",
             match.createdAt,
+            auditId,
+          ),
+      );
+    }
+
+    if (aiTicket) {
+      statements.push(
+        db
+          .prepare(
+            `UPDATE ai_match_tickets
+             SET consumed_at = ?, consumed_by_idempotency_key = ?, active_slot = NULL
+             WHERE token = ? AND player_id = ? AND active_slot = 1
+               AND consumed_at IS NULL AND expires_at > ?
+               AND seed = ? AND starting_player = ?
+               AND opponent_archetype_id = ? AND deck_json = ?
+               AND EXISTS (SELECT 1 FROM audit_events WHERE id = ?)`,
+          )
+          .bind(
+            now,
+            idempotencyKey,
+            aiTicket.token,
+            player.id,
+            now,
+            aiTicket.seed,
+            aiTicket.startingPlayer,
+            aiTicket.opponentArchetypeId,
+            aiTicket.deckJson,
             auditId,
           ),
       );
@@ -1431,6 +2026,9 @@ async function commitMutation<T extends Record<string, unknown>>(
       if (replay) {
         return replayAudit<T>(db, player, action, replay);
       }
+      if (aiTicket) {
+        await assertAiTicketStillConsumable(db, player.id, aiTicket.token, now);
+      }
       if (attempt === MAX_MUTATION_ATTEMPTS - 1) throw error;
       continue;
     }
@@ -1438,6 +2036,9 @@ async function commitMutation<T extends Record<string, unknown>>(
     const replay = await findAudit(db, player.id, idempotencyKey);
     if (replay) {
       return replayAudit<T>(db, player, action, replay);
+    }
+    if (aiTicket) {
+      await assertAiTicketStillConsumable(db, player.id, aiTicket.token, now);
     }
   }
 
@@ -1494,6 +2095,90 @@ async function findAudit(
     )
     .bind(playerId, idempotencyKey)
     .first<AuditRow>();
+}
+
+async function loadActiveAiTicket(
+  db: D1DatabaseLike,
+  playerId: string,
+): Promise<AiMatchTicketRow | null> {
+  return db
+    .prepare(
+      `SELECT token, player_id AS playerId, deck_id AS deckId,
+              deck_json AS deckJson, opponent_archetype_id AS opponentArchetypeId,
+              seed, starting_player AS startingPlayer, expires_at AS expiresAt,
+              consumed_at AS consumedAt,
+              consumed_by_idempotency_key AS consumedByIdempotencyKey
+       FROM ai_match_tickets
+       WHERE player_id = ? AND active_slot = 1 AND consumed_at IS NULL
+       LIMIT 1`,
+    )
+    .bind(playerId)
+    .first<AiMatchTicketRow>();
+}
+
+async function loadAiTicket(
+  db: D1DatabaseLike,
+  token: string,
+): Promise<AiMatchTicketRow | null> {
+  return db
+    .prepare(
+      `SELECT token, player_id AS playerId, deck_id AS deckId,
+              deck_json AS deckJson, opponent_archetype_id AS opponentArchetypeId,
+              seed, starting_player AS startingPlayer, expires_at AS expiresAt,
+              consumed_at AS consumedAt,
+              consumed_by_idempotency_key AS consumedByIdempotencyKey
+       FROM ai_match_tickets
+       WHERE token = ?
+       LIMIT 1`,
+    )
+    .bind(token)
+    .first<AiMatchTicketRow>();
+}
+
+function parseAiMatchTicketRow(row: AiMatchTicketRow): AiMatchTicket {
+  let playerDeck: unknown;
+  try {
+    playerDeck = JSON.parse(row.deckJson);
+  } catch {
+    throw new GameStoreError("AI_TICKET_CORRUPT", "AI 对局凭证无法读取。", 500);
+  }
+  if (
+    !Array.isArray(playerDeck) ||
+    playerDeck.length !== 30 ||
+    !playerDeck.every((cardId) => typeof cardId === "string") ||
+    !Number.isSafeInteger(row.seed) ||
+    row.seed < 0 ||
+    row.seed > 0x7fffffff ||
+    (row.startingPlayer !== 0 && row.startingPlayer !== 1)
+  ) {
+    throw new GameStoreError("AI_TICKET_CORRUPT", "AI 对局凭证参数损坏。", 500);
+  }
+  return {
+    token: row.token,
+    seed: row.seed,
+    startingPlayer: row.startingPlayer,
+    playerDeck,
+    opponentArchetypeId: row.opponentArchetypeId,
+    expiresAt: row.expiresAt,
+  };
+}
+
+async function assertAiTicketStillConsumable(
+  db: D1DatabaseLike,
+  playerId: string,
+  token: string,
+  now: string,
+): Promise<void> {
+  const ticket = await loadAiTicket(db, token);
+  if (!ticket || ticket.playerId !== playerId) {
+    throw new GameStoreError("AI_TICKET_INVALID", "AI 对局凭证无效。", 409);
+  }
+  if (ticket.consumedAt) {
+    throw new GameStoreError("AI_TICKET_CONSUMED", "该 AI 对局已经结算。", 409);
+  }
+  if (ticket.expiresAt <= now) {
+    throw new GameStoreError("AI_TICKET_EXPIRED", "AI 对局凭证已过期，请重新开始对局。", 409);
+  }
 }
 
 async function ensurePlayer(
@@ -1872,7 +2557,7 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
           REFERENCES players(id) ON DELETE CASCADE,
         idempotency_key TEXT NOT NULL,
         pvp_token TEXT,
-        result TEXT NOT NULL CHECK (result IN ('win', 'loss')),
+        result TEXT NOT NULL CHECK (result IN ('win', 'loss', 'draw')),
         mode TEXT NOT NULL CHECK (mode IN ('ai', 'pvp')),
         opponent TEXT NOT NULL,
         reward_gold INTEGER NOT NULL,
@@ -1908,6 +2593,34 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
       `CREATE INDEX IF NOT EXISTS audit_events_player_created_idx
        ON audit_events (player_id, created_at)`,
     ),
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS ai_match_tickets (
+        token TEXT PRIMARY KEY NOT NULL,
+        player_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        deck_id TEXT NOT NULL,
+        deck_json TEXT NOT NULL,
+        opponent_archetype_id TEXT NOT NULL,
+        seed INTEGER NOT NULL,
+        starting_player INTEGER NOT NULL CHECK (starting_player IN (0, 1)),
+        active_slot INTEGER CHECK (active_slot IS NULL OR active_slot = 1),
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        consumed_by_idempotency_key TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+    ),
+    db.prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS ai_match_tickets_player_active_uidx
+       ON ai_match_tickets (player_id, active_slot)`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS ai_match_tickets_player_created_idx
+       ON ai_match_tickets (player_id, created_at)`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS ai_match_tickets_expires_idx
+       ON ai_match_tickets (expires_at)`,
+    ),
     // Social graph: one canonical row per pair keeps friend requests,
     // accepts and retries deterministic across devices.
     db.prepare(
@@ -1929,6 +2642,10 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
       `CREATE INDEX IF NOT EXISTS friend_links_player_b_idx ON friend_links (player_b, status)`,
     ),
     db.prepare(
+      `CREATE INDEX IF NOT EXISTS friend_links_requested_created_idx
+       ON friend_links (requested_by, created_at)`,
+    ),
+    db.prepare(
       `CREATE TABLE IF NOT EXISTS social_messages (
         id TEXT PRIMARY KEY NOT NULL,
         sender_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
@@ -1940,6 +2657,10 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
     db.prepare(
       `CREATE INDEX IF NOT EXISTS social_messages_pair_idx
        ON social_messages (sender_id, recipient_id, created_at)`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS social_messages_sender_created_idx
+       ON social_messages (sender_id, created_at)`,
     ),
     db.prepare(
       `CREATE TABLE IF NOT EXISTS social_blocks (
@@ -1971,6 +2692,7 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
         room_code TEXT PRIMARY KEY NOT NULL,
         match_token TEXT NOT NULL,
         state_json TEXT NOT NULL,
+        format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       )`,
@@ -1978,6 +2700,15 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
     db.prepare(
       `CREATE UNIQUE INDEX IF NOT EXISTS pvp_matches_token_uidx
        ON pvp_matches (match_token)`,
+    ),
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS pvp_match_archives (
+        match_token TEXT PRIMARY KEY NOT NULL,
+        state_json TEXT NOT NULL,
+        format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      )`,
     ),
     db.prepare(
       `CREATE TABLE IF NOT EXISTS pvp_match_participants (
@@ -1991,6 +2722,14 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
     db.prepare(
       `CREATE INDEX IF NOT EXISTS pvp_match_participants_created_idx
        ON pvp_match_participants (created_at)`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS pvp_match_participants_host_identity_idx
+       ON pvp_match_participants (host_identity, created_at)`,
+    ),
+    db.prepare(
+      `CREATE INDEX IF NOT EXISTS pvp_match_participants_guest_identity_idx
+       ON pvp_match_participants (guest_identity, created_at)`,
     ),
   ]);
 
@@ -2017,6 +2756,12 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
   } catch {
     // Column already exists on new installations or a previous migration.
   }
+  try {
+    await db.prepare("ALTER TABLE pvp_matches ADD COLUMN format TEXT NOT NULL DEFAULT 'ranked'").run();
+  } catch {
+    // Column already exists on new installations or a previous migration.
+  }
+  await migrateMatchRecordsForDraw(db);
   await db.prepare(
     `CREATE UNIQUE INDEX IF NOT EXISTS match_records_player_pvp_token_uidx
        ON match_records (player_id, pvp_token)
@@ -2026,6 +2771,57 @@ async function initializeSchema(db: D1DatabaseLike): Promise<void> {
   // previous request before the migration batch above ran.
   await db.prepare(`DROP INDEX IF EXISTS players_email_uidx`).run();
   await db.prepare(`CREATE INDEX IF NOT EXISTS players_email_idx ON players (email)`).run();
+}
+
+async function migrateMatchRecordsForDraw(db: D1DatabaseLike): Promise<void> {
+  const table = await db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'match_records' LIMIT 1")
+    .first<{ sql?: string | null }>();
+  if (table?.sql?.toLowerCase().includes("'draw'")) return;
+
+  // SQLite cannot alter a CHECK constraint in place. Rebuild just this table,
+  // retaining every archived match and then restoring its indexes.
+  await db.batch([
+    db.prepare("DROP INDEX IF EXISTS match_records_player_idempotency_uidx"),
+    db.prepare("DROP INDEX IF EXISTS match_records_player_created_idx"),
+    db.prepare("DROP INDEX IF EXISTS match_records_player_pvp_token_uidx"),
+    db.prepare("ALTER TABLE match_records RENAME TO match_records_draw_legacy"),
+    db.prepare(
+      `CREATE TABLE match_records (
+        id TEXT PRIMARY KEY NOT NULL,
+        player_id TEXT NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+        idempotency_key TEXT NOT NULL,
+        pvp_token TEXT,
+        result TEXT NOT NULL CHECK (result IN ('win', 'loss', 'draw')),
+        mode TEXT NOT NULL CHECK (mode IN ('ai', 'pvp')),
+        opponent TEXT NOT NULL,
+        reward_gold INTEGER NOT NULL,
+        format TEXT NOT NULL DEFAULT 'ranked' CHECK (format IN ('ranked', 'casual')),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`,
+    ),
+    db.prepare(
+      `INSERT INTO match_records
+         (id, player_id, idempotency_key, pvp_token, result, mode, opponent, reward_gold, format, created_at)
+       SELECT id, player_id, idempotency_key, pvp_token, result, mode, opponent,
+              reward_gold, COALESCE(format, 'ranked'), created_at
+       FROM match_records_draw_legacy`,
+    ),
+    db.prepare("DROP TABLE match_records_draw_legacy"),
+    db.prepare(
+      `CREATE UNIQUE INDEX match_records_player_idempotency_uidx
+       ON match_records (player_id, idempotency_key)`,
+    ),
+    db.prepare(
+      `CREATE INDEX match_records_player_created_idx
+       ON match_records (player_id, created_at)`,
+    ),
+    db.prepare(
+      `CREATE UNIQUE INDEX match_records_player_pvp_token_uidx
+       ON match_records (player_id, pvp_token)
+       WHERE pvp_token IS NOT NULL`,
+    ),
+  ]);
 }
 
 function createDefaultState(now: string): StoredPlayerState {
@@ -2109,7 +2905,7 @@ function createDefaultState(now: string): StoredPlayerState {
     },
     progression: { xp: 0, level: 1 },
     rewardTrack: { claimedLevels: [] },
-    ladder: { seasonKey: utcSeasonKey(now), rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0, highestRating: 1000 },
+    ladder: { seasonKey: utcSeasonKey(now), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 },
     stats: {
       wins: 0,
       losses: 0,
@@ -2201,16 +2997,19 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
   const ladder = isRecord(value.ladder)
     ? {
         seasonKey: typeof value.ladder.seasonKey === "string" ? value.ladder.seasonKey : utcSeasonKey(new Date().toISOString()),
-        rating: isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : 1000,
-        tier: typeof value.ladder.tier === "string" ? value.ladder.tier : "青铜",
-        stars: isFiniteNonNegativeInteger(value.ladder.stars) ? value.ladder.stars : 0,
+        rating: isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : LADDER_START_RATING,
+        tier: typeof value.ladder.tier === "string" ? value.ladder.tier : ladderTierForRating(LADDER_START_RATING),
+        stars: isFiniteNonNegativeInteger(value.ladder.stars) ? value.ladder.stars : ladderStarsForRating(LADDER_START_RATING),
         wins: isFiniteNonNegativeInteger(value.ladder.wins) ? value.ladder.wins : 0,
         losses: isFiniteNonNegativeInteger(value.ladder.losses) ? value.ladder.losses : 0,
         highestRating: isFiniteNonNegativeInteger(value.ladder.highestRating)
           ? value.ladder.highestRating
-          : (isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : 1000),
+          : (isFiniteNonNegativeInteger(value.ladder.rating) ? value.ladder.rating : LADDER_START_RATING),
+        winStreak: isFiniteNonNegativeInteger(value.ladder.winStreak) ? value.ladder.winStreak : 0,
       }
-    : { seasonKey: utcSeasonKey(new Date().toISOString()), rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0, highestRating: 1000 };
+    : { seasonKey: utcSeasonKey(new Date().toISOString()), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 };
+  ladder.tier = ladderTierForRating(ladder.rating);
+  ladder.stars = ladderStarsForRating(ladder.rating);
   return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, ladder } as StoredPlayerState;
 }
 
@@ -2285,7 +3084,8 @@ function isLadder(value: unknown): value is PlayerLadder {
     isFiniteNonNegativeInteger(value.stars) &&
     isFiniteNonNegativeInteger(value.wins) &&
     isFiniteNonNegativeInteger(value.losses) &&
-    isFiniteNonNegativeInteger(value.highestRating)
+    isFiniteNonNegativeInteger(value.highestRating) &&
+    (value.winStreak === undefined || isFiniteNonNegativeInteger(value.winStreak))
   );
 }
 
@@ -2370,26 +3170,47 @@ function awardXp(progression: PlayerProgression, amount: number): PlayerProgress
 }
 
 function updateLadder(ladder: PlayerLadder, result: MatchResult): PlayerLadder {
-  const rating = Math.max(0, ladder.rating + (result === "win" ? 25 : -20));
-  const tier = rating >= 1800 ? "传说" : rating >= 1600 ? "钻石" : rating >= 1400 ? "白金" : rating >= 1200 ? "黄金" : rating >= 1000 ? "白银" : "青铜";
-  return {
-    seasonKey: ladder.seasonKey,
-    rating,
-    tier,
-    stars: Math.floor((rating % 200) / 50),
-    wins: ladder.wins + (result === "win" ? 1 : 0),
-    losses: ladder.losses + (result === "loss" ? 1 : 0),
-    highestRating: Math.max(ladder.highestRating, rating),
-  };
+  return updateRankedSnapshot(ladder, result);
 }
 
 function advanceMatchTasks(
   tasks: PlayerTask[],
   result: MatchResult,
 ): PlayerTask[] {
-  let next = advanceTasksMatching(tasks, (task) => task.description.includes("对战"), 1);
+  let next = advanceTasksMatching(
+    tasks,
+    (task) => task.description.includes("对战") && !task.description.includes("赢得"),
+    1,
+  );
   if (result === "win") {
     next = advanceTasksMatching(next, (task) => task.description.includes("赢得"), 1);
+  }
+  return next;
+}
+
+function advanceReconciledPvpTasks(
+  tasks: PlayerTask[],
+  cycle: TaskCycle,
+  result: MatchResult,
+  matchCreatedAt: string,
+): PlayerTask[] {
+  const eligiblePeriods = new Set<PlayerTask["period"]>();
+  if (cycle.dayKey === utcDayKey(matchCreatedAt)) eligiblePeriods.add("daily");
+  if (cycle.weekKey === utcWeekKey(matchCreatedAt)) eligiblePeriods.add("weekly");
+  let next = advanceTasksMatching(
+    tasks,
+    (task) =>
+      eligiblePeriods.has(task.period) &&
+      task.description.includes("对战") &&
+      !task.description.includes("赢得"),
+    1,
+  );
+  if (result === "win") {
+    next = advanceTasksMatching(
+      next,
+      (task) => eligiblePeriods.has(task.period) && task.description.includes("赢得"),
+      1,
+    );
   }
   return next;
 }
@@ -2437,7 +3258,7 @@ function refreshTaskCycle(state: StoredPlayerState, now: string): StoredPlayerSt
       weeklyFreePackClaimed: weekChanged || firstLoad ? false : state.taskCycle.weeklyFreePackClaimed,
     },
     ladder: seasonChanged || firstLoad
-      ? { ...state.ladder, seasonKey, rating: 1000, tier: "青铜", stars: 0, wins: 0, losses: 0 }
+      ? { ...state.ladder, seasonKey, rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, winStreak: 0 }
       : state.ladder,
   };
 }
@@ -2566,20 +3387,41 @@ function assertCardsOwned(
 }
 
 function verifyAiMatchProof(
-  current: StoredPlayerState,
   proof: AiMatchProof,
+  ticket: AiMatchTicket,
+): MatchResult {
+  try {
+    return replayAiMatchProof(proof, ticket);
+  } catch (error) {
+    if (error instanceof GameStoreError && error.code === "AI_PROOF_INVALID") {
+      throw error;
+    }
+    // Deck ownership checks, malformed runtime values, and engine failures are
+    // all failures of the untrusted proof. Do not leak a different error code
+    // that callers could mistake for a valid match or account mutation error.
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局重放凭证无法验证。", 409);
+  }
+}
+
+function replayAiMatchProof(
+  proof: AiMatchProof,
+  ticket: AiMatchTicket,
 ): MatchResult {
   if (
+    typeof proof.ticketToken !== "string" ||
     !Number.isSafeInteger(proof.seed) ||
     proof.seed < 0 ||
     !Array.isArray(proof.playerDeck) ||
     proof.playerDeck.length !== 30 ||
     !Array.isArray(proof.commands) ||
     proof.commands.length === 0 ||
-    proof.commands.length > 400 ||
+    proof.commands.length > MAX_AI_PROOF_COMMANDS ||
     (proof.startingPlayer !== 0 && proof.startingPlayer !== 1)
   ) {
     throw new GameStoreError("AI_PROOF_INVALID", "AI 对局重放凭证格式无效。", 409);
+  }
+  if (!aiMatchTicketMatchesProof(ticket, proof)) {
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局参数与服务端签发凭证不一致。", 409);
   }
   const archetype = AI_ARCHETYPES.find((candidate) => candidate.id === proof.opponentArchetypeId);
   if (!archetype) {
@@ -2589,13 +3431,6 @@ function verifyAiMatchProof(
   if (!deckValidation.valid) {
     throw new GameStoreError("AI_PROOF_INVALID", "AI 对局使用了无效玩家卡组。", 409, deckValidation.errors);
   }
-  assertCardsOwned(proof.playerDeck, current.collection);
-  const savedDeckMatches = current.decks.some(
-    (deck) => deck.cardIds.length === proof.playerDeck.length && deck.cardIds.every((cardId, index) => cardId === proof.playerDeck[index]),
-  );
-  if (!savedDeckMatches) {
-    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局卡组不是当前账号已保存卡组。", 409);
-  }
 
   let state = createMatch({
     seed: proof.seed,
@@ -2603,21 +3438,178 @@ function verifyAiMatchProof(
     decks: [proof.playerDeck, [...archetype.deck]],
   });
   const commandIds = new Set<string>();
-  for (const command of proof.commands) {
-    if (!isRecord(command) || (typeof command.commandId === "string" && commandIds.has(command.commandId))) {
-      throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令序列包含重复或无效命令。", 409);
+  let commandIndex = 0;
+
+  while (commandIndex < proof.commands.length) {
+    if (aiMustAct(state)) {
+      const required = generateRequiredAiCommands(state);
+      if (required.commands.length === 0) {
+        throw new GameStoreError("AI_PROOF_INVALID", "服务端无法生成 AI 的确定性行动。", 409);
+      }
+      for (const expectedCommand of required.commands) {
+        const actualCommand = proof.commands[commandIndex];
+        assertProofCommandEnvelope(actualCommand, commandIds);
+        if (!proofCommandsMatch(actualCommand, expectedCommand)) {
+          throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令与服务端策略不一致。", 409);
+        }
+        commandIndex += 1;
+      }
+      // Advance with the server-generated commands, never the client copies.
+      state = required.state;
+      continue;
     }
-    if (typeof command.commandId === "string") commandIds.add(command.commandId);
+
+    const command = proof.commands[commandIndex];
+    assertProofCommandEnvelope(command, commandIds);
+    if (command.player !== 0) {
+      throw new GameStoreError("AI_PROOF_INVALID", "客户端不能替 AI 提交行动。", 409);
+    }
     const result = applyCommand(state, command);
-    if (!result.accepted) {
+    if (!result.accepted || result.duplicate) {
       throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令无法通过服务端规则重放。", 409, result.error);
     }
     state = result.state;
+    commandIndex += 1;
   }
-  if (state.phase !== "game-over" || state.result?.winner === null || state.result?.winner === undefined) {
-    throw new GameStoreError("AI_PROOF_INCOMPLETE", "AI 对局尚未完成，不能结算奖励。", 409);
+
+  if (
+    aiMustAct(state) ||
+    state.phase !== "game-over" ||
+    !state.result
+  ) {
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令序列不完整。", 409);
+  }
+  if (state.result.winner === null) {
+    if (state.result.reason === "draw") return "draw";
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局平局状态无法验证。", 409);
   }
   return state.result.winner === 0 ? "win" : "loss";
+}
+
+function aiMustAct(state: MatchState): boolean {
+  if (state.phase === "game-over") return false;
+  if (state.phase === "mulligan") return !state.mulliganDone[1];
+  if (state.phase === "discover") return state.discover?.player === 1;
+  if (state.phase === "choose-one") return state.chooseOne?.player === 1;
+  return state.phase === "main" && state.activePlayer === 1;
+}
+
+function generateRequiredAiCommands(
+  state: MatchState,
+): { state: MatchState; commands: BattleCommand[] } {
+  if (state.phase === "mulligan") {
+    const command: BattleCommand = {
+      type: "mulligan",
+      player: 1,
+      cardIndexes: chooseAiMulliganIndexes(state, 1),
+    };
+    const result = applyCommand(state, command);
+    if (!result.accepted) {
+      throw new GameStoreError("AI_PROOF_INVALID", "服务端无法重放 AI 起手换牌。", 409, result.error);
+    }
+    return { state: result.state, commands: [command] };
+  }
+
+  let next = state;
+  const commands: BattleCommand[] = [];
+  while (aiMustAct(next)) {
+    const commandCountBeforeRun = commands.length;
+    const versionBeforeRun = next.version;
+    next = runAiTurn(next, 1, (_stepState, command) => {
+      commands.push(command);
+    });
+    if (commands.length === commandCountBeforeRun || next.version <= versionBeforeRun) {
+      throw new GameStoreError("AI_PROOF_INVALID", "服务端 AI 行动未能推进对局。", 409);
+    }
+    if (commands.length > 400) {
+      throw new GameStoreError("AI_PROOF_INVALID", "服务端 AI 行动序列超出安全限制。", 409);
+    }
+  }
+  return { state: next, commands };
+}
+
+const AI_PROOF_COMMAND_TYPES = new Set<string>([
+  "mulligan",
+  "play-card",
+  "trade-card",
+  "attack",
+  "hero-attack",
+  "choose-discover",
+  "choose-one",
+  "hero-power",
+  "use-coin",
+  "end-turn",
+  "concede",
+]);
+
+function assertProofCommandEnvelope(
+  command: unknown,
+  commandIds: Set<string>,
+): asserts command is BattleCommand {
+  if (
+    !isRecord(command) ||
+    typeof command.type !== "string" ||
+    !AI_PROOF_COMMAND_TYPES.has(command.type) ||
+    (command.player !== 0 && command.player !== 1) ||
+    (command.commandId !== undefined && typeof command.commandId !== "string") ||
+    (command.expectedVersion !== undefined &&
+      (!Number.isSafeInteger(command.expectedVersion) || command.expectedVersion < 0))
+  ) {
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令序列包含无效命令。", 409);
+  }
+  if (typeof command.commandId === "string") {
+    if (commandIds.has(command.commandId)) {
+      throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令序列包含重复命令。", 409);
+    }
+    commandIds.add(command.commandId);
+  }
+}
+
+function proofCommandsMatch(actual: BattleCommand, expected: BattleCommand): boolean {
+  return proofValuesMatch(
+    proofCommandSemantics(actual),
+    proofCommandSemantics(expected),
+  );
+}
+
+function proofCommandSemantics(command: BattleCommand): Record<string, unknown> {
+  // These two top-level fields describe delivery, not the move. Keep every
+  // other key (including unknown extras) so a client cannot smuggle a changed
+  // target or AI-only option through a permissive partial comparison.
+  return Object.fromEntries(
+    Object.entries(command)
+      .filter(([key, value]) => key !== "commandId" && key !== "expectedVersion" && value !== undefined)
+      .map(([key, value]) => [key, normalizeProofValue(value)]),
+  );
+}
+
+function normalizeProofValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeProofValue);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([, entry]) => entry !== undefined)
+      .map(([key, entry]) => [key, normalizeProofValue(entry)]),
+  );
+}
+
+function proofValuesMatch(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((entry, index) => proofValuesMatch(entry, right[index]))
+    );
+  }
+  if (!isRecord(left) || !isRecord(right)) return false;
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) => Object.hasOwn(right, key) && proofValuesMatch(left[key], right[key]))
+  );
 }
 
 async function stableId(value: string): Promise<string> {

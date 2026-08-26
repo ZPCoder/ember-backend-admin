@@ -3,6 +3,7 @@ import {
   claimTask,
   claimReward,
   claimWeeklyPack,
+  createAiMatch,
   acceptFriendRequest,
   blockPlayer,
   buyPack,
@@ -21,6 +22,7 @@ import {
   sendFriendRequest,
   unblockPlayer,
   updateProfile,
+  MAX_AI_PROOF_COMMANDS,
   type GameIdentity,
   type AiMatchProof,
   type MatchMode,
@@ -30,7 +32,10 @@ import {
 
 export const dynamic = "force-dynamic";
 
-const MAX_BODY_BYTES = 32 * 1024;
+// AI match settlement carries the bounded command transcript used for
+// authoritative replay. 512 KiB accommodates the maximum legal transcript
+// while still placing a strict ceiling on request parsing work.
+const MAX_BODY_BYTES = 512 * 1024;
 const DEMO_IDENTITY: GameIdentity = {
   email: "demo@local.invalid",
   displayName: "本地演示玩家",
@@ -43,6 +48,11 @@ const ANONYMOUS_COOKIE = "ember-device-id";
 const ANONYMOUS_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 
 type GameAction =
+  | {
+      action: "create_ai_match";
+      deckId: string;
+      opponentArchetypeId: string;
+    }
   | {
       action: "save_deck";
       idempotencyKey: string;
@@ -163,6 +173,16 @@ export async function POST(request: Request): Promise<Response> {
 
     const action = parseAction(await readJsonBody(request));
     switch (action.action) {
+      case "create_ai_match": {
+        const result = await createAiMatch(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          aiMatch: result.aiMatch,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
       case "save_deck": {
         const result = await saveDeck(identity, action);
         return json({
@@ -456,6 +476,13 @@ function parseAction(value: unknown): GameAction {
   }
 
   switch (value.action) {
+    case "create_ai_match":
+      assertExactKeys(value, ["action", "deckId", "opponentArchetypeId"]);
+      return {
+        action: "create_ai_match",
+        deckId: parseIdentifier(value.deckId, "deckId"),
+        opponentArchetypeId: parseIdentifier(value.opponentArchetypeId, "opponentArchetypeId"),
+      };
     case "save_deck": {
       assertExactKeys(value, ["action", "idempotencyKey", "deck"]);
       const idempotencyKey = parseIdempotencyKey(value.idempotencyKey);
@@ -539,8 +566,8 @@ function parseAction(value: unknown): GameAction {
         "mode",
         "opponent",
       ], ["action", "idempotencyKey", "result", "mode", "opponent", "pvpToken", "pvpPlayer", "format", "aiProof"]);
-      if (value.result !== "win" && value.result !== "loss") {
-        throw new PayloadError("result 必须是 win 或 loss。");
+      if (value.result !== "win" && value.result !== "loss" && value.result !== "draw") {
+        throw new PayloadError("result 必须是 win、loss 或 draw。");
       }
       if (value.mode !== "ai" && value.mode !== "pvp") {
         throw new PayloadError("mode 必须是 ai 或 pvp。");
@@ -558,7 +585,7 @@ function parseAction(value: unknown): GameAction {
         : value.format === "ranked" || value.format === "casual"
           ? value.format
           : (() => { throw new PayloadError("format 必须是 ranked 或 casual。"); })();
-      if (value.mode === "pvp" && (!pvpToken || pvpPlayer === undefined)) {
+      if (value.mode === "pvp" && !pvpToken) {
         throw new PayloadError("PVP 对局必须携带服务器对局凭证。");
       }
       const aiProof = value.aiProof === undefined ? undefined : parseAiMatchProof(value.aiProof);
@@ -640,7 +667,8 @@ function parseIdempotencyKey(value: unknown): string {
 
 function parseAiMatchProof(value: unknown): AiMatchProof {
   if (!isRecord(value)) throw new PayloadError("aiProof 必须是对象。");
-  assertExactKeys(value, ["seed", "startingPlayer", "playerDeck", "opponentArchetypeId", "commands"]);
+  assertExactKeys(value, ["ticketToken", "seed", "startingPlayer", "playerDeck", "opponentArchetypeId", "commands"]);
+  const ticketToken = parseTrimmedString(value.ticketToken, "aiProof.ticketToken", 16, 128);
   if (typeof value.seed !== "number" || !Number.isSafeInteger(value.seed) || value.seed < 0 || value.seed > 0x7fffffff) {
     throw new PayloadError("aiProof.seed 必须是合法整数。");
   }
@@ -649,8 +677,12 @@ function parseAiMatchProof(value: unknown): AiMatchProof {
   }
   const playerDeck = parseCardIds(value.playerDeck);
   const opponentArchetypeId = parseIdentifier(value.opponentArchetypeId, "aiProof.opponentArchetypeId");
-  if (!Array.isArray(value.commands) || value.commands.length < 1 || value.commands.length > 400) {
-    throw new PayloadError("aiProof.commands 必须包含 1–400 条命令。");
+  if (
+    !Array.isArray(value.commands) ||
+    value.commands.length < 1 ||
+    value.commands.length > MAX_AI_PROOF_COMMANDS
+  ) {
+    throw new PayloadError(`aiProof.commands 必须包含 1–${MAX_AI_PROOF_COMMANDS} 条命令。`);
   }
   const allowedTypes = new Set([
     "mulligan", "play-card", "trade-card", "attack", "hero-attack",
@@ -669,7 +701,7 @@ function parseAiMatchProof(value: unknown): AiMatchProof {
     }
     return raw;
   }) as unknown as AiMatchProof["commands"];
-  return { seed: value.seed, startingPlayer: value.startingPlayer, playerDeck, opponentArchetypeId, commands };
+  return { ticketToken, seed: value.seed, startingPlayer: value.startingPlayer, playerDeck, opponentArchetypeId, commands };
 }
 
 function parseIdentifier(value: unknown, field: string): string {

@@ -18,7 +18,7 @@
 - 卡组工坊支持保存多套卡组、切换已保存卡组与新建卡组草稿
 - 响应式中文界面、键盘操作、ARIA 标签与社交分享图
 
-网页纵向切片默认进入 AI 练习；战术对战页同时提供 PVP 房间大厅，已发布网页和 Flutter 客户端默认连接当前站点的 `wss://…/api/pvp`。手机和电脑只需打开同一网址即可通过房间码进行 1v1 同步出牌、攻击、回合和胜负结算；Ranked 队列按赛季 rating 近邻匹配并随等待时间放宽，Casual 不影响段位。生产 Worker 负责权威规则校验、隐藏信息、回合时限和断线同步。仓库也提供 `flutter_app/` 全端客户端，支持 Web、macOS、Windows、Linux、iOS、Android。
+网页纵向切片默认进入 AI 练习；战术对战页同时提供正式 PVP 房间大厅。发布网页通过同站 `/api/pvp-poll` 连接 D1 持久化大厅，手机和电脑打开同一网址即可用房间码进行 1v1；Ranked 队列按赛季 rating 近邻匹配并随等待时间放宽，Casual 不影响段位。生产 Worker 负责权威规则校验、隐藏信息、回合时限、断线同步和终局归档。仓库也提供 `flutter_app/` 全端离线练习客户端，支持 Web、macOS、Windows、Linux、iOS、Android；其 WebSocket 房间界面是本地协议调试工具，不记入正式排位战绩。
 
 ## Flutter 全端客户端
 
@@ -32,7 +32,7 @@ flutter run                 # Android / iOS 设备
 
 联机房间服务器和双客户端协议烟测见 [`flutter_app/README.md`](flutter_app/README.md)。
 
-本地开发时可在仓库根目录运行 `dart run server/multiplayer_server.dart 8787` 做房间 UI/连接测试；完整规则联机应使用部署 Worker 的 `wss://当前站点/api/pvp`，发布网页和手机端不需要启动本地服务器。
+本地开发时可在仓库根目录运行 `dart run server/multiplayer_server.dart 8787` 做 Flutter 房间 UI/连接协议测试。该内存服务不执行 TypeScript 权威规则，也不保存战绩；完整规则和正式结算请使用部署网页的 D1 联机入口。
 
 ## 技术结构
 
@@ -43,7 +43,10 @@ flutter run                 # Android / iOS 设备
 - `tests/`：战斗规则和发布产物检查
 - `worker/`：Cloudflare Worker 入口
 
-服务端写操作使用平台注入的 ChatGPT 身份头；生产环境不会接受客户端伪造的用户标识。玩家状态更新使用版本号和命令幂等键，避免重复领奖或重复结算。
+规则语义、与《炉石传说》的逐项差异、已支持关键词及后续扩展门槛见
+[`docs/HEARTHSTONE_RULES_AUDIT.md`](docs/HEARTHSTONE_RULES_AUDIT.md)。
+
+服务端写操作使用平台注入的 ChatGPT 身份头；生产环境不会接受客户端伪造的用户标识。玩家状态更新使用版本号和命令幂等键，避免重复领奖或重复结算。PVP 胜负由参赛身份和终局快照推导，并会在下次登录时自动补记，关闭败局页面不能逃避战绩。AI 开局参数由服务端一次性票据固定，结算重放与奖励写入会在同一 D1 batch 内消费票据，客户端不能通过重抽 seed 或更换幂等键重复领取奖励。
 
 ## 本地运行
 
