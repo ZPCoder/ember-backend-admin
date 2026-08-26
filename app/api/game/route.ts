@@ -1059,7 +1059,7 @@ function parseAiMatchProof(value: unknown): AiMatchProof {
     throw new PayloadError(`aiProof.commands 必须包含 1–${MAX_AI_PROOF_COMMANDS} 条命令。`);
   }
   const allowedTypes = new Set([
-    "mulligan", "play-card", "trade-card", "prepare-card", "attack", "hero-attack",
+    "mulligan", "play-card", "trade-card", "prepare-card", "attack", "hero-attack", "activate-location",
     "choose-discover", "choose-one", "hero-power", "use-coin", "end-turn", "concede",
   ]);
   const commands = value.commands.map((raw, index) => {
