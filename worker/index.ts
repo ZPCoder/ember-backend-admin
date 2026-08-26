@@ -174,6 +174,9 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       hand: privateCards,
       handCostReductions: privateCards.map(() => 0),
       handFragments: privateCards.map(() => null),
+      // The ordered spell identity history can reveal an untriggered Secret.
+      // Keep the complete list server-side for recast effects.
+      spellsPlayedThisGame: [],
       secrets: (player.secrets ?? []).map((_, secretIndex) => ({
         cardId: `hidden-secret-${secretIndex}`,
         secretId: `hidden-secret-${secretIndex}`,
@@ -240,6 +243,20 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
         ...safeEvent,
         message: `玩家 ${safeEvent.player ?? 1} 设置了一个奥秘。`,
         data: undefined,
+      };
+    }
+    if (
+      safeEvent.type === "spell-recast"
+      && typeof safeEvent.data?.cardId === "string"
+      && isSecretCard(safeEvent.data.cardId)
+    ) {
+      const safeData = { ...(safeEvent.data ?? {}) };
+      delete safeData.cardId;
+      delete safeData.target;
+      return {
+        ...safeEvent,
+        message: "对手重施放并设置了一个奥秘。",
+        data: safeData,
       };
     }
     if (
