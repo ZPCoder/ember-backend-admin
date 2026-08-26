@@ -162,6 +162,8 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
         deck: (player.deck ?? []).map(() => "__hidden-card__"),
         hand: privateCards,
         handCostReductions: [...(player.handCostReductions ?? player.hand.map(() => 0))],
+        handFragments: (player.handFragments ?? player.hand.map(() => null)).map((fragment) =>
+          fragment ? { ...fragment } : null),
       };
     }
     return {
@@ -171,6 +173,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       deck: (player.deck ?? []).map(() => "__hidden-card__"),
       hand: privateCards,
       handCostReductions: privateCards.map(() => 0),
+      handFragments: privateCards.map(() => null),
       secrets: (player.secrets ?? []).map((_, secretIndex) => ({
         cardId: `hidden-secret-${secretIndex}`,
         secretId: `hidden-secret-${secretIndex}`,
@@ -257,6 +260,18 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
             ? "对手抽取了一张牌。"
             : safeEvent.message,
         data: safeData,
+      };
+    }
+    if (
+      safeEvent.type === "card-shattered"
+      || safeEvent.type === "card-reassembled"
+    ) {
+      return {
+        ...safeEvent,
+        message: safeEvent.type === "card-shattered"
+          ? "对手的一张牌裂成碎片并移向手牌两端。"
+          : "对手的两片破碎卡牌已经重组。",
+        data: undefined,
       };
     }
     if (safeEvent.type === "discover-started") {
