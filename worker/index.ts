@@ -8,6 +8,7 @@ import {
   MATCHMAKING_WINDOW_MAX,
   MATCHMAKING_WINDOW_STEP,
   MATCHMAKING_WINDOW_STEP_MS,
+  MAX_HAND_SIZE,
   LADDER_READY_DECKS,
   applyCommand,
   apprenticeMatchPoolForFacts,
@@ -160,6 +161,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
         // Even the owner must not receive the authoritative future draw order.
         deck: (player.deck ?? []).map(() => "__hidden-card__"),
         hand: privateCards,
+        handCostReductions: [...(player.handCostReductions ?? player.hand.map(() => 0))],
       };
     }
     return {
@@ -168,6 +170,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       // server-side until a card is publicly played.
       deck: (player.deck ?? []).map(() => "__hidden-card__"),
       hand: privateCards,
+      handCostReductions: privateCards.map(() => 0),
       secrets: (player.secrets ?? []).map((_, secretIndex) => ({
         cardId: `hidden-secret-${secretIndex}`,
         secretId: `hidden-secret-${secretIndex}`,
@@ -236,13 +239,20 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
         data: undefined,
       };
     }
-    if (safeEvent.type === "card-drawn" || safeEvent.type === "card-burned" || safeEvent.type === "card-traded") {
+    if (
+      safeEvent.type === "card-drawn"
+      || safeEvent.type === "card-burned"
+      || safeEvent.type === "card-traded"
+      || safeEvent.type === "card-prepared"
+    ) {
       const safeData = { ...(safeEvent.data ?? {}) };
       delete safeData.cardId;
       return {
         ...safeEvent,
         message: safeEvent.type === "card-traded"
           ? "对手完成了一次可交易循环。"
+          : safeEvent.type === "card-prepared"
+            ? "对手完成了一次预备。"
           : safeEvent.type === "card-drawn"
             ? "对手抽取了一张牌。"
             : safeEvent.message,
@@ -291,8 +301,11 @@ function redactPvpCommandForViewer(command: BattleCommand, viewer: 0 | 1): Battl
   if (command.type === "play-card" && isSecretCard(command.cardId)) {
     return { ...command, cardId: "__hidden-secret__", target: undefined };
   }
-  if (command.type === "choose-discover" || command.type === "trade-card") {
+  if (command.type === "choose-discover") {
     return { ...command, cardId: "__hidden-card__" };
+  }
+  if (command.type === "trade-card" || command.type === "prepare-card") {
+    return { ...command, cardId: "__hidden-card__", handIndex: undefined };
   }
   if (command.type === "choose-one") {
     return { ...command, optionIndex: -1 };
@@ -1498,6 +1511,15 @@ function canonicalCommandString(value: unknown): string | null {
     : null;
 }
 
+function canonicalHandIndex(value: unknown): number | undefined {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value >= 0
+    && value < MAX_HAND_SIZE
+    ? value
+    : undefined;
+}
+
 function canonicalTarget(value: unknown, role: 0 | 1): BattleTarget | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const raw = value as Record<string, unknown>;
@@ -1533,13 +1555,23 @@ function canonicalCommand(value: unknown, role: 0 | 1): BattleCommand | null {
     case "play-card": {
       const cardId = canonicalCommandString(raw.cardId);
       if (!cardId) return null;
-      if (raw.target === undefined) return { type: "play-card", ...metadata, cardId };
+      const handIndex = canonicalHandIndex(raw.handIndex);
+      if (raw.handIndex !== undefined && handIndex === undefined) return null;
+      if (raw.target === undefined) return { type: "play-card", ...metadata, cardId, ...(handIndex === undefined ? {} : { handIndex }) };
       const target = canonicalTarget(raw.target, role);
-      return target ? { type: "play-card", ...metadata, cardId, target } : null;
+      return target ? { type: "play-card", ...metadata, cardId, ...(handIndex === undefined ? {} : { handIndex }), target } : null;
     }
     case "trade-card": {
       const cardId = canonicalCommandString(raw.cardId);
-      return cardId ? { type: "trade-card", ...metadata, cardId } : null;
+      const handIndex = canonicalHandIndex(raw.handIndex);
+      if (raw.handIndex !== undefined && handIndex === undefined) return null;
+      return cardId ? { type: "trade-card", ...metadata, cardId, ...(handIndex === undefined ? {} : { handIndex }) } : null;
+    }
+    case "prepare-card": {
+      const cardId = canonicalCommandString(raw.cardId);
+      const handIndex = canonicalHandIndex(raw.handIndex);
+      if (raw.handIndex !== undefined && handIndex === undefined) return null;
+      return cardId ? { type: "prepare-card", ...metadata, cardId, ...(handIndex === undefined ? {} : { handIndex }) } : null;
     }
     case "attack": {
       const attackerId = canonicalCommandString(raw.attackerId);

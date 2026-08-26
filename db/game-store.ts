@@ -3986,6 +3986,7 @@ const AI_PROOF_COMMAND_TYPES = new Set<string>([
   "mulligan",
   "play-card",
   "trade-card",
+  "prepare-card",
   "attack",
   "hero-attack",
   "choose-discover",
