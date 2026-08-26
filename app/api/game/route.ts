@@ -8,6 +8,7 @@ import {
   claimReward,
   claimWeeklyPack,
   createAiMatch,
+  completeTrainingChapter,
   activateLadderReady,
   acceptFriendRequest,
   blockPlayer,
@@ -42,6 +43,8 @@ import {
   type LadderReadyDeckId,
   type RankedFormat,
   type ReturnQuestStageId,
+  getTrainingChapter,
+  type TrainingChapterId,
 } from "../../../lib/game";
 
 export const dynamic = "force-dynamic";
@@ -68,6 +71,7 @@ type GameAction =
       ladderReadyDeckId?: LadderReadyDeckId;
       opponentArchetypeId: string;
       training?: boolean;
+      trainingChapterId?: TrainingChapterId;
     }
   | {
       action: "activate_ladder_ready";
@@ -138,6 +142,12 @@ type GameAction =
       action: "claim_apprentice_reward";
       idempotencyKey: string;
       milestoneId: ApprenticeMilestoneId;
+    }
+  | {
+      action: "complete_training_chapter";
+      idempotencyKey: string;
+      chapterId: TrainingChapterId;
+      aiProof: AiMatchProof;
     }
   | {
       action: "record_match";
@@ -226,6 +236,16 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           aiMatch: result.aiMatch,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "complete_training_chapter": {
+        const result = await completeTrainingChapter(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          trainingChapterId: result.chapterId,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -584,7 +604,7 @@ function parseAction(value: unknown): GameAction {
 
   switch (value.action) {
     case "create_ai_match": {
-      assertExactKeys(value, ["action", "opponentArchetypeId"], ["action", "opponentArchetypeId", "deckId", "ladderReadyDeckId", "training"]);
+      assertExactKeys(value, ["action", "opponentArchetypeId"], ["action", "opponentArchetypeId", "deckId", "ladderReadyDeckId", "training", "trainingChapterId"]);
       const training = value.training === true;
       if (value.training !== undefined && typeof value.training !== "boolean") {
         throw new PayloadError("training 必须是布尔值。");
@@ -593,10 +613,20 @@ function parseAction(value: unknown): GameAction {
       const rawLadderReadyDeckId = value.ladderReadyDeckId === undefined
         ? undefined
         : parseIdentifier(value.ladderReadyDeckId, "ladderReadyDeckId");
-      if (!training && Boolean(deckId) === Boolean(rawLadderReadyDeckId)) {
+      const rawTrainingChapterId = value.trainingChapterId === undefined
+        ? undefined
+        : parseIdentifier(value.trainingChapterId, "trainingChapterId");
+      const trainingChapterId = rawTrainingChapterId && getTrainingChapter(rawTrainingChapterId)
+        ? rawTrainingChapterId as TrainingChapterId
+        : undefined;
+      if (rawTrainingChapterId && !trainingChapterId) {
+        throw new PayloadError("trainingChapterId 不是有效的教学关卡。");
+      }
+      const isTraining = training || Boolean(trainingChapterId);
+      if (!isTraining && Boolean(deckId) === Boolean(rawLadderReadyDeckId)) {
         throw new PayloadError("deckId 与 ladderReadyDeckId 必须且只能提供一个。");
       }
-      if (training && (deckId || rawLadderReadyDeckId)) {
+      if (isTraining && (deckId || rawLadderReadyDeckId)) {
         throw new PayloadError("训练对局使用固定教学牌组，不能指定普通牌组。");
       }
       if (rawLadderReadyDeckId && !LADDER_READY_DECKS.some((deck) => deck.id === rawLadderReadyDeckId)) {
@@ -607,7 +637,21 @@ function parseAction(value: unknown): GameAction {
         ...(deckId ? { deckId } : {}),
         ...(rawLadderReadyDeckId ? { ladderReadyDeckId: rawLadderReadyDeckId as LadderReadyDeckId } : {}),
         ...(training ? { training: true } : {}),
+        ...(trainingChapterId ? { trainingChapterId } : {}),
         opponentArchetypeId: parseIdentifier(value.opponentArchetypeId, "opponentArchetypeId"),
+      };
+    }
+    case "complete_training_chapter": {
+      assertExactKeys(value, ["action", "idempotencyKey", "chapterId", "aiProof"]);
+      const chapterId = parseIdentifier(value.chapterId, "chapterId");
+      if (!getTrainingChapter(chapterId)) {
+        throw new PayloadError("chapterId 不是有效的教学关卡。");
+      }
+      return {
+        action: "complete_training_chapter",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        chapterId: chapterId as TrainingChapterId,
+        aiProof: parseAiMatchProof(value.aiProof),
       };
     }
     case "activate_ladder_ready":

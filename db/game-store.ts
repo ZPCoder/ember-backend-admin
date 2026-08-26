@@ -21,16 +21,18 @@ import {
   TRIAL_CARD_ACCESS_MS,
   RETURN_QUEST_STAGE_IDS,
   returnQuestStageReady,
-  TRAINING_DECK_ID,
-  TRAINING_MATCH_SEED,
-  TRAINING_OPPONENT_ARCHETYPE_ID,
   TRAINING_PLAYER_DECK,
-  TRAINING_STARTING_PLAYER,
+  getTrainingChapter,
+  normalizeTrainingCampaign,
+  trainingChapterIdFromDeckId,
+  trainingChapterProgressForCommands,
+  trainingChapterUnlocked,
+  trainingDeckId,
   ladderReadyTrialIsActive,
   validateDeck,
   validateDeckForFormat,
 } from "../lib/game";
-import type { BattleCommand, CatchUpPackProgress, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrialCardAccess } from "../lib/game";
+import type { BattleCommand, CatchUpPackProgress, LadderReadyDeckId, MatchState, RankedFormat, ReturnJourneyState, ReturnQuestStageId, TrainingCampaignState, TrainingChapterId, TrialCardAccess } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
 import {
   APPRENTICE_MILESTONES,
@@ -186,6 +188,7 @@ export type AiMatchTicket = {
   playerDeck: string[];
   opponentArchetypeId: string;
   expiresAt: string;
+  trainingChapterId?: TrainingChapterId;
 };
 
 export type PlayerState = {
@@ -210,6 +213,7 @@ export type PlayerState = {
   catchUpPack: CatchUpPackState;
   trialCards: TrialCardAccess;
   returnJourney: ReturnJourneyState;
+  trainingCampaign: TrainingCampaignState;
   rankedLadders: RankedLadders;
   rankedRewards: RankedRewardState;
   friends?: FriendSummary[];
@@ -342,6 +346,12 @@ export type RecordMatchResult = {
 export type CreateAiMatchResult = {
   player: PlayerState;
   aiMatch: AiMatchTicket;
+  replayed: boolean;
+};
+
+export type CompleteTrainingChapterResult = {
+  player: PlayerState;
+  chapterId: TrainingChapterId;
   replayed: boolean;
 };
 
@@ -515,9 +525,9 @@ export async function getPlayerState(
 }
 
 /**
- * Issue (or recover) the sole active AI match ticket for a player. A valid
- * unconsumed ticket always wins over newly requested parameters so repeatedly
- * opening the battle screen cannot be used to reroll the seed or first player.
+ * Issue (or recover) the sole active AI match ticket for a player. Repeated
+ * starts of the same training chapter recover its deterministic ticket; a
+ * deliberate mode or chapter change retires the previous active ticket.
  */
 export async function createAiMatch(
   identity: GameIdentity,
@@ -526,6 +536,7 @@ export async function createAiMatch(
     ladderReadyDeckId?: LadderReadyDeckId;
     opponentArchetypeId: string;
     training?: boolean;
+    trainingChapterId?: TrainingChapterId;
   },
 ): Promise<CreateAiMatchResult> {
   const db = getD1();
@@ -534,10 +545,13 @@ export async function createAiMatch(
   const now = new Date();
   const nowIso = now.toISOString();
 
+  const requestedChapter = getTrainingChapter(input.trainingChapterId ?? (input.training ? "mist-gate" : null));
   const existing = await loadActiveAiTicket(db, player.id);
-  const requestedTraining = input.training === true;
-  const existingTraining = existing?.deckId === TRAINING_DECK_ID;
-  if (existing && existing.expiresAt > nowIso && requestedTraining === existingTraining) {
+  const existingChapterId = trainingChapterIdFromDeckId(existing?.deckId);
+  const existingMatchesRequestedMode = requestedChapter
+    ? existingChapterId === requestedChapter.id
+    : !existing?.deckId.startsWith("training:");
+  if (existing && existing.expiresAt > nowIso && existingMatchesRequestedMode) {
     return {
       player: await loadPublicPlayer(db, player),
       aiMatch: parseAiMatchTicketRow(existing),
@@ -562,8 +576,11 @@ export async function createAiMatch(
   let selectedDeckId: string;
   let selectedCardIds: readonly string[];
   let selectedRankedFormat: RankedFormat;
-  if (requestedTraining) {
-    selectedDeckId = TRAINING_DECK_ID;
+  if (requestedChapter) {
+    if (!trainingChapterUnlocked(state.trainingCampaign, requestedChapter.id)) {
+      throw new GameStoreError("TRAINING_CHAPTER_LOCKED", "请先完成上一关教学。", 409);
+    }
+    selectedDeckId = trainingDeckId(requestedChapter.id);
     selectedCardIds = TRAINING_PLAYER_DECK;
     selectedRankedFormat = "standard";
   } else if (trialDeck) {
@@ -588,8 +605,8 @@ export async function createAiMatch(
   if (!validation.valid) {
     throw new GameStoreError("INVALID_DECK", "卡组不符合组牌规则。", 400, validation.errors);
   }
-  const requestedArchetypeId = requestedTraining
-    ? TRAINING_OPPONENT_ARCHETYPE_ID
+  const requestedArchetypeId = requestedChapter
+    ? requestedChapter.bossArchetypeId
     : input.opponentArchetypeId;
   const archetype = AI_ARCHETYPES.find((candidate) => candidate.id === requestedArchetypeId);
   if (!archetype) {
@@ -603,12 +620,13 @@ export async function createAiMatch(
     : now.getTime() + AI_MATCH_TICKET_TTL_MS;
   const ticket: AiMatchTicket = {
     token: `ai-${crypto.randomUUID()}`,
-    seed: requestedTraining ? TRAINING_MATCH_SEED : (randomness[0] ?? 0) & 0x7fffffff,
-    startingPlayer: requestedTraining ? TRAINING_STARTING_PLAYER : ((randomness[1] ?? 0) & 1) as 0 | 1,
+    seed: requestedChapter ? requestedChapter.seed : (randomness[0] ?? 0) & 0x7fffffff,
+    startingPlayer: requestedChapter ? requestedChapter.startingPlayer : ((randomness[1] ?? 0) & 1) as 0 | 1,
     rankedFormat: selectedRankedFormat,
     playerDeck: [...selectedCardIds],
     opponentArchetypeId: archetype.id,
     expiresAt: new Date(ticketExpiryMs).toISOString(),
+    ...(requestedChapter ? { trainingChapterId: requestedChapter.id } : {}),
   };
 
   try {
@@ -636,12 +654,25 @@ export async function createAiMatch(
     // Concurrent starts race on the per-player active-slot index. Return the
     // winner's ticket so both requests resume exactly the same match.
     const winner = await loadActiveAiTicket(db, player.id);
-    if (winner && winner.expiresAt > new Date().toISOString()) {
+    if (
+      winner
+      && winner.expiresAt > new Date().toISOString()
+      && (requestedChapter
+        ? trainingChapterIdFromDeckId(winner.deckId) === requestedChapter.id
+        : !winner.deckId.startsWith("training:"))
+    ) {
       return {
         player: await loadPublicPlayer(db, player),
         aiMatch: parseAiMatchTicketRow(winner),
         replayed: true,
       };
+    }
+    if (winner) {
+      throw new GameStoreError(
+        "AI_MATCH_START_CONFLICT",
+        "另一场 AI 对局刚刚启动，请重试以进入最新对局。",
+        409,
+      );
     }
     throw error;
   }
@@ -651,6 +682,93 @@ export async function createAiMatch(
     aiMatch: ticket,
     replayed: false,
   };
+}
+
+export async function completeTrainingChapter(
+  identity: GameIdentity,
+  input: {
+    idempotencyKey: string;
+    chapterId: TrainingChapterId;
+    aiProof: AiMatchProof;
+  },
+): Promise<CompleteTrainingChapterResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+  const existingAudit = await findAudit(db, player.id, input.idempotencyKey);
+  if (existingAudit) {
+    const replay = await replayAudit<{ chapterId: TrainingChapterId }>(
+      db,
+      player,
+      "complete_training_chapter",
+      existingAudit,
+    );
+    return { player: replay.player, chapterId: replay.result.chapterId, replayed: true };
+  }
+
+  const chapter = getTrainingChapter(input.chapterId);
+  if (!chapter) {
+    throw new GameStoreError("TRAINING_CHAPTER_NOT_FOUND", "教学关卡不存在。", 400);
+  }
+  const row = await loadAiTicket(db, input.aiProof.ticketToken);
+  if (!row || row.playerId !== player.id || trainingChapterIdFromDeckId(row.deckId) !== chapter.id) {
+    throw new GameStoreError("TRAINING_TICKET_INVALID", "教学对局凭证无效。", 409);
+  }
+  if (row.consumedAt) {
+    throw new GameStoreError("TRAINING_TICKET_CONSUMED", "该教学对局已经结算。", 409);
+  }
+  if (row.expiresAt <= new Date().toISOString()) {
+    throw new GameStoreError("TRAINING_TICKET_EXPIRED", "教学对局凭证已过期，请重新开始。", 409);
+  }
+  const ticket = parseAiMatchTicketRow(row);
+  if (!aiMatchTicketMatchesProof(ticket, input.aiProof)) {
+    throw new GameStoreError("TRAINING_TICKET_MISMATCH", "教学对局参数与服务器凭证不一致。", 409);
+  }
+
+  try {
+    const replayedState = replayAiProofState(input.aiProof, ticket);
+    const progress = trainingChapterProgressForCommands(chapter.id, input.aiProof.commands);
+    if (aiMustAct(replayedState) || progress.invalid || progress.completed !== chapter.objectives.length) {
+      throw new GameStoreError("TRAINING_PROOF_INCOMPLETE", "教学目标尚未全部完成。", 409);
+    }
+  } catch (error) {
+    if (error instanceof GameStoreError && error.code.startsWith("TRAINING_")) throw error;
+    throw new GameStoreError("TRAINING_PROOF_INVALID", "教学对局无法通过服务器重放验证。", 409);
+  }
+
+  return commitMutation(
+    db,
+    player,
+    "complete_training_chapter",
+    input.idempotencyKey,
+    { chapterId: chapter.id, aiProof: input.aiProof },
+    (current) => {
+      if (!trainingChapterUnlocked(current.trainingCampaign, chapter.id)) {
+        throw new GameStoreError("TRAINING_CHAPTER_LOCKED", "请先完成上一关教学。", 409);
+      }
+      const completedChapterIds = current.trainingCampaign.completedChapterIds.includes(chapter.id)
+        ? current.trainingCampaign.completedChapterIds
+        : [...current.trainingCampaign.completedChapterIds, chapter.id];
+      const trainingCampaign = normalizeTrainingCampaign({ completedChapterIds });
+      return {
+        nextState: { ...current, trainingCampaign },
+        result: { chapterId: chapter.id },
+      };
+    },
+    {
+      aiTicket: {
+        token: row.token,
+        seed: row.seed,
+        startingPlayer: row.startingPlayer as 0 | 1,
+        opponentArchetypeId: row.opponentArchetypeId,
+        deckJson: row.deckJson,
+      },
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    chapterId: result.chapterId,
+    replayed,
+  }));
 }
 
 /**
@@ -2255,7 +2373,7 @@ export async function recordMatch(
   if (verifiedAiTicket.expiresAt <= new Date().toISOString()) {
     throw new GameStoreError("AI_TICKET_EXPIRED", "AI 对局凭证已过期，请重新开始对局。", 409);
   }
-  if (verifiedAiTicket.deckId === TRAINING_DECK_ID) {
+  if (verifiedAiTicket.deckId.startsWith("training:")) {
     throw new GameStoreError("TRAINING_MATCH_NO_SETTLEMENT", "训练对局不计入正式战绩与奖励。", 409);
   }
   const ticket = parseAiMatchTicketRow(verifiedAiTicket);
@@ -2673,6 +2791,7 @@ function parseAiMatchTicketRow(row: AiMatchTicketRow): AiMatchTicket {
   ) {
     throw new GameStoreError("AI_TICKET_CORRUPT", "AI 对局凭证参数损坏。", 500);
   }
+  const trainingChapterId = trainingChapterIdFromDeckId(row.deckId);
   return {
     token: row.token,
     seed: row.seed,
@@ -2681,6 +2800,9 @@ function parseAiMatchTicketRow(row: AiMatchTicketRow): AiMatchTicket {
     playerDeck,
     opponentArchetypeId: row.opponentArchetypeId,
     expiresAt: row.expiresAt,
+    ...(trainingChapterId
+      ? { trainingChapterId }
+      : {}),
   };
 }
 
@@ -3452,6 +3574,7 @@ function createDefaultState(now: string): StoredPlayerState {
     catchUpPack: { claimedAt: null, cardsGranted: 0, ...catchUpProgress },
     trialCards: { activatedAt: null, expiresAt: null },
     returnJourney: { claimedStageIds: [], matchesPlayedAtActivation: 0 },
+    trainingCampaign: { completedChapterIds: [] },
     rankedLadders: createRankedLadders(utcSeasonKey(now)),
     rankedRewards: createRankedRewardState(),
     stats: {
@@ -3633,13 +3756,14 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
         ? value.stats.matchesPlayed
         : 0,
   };
+  const trainingCampaign = normalizeTrainingCampaign(value.trainingCampaign);
   const rankedLadders = normalizeRankedLadders(
     value.rankedLadders,
     value.ladder,
     utcSeasonKey(new Date().toISOString()),
   );
   const rankedRewards = normalizeRankedRewardState(value.rankedRewards);
-  return { ...value, decks, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, returnJourney, rankedLadders, rankedRewards } as StoredPlayerState;
+  return { ...value, decks, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, catchUpPack, trialCards, returnJourney, trainingCampaign, rankedLadders, rankedRewards } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -3668,6 +3792,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isCatchUpPackState(value.catchUpPack) &&
     isTrialCardAccess(value.trialCards) &&
     isReturnJourneyState(value.returnJourney) &&
+    isTrainingCampaignState(value.trainingCampaign) &&
     isRankedLadders(value.rankedLadders) &&
     isRankedRewardState(value.rankedRewards) &&
     value.decks.every(isDeck) &&
@@ -3716,6 +3841,13 @@ function isApprenticeTrack(value: unknown): value is ApprenticeTrackState {
     && value.claimedMilestones.every(
       (id) => typeof id === "string" && APPRENTICE_MILESTONES.some((milestone) => milestone.id === id),
     );
+}
+
+function isTrainingCampaignState(value: unknown): value is TrainingCampaignState {
+  if (!isRecord(value) || !Array.isArray(value.completedChapterIds)) return false;
+  const normalized = normalizeTrainingCampaign(value);
+  return normalized.completedChapterIds.length === value.completedChapterIds.length
+    && normalized.completedChapterIds.every((id, index) => id === value.completedChapterIds[index]);
 }
 
 function isLadderReadyState(value: unknown): value is LadderReadyState {
@@ -3868,6 +4000,9 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
       claimedStageIds: [...state.returnJourney.claimedStageIds],
       matchesPlayedAtActivation: state.returnJourney.matchesPlayedAtActivation,
     },
+    trainingCampaign: {
+      completedChapterIds: [...state.trainingCampaign.completedChapterIds],
+    },
     rankedLadders: cloneRankedLadders(state.rankedLadders),
     rankedRewards: {
       claimedFirstTimeFloors: [...state.rankedRewards.claimedFirstTimeFloors],
@@ -3913,6 +4048,7 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.trialCards.activatedAt === null &&
     state.returnJourney.claimedStageIds.length === 0 &&
     state.returnJourney.matchesPlayedAtActivation === 0 &&
+    state.trainingCampaign.completedChapterIds.length === 0 &&
     state.rankedLadders.standard.rankProgress === 0 &&
     state.rankedLadders.wild.rankProgress === 0 &&
     state.rankedRewards.claimedFirstTimeFloors.length === 0 &&
@@ -4211,6 +4347,25 @@ function replayAiMatchProof(
   proof: AiMatchProof,
   ticket: AiMatchTicket,
 ): MatchResult {
+  const state = replayAiProofState(proof, ticket);
+  if (
+    aiMustAct(state) ||
+    state.phase !== "game-over" ||
+    !state.result
+  ) {
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令序列不完整。", 409);
+  }
+  if (state.result.winner === null) {
+    if (state.result.reason === "draw") return "draw";
+    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局平局状态无法验证。", 409);
+  }
+  return state.result.winner === 0 ? "win" : "loss";
+}
+
+function replayAiProofState(
+  proof: AiMatchProof,
+  ticket: AiMatchTicket,
+): MatchState {
   if (
     typeof proof.ticketToken !== "string" ||
     !Number.isSafeInteger(proof.seed) ||
@@ -4278,18 +4433,7 @@ function replayAiMatchProof(
     commandIndex += 1;
   }
 
-  if (
-    aiMustAct(state) ||
-    state.phase !== "game-over" ||
-    !state.result
-  ) {
-    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局命令序列不完整。", 409);
-  }
-  if (state.result.winner === null) {
-    if (state.result.reason === "draw") return "draw";
-    throw new GameStoreError("AI_PROOF_INVALID", "AI 对局平局状态无法验证。", 409);
-  }
-  return state.result.winner === 0 ? "win" : "loss";
+  return state;
 }
 
 function aiMustAct(state: MatchState): boolean {
