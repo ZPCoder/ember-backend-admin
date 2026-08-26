@@ -272,6 +272,9 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
     ) {
       const safeData = { ...(safeEvent.data ?? {}) };
       delete safeData.cardId;
+      delete safeData.retainedCostReduction;
+      delete safeData.fragment;
+      delete safeData.groupId;
       return {
         ...safeEvent,
         message: safeEvent.type === "card-traded"
@@ -341,7 +344,7 @@ function redactPvpCommandForViewer(command: BattleCommand, viewer: 0 | 1): Battl
     return { ...command, cardId: "__hidden-secret__", target: undefined };
   }
   if (command.type === "choose-discover") {
-    return { ...command, cardId: "__hidden-card__" };
+    return { ...command, cardId: "__hidden-card__", choiceIndex: undefined };
   }
   if (command.type === "trade-card" || command.type === "prepare-card") {
     return { ...command, cardId: "__hidden-card__", handIndex: undefined };
@@ -1630,7 +1633,18 @@ function canonicalCommand(value: unknown, role: 0 | 1): BattleCommand | null {
     }
     case "choose-discover": {
       const cardId = canonicalCommandString(raw.cardId);
-      return cardId ? { type: "choose-discover", ...metadata, cardId } : null;
+      const choiceIndex = raw.choiceIndex === undefined
+        ? undefined
+        : typeof raw.choiceIndex === "number"
+            && Number.isSafeInteger(raw.choiceIndex)
+            && raw.choiceIndex >= 0
+            && raw.choiceIndex < 3
+          ? raw.choiceIndex
+          : null;
+      if (choiceIndex === null) return null;
+      return cardId
+        ? { type: "choose-discover", ...metadata, cardId, ...(choiceIndex === undefined ? {} : { choiceIndex }) }
+        : null;
     }
     case "choose-one":
       return typeof raw.optionIndex === "number" && Number.isSafeInteger(raw.optionIndex) && raw.optionIndex >= 0
@@ -1706,6 +1720,7 @@ function resolvePvpTimeout(
       type: "choose-discover",
       player: next.discover.player,
       cardId: next.discover.choices[0],
+      choiceIndex: 0,
       commandId: `server-timeout-${matchToken}-discover-${next.version}-${crypto.randomUUID()}`,
     });
   } else if (next.phase === "choose-one" && next.chooseOne?.options[0]) {
