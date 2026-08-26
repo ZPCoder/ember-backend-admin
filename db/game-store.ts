@@ -1043,7 +1043,9 @@ export async function openPack(
           503,
         );
       }
-      const batch = drawPackBatch(current.collection, current.packPity, 1);
+      const batch = drawPackBatch(current.collection, current.packPity, 1, {
+        duplicateProtectionCollection: current.catchUpPack.receivedCopiesByCard,
+      });
       const catchUpProgress = recordCatchUpCards(
         current.catchUpPack,
         batch.openedCards.flatMap((opened) => Array.from({ length: opened.count }, () => opened.cardId)),
@@ -1106,7 +1108,9 @@ export async function openPacks(
         throw new GameStoreError("CARD_CATALOG_EMPTY", "卡牌目录尚未就绪。", 503);
       }
 
-      const batch = drawPackBatch(current.collection, current.packPity, input.count);
+      const batch = drawPackBatch(current.collection, current.packPity, input.count, {
+        duplicateProtectionCollection: current.catchUpPack.receivedCopiesByCard,
+      });
       const grantedCardIds = batch.openedCards.flatMap((opened) =>
         Array.from({ length: opened.count }, () => opened.cardId));
       const catchUpProgress = recordCatchUpCards(current.catchUpPack, grantedCardIds);
