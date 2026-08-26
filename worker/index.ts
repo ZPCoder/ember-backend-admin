@@ -186,8 +186,10 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       // The ordered spell identity history can reveal an untriggered Secret.
       // Keep the complete list server-side for recast effects.
       spellsPlayedThisGame: [],
+      spellsPlayedEntityIds: [],
       spellsPlayedFromStartingDeck: [],
       secrets: (player.secrets ?? []).map((_, secretIndex) => ({
+        entityId: `hidden-secret-${secretIndex}`,
         cardId: `hidden-secret-${secretIndex}`,
         secretId: `hidden-secret-${secretIndex}`,
         name: "未知奥秘",
@@ -242,6 +244,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       const safeData = { ...(safeEvent.data ?? {}) };
       delete safeData.cardId;
       delete safeData.target;
+      delete safeData.handEntityId;
       return {
         ...safeEvent,
         message: "对手设置了一个奥秘。",
