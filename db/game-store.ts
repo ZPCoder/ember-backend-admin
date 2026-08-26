@@ -4191,6 +4191,7 @@ function rankedRewardEconomy(state: StoredPlayerState): RankedRewardEconomy {
     ladders: state.rankedLadders,
     rankedRewards: state.rankedRewards,
     collection: state.collection,
+    receivedCopiesByCard: state.catchUpPack.receivedCopiesByCard,
     packsAvailable: state.packsAvailable,
   };
 }
