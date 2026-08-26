@@ -4,6 +4,7 @@ import handler from "vinext/server/app-router-entry";
 import {
   CARD_BY_ID,
   CARD_CATALOG,
+  DEFAULT_CARD_BACK_ID,
   HIDDEN_MMR_START,
   MATCHMAKING_WINDOW_INITIAL,
   MATCHMAKING_WINDOW_MAX,
@@ -18,8 +19,12 @@ import {
   initialHiddenMmrForVisibleRating,
   ladderReadyDeckMatches,
   ladderReadyTrialIsActive,
+  isCardBackId,
   matchQualityForGap,
   normalizeHiddenMmr,
+  normalizeOwnedCardBackId,
+  normalizeRankedRewardState,
+  resolveCardBackSelection,
   updateHiddenMmrPair,
   validateDeckForFormat,
   type BattleCommand,
@@ -76,6 +81,7 @@ type PvpRoom = {
   peers: PvpPeer[];
   nextSequence: number;
   readyDecks: Map<string, string[]>;
+  readyCardBacks: Map<string, string>;
   matchState?: MatchState;
   matchToken?: string;
   matchUpdatedAt?: number;
@@ -981,14 +987,46 @@ function pvpAccountStateAllowsDeck(
   return LADDER_READY_DECKS.some((deck) => ladderReadyDeckMatches(deck.deck, deckIds));
 }
 
-async function pvpAccountOwnsSavedDeck(
+function pvpAccountStateAuthorizesCardBack(
+  stateJson: string,
+  deckIds: readonly string[],
+  rankedFormat: RankedFormat,
+  requestedCardBackId: string,
+): string | null {
+  if (!isCardBackId(requestedCardBackId) || !pvpAccountStateAllowsDeck(stateJson, deckIds, rankedFormat)) return null;
+  let state: unknown;
+  try {
+    state = JSON.parse(stateJson);
+  } catch {
+    return null;
+  }
+  if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+  const raw = state as Record<string, unknown>;
+  const rewards = normalizeRankedRewardState(raw.rankedRewards);
+  const savedDecks = Array.isArray(raw.decks) ? raw.decks.filter((deck) => {
+    if (!deck || typeof deck !== "object" || Array.isArray(deck)) return false;
+    const stored = deck as Record<string, unknown>;
+    return Array.isArray(stored.cardIds)
+      && stored.cardIds.every((cardId) => typeof cardId === "string")
+      && ladderReadyDeckMatches(stored.cardIds as string[], deckIds);
+  }) as Array<Record<string, unknown>> : [];
+  const matchingDeck = savedDecks.some((stored) =>
+    normalizeOwnedCardBackId(stored.cardBackId, rewards) === requestedCardBackId);
+  if (matchingDeck) return requestedCardBackId;
+  if (savedDecks.length > 0) return null;
+
+  // Unsaved seven-day trial decks have no cosmetic loadout and always use the
+  // universally owned default card back.
+  return requestedCardBackId === DEFAULT_CARD_BACK_ID ? DEFAULT_CARD_BACK_ID : null;
+}
+
+async function pvpAccountAuthorizesLoadout(
   db: PvpDatabase,
   clientId: string,
   deckIds: readonly string[],
   rankedFormat: RankedFormat,
-): Promise<boolean> {
-  // Resolve through the immutable session identity binding rather than any
-  // client-supplied player id or email.
+  requestedCardBackId: string,
+): Promise<string | null> {
   const row = await db.prepare(`
     SELECT ps.state_json
     FROM pvp_session_identities psi
@@ -997,7 +1035,27 @@ async function pvpAccountOwnsSavedDeck(
     WHERE psi.client_id = ? AND psi.identity_key <> ''
     LIMIT 1
   `).bind(clientId).first<{ state_json: string }>();
-  return Boolean(row && pvpAccountStateAllowsDeck(row.state_json, deckIds, rankedFormat));
+  return row
+    ? pvpAccountStateAuthorizesCardBack(row.state_json, deckIds, rankedFormat, requestedCardBackId)
+    : null;
+}
+
+async function loadPvpRewardState(db: PvpDatabase, clientId: string): Promise<unknown> {
+  const row = await db.prepare(`
+    SELECT ps.state_json
+    FROM pvp_session_identities psi
+    JOIN players p ON p.identity_key = psi.identity_key
+    JOIN player_states ps ON ps.player_id = p.id
+    WHERE psi.client_id = ? AND psi.identity_key <> ''
+    LIMIT 1
+  `).bind(clientId).first<{ state_json: string }>();
+  if (!row) return undefined;
+  try {
+    const state = JSON.parse(row.state_json) as Record<string, unknown>;
+    return state.rankedRewards;
+  } catch {
+    return undefined;
+  }
 }
 
 async function dbLeaveQueue(db: PvpDatabase, session: PvpDbSession): Promise<void> {
@@ -1072,6 +1130,19 @@ function parsePvpDeck(value: unknown, rankedFormat: RankedFormat = "wild"): stri
   if (!Array.isArray(value) || value.length !== 30 || value.some((cardId) => typeof cardId !== "string")) return null;
   const deck = value.map(String);
   return validateDeckForFormat(deck, rankedFormat).valid ? deck : null;
+}
+
+function parsePvpReadyLoadout(value: unknown, rankedFormat: RankedFormat): { deckIds: string[]; cardBackId: string } | null {
+  if (Array.isArray(value)) {
+    const deckIds = parsePvpDeck(value, rankedFormat);
+    return deckIds ? { deckIds, cardBackId: DEFAULT_CARD_BACK_ID } : null;
+  }
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const deckIds = parsePvpDeck(raw.cardIds, rankedFormat);
+  return deckIds && isCardBackId(raw.cardBackId)
+    ? { deckIds, cardBackId: raw.cardBackId }
+    : null;
 }
 
 function parsePvpFormat(value: unknown): "ranked" | "casual" {
@@ -1873,10 +1944,11 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
 
   if (action === "ready") {
     const deckIds = parsePvpDeck(payload.deckIds, room.ranked_format);
-    const accountOwnsDeck = deckIds
-      ? await pvpAccountOwnsSavedDeck(db, session.client_id, deckIds, room.ranked_format)
-      : false;
-    if (!deckIds || !accountOwnsDeck) {
+    const requestedCardBackId = isCardBackId(payload.cardBackId) ? payload.cardBackId : null;
+    const authorizedCardBackId = deckIds && requestedCardBackId
+      ? await pvpAccountAuthorizesLoadout(db, session.client_id, deckIds, room.ranked_format, requestedCardBackId)
+      : null;
+    if (!deckIds || !authorizedCardBackId) {
       // Keep ownership, saved-deck and structural failures indistinguishable
       // so the endpoint cannot be used to probe another account's collection.
       await db.prepare(`DELETE FROM pvp_ready WHERE client_id = ?`).bind(session.client_id).run();
@@ -1885,10 +1957,10 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     const now = Date.now();
     await db.prepare(`INSERT INTO pvp_ready (client_id, room_code, deck_json, updated_at) VALUES (?, ?, ?, ?)
       ON CONFLICT(client_id) DO UPDATE SET room_code = excluded.room_code, deck_json = excluded.deck_json, updated_at = excluded.updated_at`)
-      .bind(session.client_id, room.code, JSON.stringify(deckIds), now).run();
+      .bind(session.client_id, room.code, JSON.stringify({ cardIds: deckIds, cardBackId: authorizedCardBackId }), now).run();
     const sequence = await nextPvpSequence(db, room);
     const opponentId = role === 0 ? room.guest_client_id : room.host_client_id;
-    if (opponentId) await queuePvpDbMessage(db, opponentId, { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: { ready: true } });
+    if (opponentId) await queuePvpDbMessage(db, opponentId, { type: "action", playerId: session.player_id, peerName: session.name, sequence, action, payload: { ready: true, cardBackId: authorizedCardBackId } });
     await queuePvpDbMessage(db, session.client_id, { type: "action_ack", action, sequence });
     return;
   }
@@ -1909,24 +1981,26 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     }
     const hostReady = await getPvpDbReady(db, room.host_client_id);
     const guestReady = await getPvpDbReady(db, room.guest_client_id);
-    let hostDeck: string[] | null = null;
-    let guestDeck: string[] | null = null;
+    let hostLoadout: { deckIds: string[]; cardBackId: string } | null = null;
+    let guestLoadout: { deckIds: string[]; cardBackId: string } | null = null;
     try {
-      hostDeck = hostReady ? parsePvpDeck(JSON.parse(hostReady.deck_json), room.ranked_format) : null;
-      guestDeck = guestReady ? parsePvpDeck(JSON.parse(guestReady.deck_json), room.ranked_format) : null;
+      hostLoadout = hostReady ? parsePvpReadyLoadout(JSON.parse(hostReady.deck_json), room.ranked_format) : null;
+      guestLoadout = guestReady ? parsePvpReadyLoadout(JSON.parse(guestReady.deck_json), room.ranked_format) : null;
     } catch {
-      hostDeck = null;
-      guestDeck = null;
+      hostLoadout = null;
+      guestLoadout = null;
     }
-    const decksStillAuthorized = hostDeck && guestDeck && hostReady?.room_code === room.code && guestReady?.room_code === room.code
+    const loadoutsStillAuthorized = hostLoadout && guestLoadout && hostReady?.room_code === room.code && guestReady?.room_code === room.code
       ? await Promise.all([
-          pvpAccountOwnsSavedDeck(db, room.host_client_id, hostDeck, room.ranked_format),
-          pvpAccountOwnsSavedDeck(db, room.guest_client_id, guestDeck, room.ranked_format),
+          pvpAccountAuthorizesLoadout(db, room.host_client_id, hostLoadout.deckIds, room.ranked_format, hostLoadout.cardBackId),
+          pvpAccountAuthorizesLoadout(db, room.guest_client_id, guestLoadout.deckIds, room.ranked_format, guestLoadout.cardBackId),
         ])
-      : [false, false];
-    if (!hostDeck || !guestDeck || !decksStillAuthorized[0] || !decksStillAuthorized[1]) {
+      : [null, null];
+    if (!hostLoadout || !guestLoadout || !loadoutsStillAuthorized[0] || !loadoutsStillAuthorized[1]) {
       return queuePvpDbMessage(db, session.client_id, { type: "action_rejected", action, message: "双方都需要先用合法卡组准备。" });
     }
+    const hostDeck = hostLoadout.deckIds;
+    const guestDeck = guestLoadout.deckIds;
     const [hostIdentity, guestIdentity] = await Promise.all([
       getPvpDbIdentity(db, room.host_client_id),
       getPvpDbIdentity(db, room.guest_client_id),
@@ -1938,7 +2012,14 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
     // Choose first player on the authoritative path; the room creator is not
     // always first, matching the normal Hearthstone opening cadence.
     const startingPlayer = createAuthoritativeStartingPlayer();
-    const state = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed, rankedFormat: room.ranked_format });
+    const cardBackIds: [string, string] = [
+      resolveCardBackSelection(hostLoadout.cardBackId, normalizeRankedRewardState((await loadPvpRewardState(db, room.host_client_id)) ?? undefined), seed, 0),
+      resolveCardBackSelection(guestLoadout.cardBackId, normalizeRankedRewardState((await loadPvpRewardState(db, room.guest_client_id)) ?? undefined), seed, 1),
+    ];
+    const state = {
+      ...createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed, rankedFormat: room.ranked_format }),
+      cardBackIds,
+    } as MatchState;
     const matchToken = crypto.randomUUID();
     const now = Date.now();
     const stateJson = JSON.stringify(state);
@@ -1995,6 +2076,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
       // The client only needs its own deck to open the pre-sync mulligan
       // screen. The authoritative snapshot follows through command sync.
       deck: viewer === 0 ? hostDeck : guestDeck,
+      cardBackIds,
       matchToken,
     });
     await queuePvpDbMessage(db, session.client_id, {
@@ -2021,6 +2103,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
         matchToken,
         format: room.format,
         rankedFormat: room.ranked_format,
+        cardBackIds,
       },
     });
     await queuePvpDbMessage(db, room.guest_client_id, {
@@ -2031,6 +2114,7 @@ async function dbRelayAction(db: PvpDatabase, session: PvpDbSession, message: Pv
         matchToken,
         format: room.format,
         rankedFormat: room.ranked_format,
+        cardBackIds,
       },
     });
     return;
@@ -2225,6 +2309,7 @@ function leavePvpRoom(peer: PvpPeer): void {
     // discard the private match and both ready decks so a replacement player
     // cannot inherit a stale state or an opponent's hidden cards.
     room.readyDecks.clear();
+    room.readyCardBacks.clear();
     room.matchState = undefined;
     room.matchToken = undefined;
     room.matchUpdatedAt = undefined;
@@ -2260,6 +2345,7 @@ function queuePvpPeer(peer: PvpPeer, format: "ranked" | "casual", rankedFormat: 
       peers: [opponent, peer],
       nextSequence: 0,
       readyDecks: new Map(),
+      readyCardBacks: new Map(),
     };
     let code = "";
     do {
@@ -2301,6 +2387,7 @@ function createPvpRoom(peer: PvpPeer, format: "ranked" | "casual", rankedFormat:
     peers: [peer],
     nextSequence: 0,
     readyDecks: new Map(),
+    readyCardBacks: new Map(),
   };
   pvpRooms.set(code, room);
   peer.room = code;
@@ -2418,8 +2505,10 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     // account-state database. It can enforce game deck rules only; production
     // D1 additionally verifies saved-deck membership and collection ownership.
     const deckIds = parsePvpDeck(rawPayload.deckIds, room.rankedFormat);
-    if (!deckIds) return rejectMemoryPvpAction(peer, action, "卡组无效，无法准备。");
+    const cardBackId = isCardBackId(rawPayload.cardBackId) ? rawPayload.cardBackId : null;
+    if (!deckIds || !cardBackId) return rejectMemoryPvpAction(peer, action, "卡组或卡背无效，无法准备。");
     room.readyDecks.set(peer.clientId, deckIds);
+    room.readyCardBacks.set(peer.clientId, cardBackId);
     const sequence = ++room.nextSequence;
     room.peers.filter((other) => other !== peer).forEach((other) => pvpJson(other, {
       type: "action",
@@ -2427,7 +2516,7 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
       peerName: peer.name,
       sequence,
       action,
-      payload: { ready: true },
+      payload: { ready: true, cardBackId },
     }));
     pvpJson(peer, { type: "action_ack", action, sequence });
     return;
@@ -2438,7 +2527,9 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     if (room.peers.length < 2) return rejectMemoryPvpAction(peer, action, "等待对手加入房间。");
     const hostDeck = room.readyDecks.get(room.peers[0].clientId);
     const guestDeck = room.readyDecks.get(room.peers[1].clientId);
-    if (!hostDeck || !guestDeck) return rejectMemoryPvpAction(peer, action, "双方都需要先用合法卡组准备。");
+    const hostCardBack = room.readyCardBacks.get(room.peers[0].clientId);
+    const guestCardBack = room.readyCardBacks.get(room.peers[1].clientId);
+    if (!hostDeck || !guestDeck || !hostCardBack || !guestCardBack) return rejectMemoryPvpAction(peer, action, "双方都需要先用合法卡组与卡背准备。");
     if (room.matchState) {
       return rejectMemoryPvpAction(
         peer,
@@ -2450,7 +2541,14 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     }
     const seed = createAuthoritativePvpSeed();
     const startingPlayer = createAuthoritativeStartingPlayer();
-    room.matchState = createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed, rankedFormat: room.rankedFormat });
+    const cardBackIds: [string, string] = [
+      hostCardBack === "random-owned" ? DEFAULT_CARD_BACK_ID : hostCardBack,
+      guestCardBack === "random-owned" ? DEFAULT_CARD_BACK_ID : guestCardBack,
+    ];
+    room.matchState = {
+      ...createMatch({ decks: [hostDeck, guestDeck], startingPlayer, seed, rankedFormat: room.rankedFormat }),
+      cardBackIds,
+    } as MatchState;
     room.matchToken = crypto.randomUUID();
     room.matchUpdatedAt = Date.now();
     const sequence = ++room.nextSequence;
@@ -2467,6 +2565,7 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
           format: room.format,
           rankedFormat: room.rankedFormat,
           deck: index === 0 ? hostDeck : guestDeck,
+          cardBackIds,
           matchToken: room.matchToken,
         },
       });
@@ -2479,6 +2578,7 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
           matchToken: room.matchToken,
           format: room.format,
           rankedFormat: room.rankedFormat,
+          cardBackIds,
         },
       });
     });
@@ -2491,6 +2591,7 @@ function relayPvpAction(peer: PvpPeer, message: PvpMessage): void {
     if (!room.peers[1]) return rejectMemoryPvpAction(peer, action, "等待对手加入房间。");
     if (room.matchState?.phase !== "game-over") return rejectMemoryPvpAction(peer, action, "本局尚未结束，暂时不能重新开始。");
     room.readyDecks.clear();
+    room.readyCardBacks.clear();
     room.matchState = undefined;
     room.matchToken = undefined;
     room.matchUpdatedAt = undefined;
