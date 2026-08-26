@@ -3,8 +3,11 @@ import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } fr
 import handler from "vinext/server/app-router-entry";
 import {
   CARD_BY_ID,
+  LADDER_READY_DECKS,
   applyCommand,
   createMatch,
+  ladderReadyDeckMatches,
+  ladderReadyTrialIsActive,
   validateDeck,
   type BattleCommand,
   type BattleTarget,
@@ -457,18 +460,6 @@ function pvpCardCounts(cardIds: readonly string[]): Map<string, number> {
   return counts;
 }
 
-function pvpDeckMultisetMatches(left: readonly string[], right: readonly string[]): boolean {
-  if (left.length !== right.length) return false;
-  const remaining = pvpCardCounts(left);
-  for (const cardId of right) {
-    const count = remaining.get(cardId);
-    if (!count) return false;
-    if (count === 1) remaining.delete(cardId);
-    else remaining.set(cardId, count - 1);
-  }
-  return remaining.size === 0;
-}
-
 function pvpAccountStateAllowsDeck(stateJson: string, deckIds: readonly string[]): boolean {
   let state: unknown;
   try {
@@ -482,18 +473,35 @@ function pvpAccountStateAllowsDeck(stateJson: string, deckIds: readonly string[]
     return false;
   }
   const collection = raw.collection as Record<string, unknown>;
-  const requested = pvpCardCounts(deckIds);
-  for (const [cardId, count] of requested) {
+  const ownsRequestedCards = [...pvpCardCounts(deckIds)].every(([cardId, count]) => {
     const owned = collection[cardId];
-    if (typeof owned !== "number" || !Number.isSafeInteger(owned) || owned < count) return false;
-  }
-  return raw.decks.some((deck) => {
+    return typeof owned === "number" && Number.isSafeInteger(owned) && owned >= count;
+  });
+  const ownsSavedDeck = ownsRequestedCards && raw.decks.some((deck) => {
     if (!deck || typeof deck !== "object" || Array.isArray(deck)) return false;
     const cardIds = (deck as Record<string, unknown>).cardIds;
     return Array.isArray(cardIds) &&
       cardIds.every((cardId) => typeof cardId === "string") &&
-      pvpDeckMultisetMatches(cardIds as string[], deckIds);
+      ladderReadyDeckMatches(cardIds as string[], deckIds);
   });
+  if (ownsSavedDeck) return true;
+
+  const trial = raw.ladderReady;
+  if (!trial || typeof trial !== "object" || Array.isArray(trial)) return false;
+  const ladderReady = trial as Record<string, unknown>;
+  if (
+    typeof ladderReady.activatedAt !== "string" ||
+    typeof ladderReady.expiresAt !== "string" ||
+    ladderReady.claimedDeckId !== null
+  ) {
+    return false;
+  }
+  if (!ladderReadyTrialIsActive({
+    activatedAt: ladderReady.activatedAt,
+    expiresAt: ladderReady.expiresAt,
+    claimedDeckId: null,
+  })) return false;
+  return LADDER_READY_DECKS.some((deck) => ladderReadyDeckMatches(deck.deck, deckIds));
 }
 
 async function pvpAccountOwnsSavedDeck(

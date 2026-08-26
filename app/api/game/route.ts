@@ -1,10 +1,12 @@
 import { getChatGPTUser } from "../../chatgpt-auth";
 import {
   claimApprenticeReward,
+  claimLadderReadyDeck,
   claimTask,
   claimReward,
   claimWeeklyPack,
   createAiMatch,
+  activateLadderReady,
   acceptFriendRequest,
   blockPlayer,
   buyPack,
@@ -32,7 +34,9 @@ import {
 } from "../../../db/game-store";
 import {
   APPRENTICE_MILESTONES,
+  LADDER_READY_DECKS,
   type ApprenticeMilestoneId,
+  type LadderReadyDeckId,
 } from "../../../lib/game";
 
 export const dynamic = "force-dynamic";
@@ -55,8 +59,18 @@ const ANONYMOUS_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
 type GameAction =
   | {
       action: "create_ai_match";
-      deckId: string;
+      deckId?: string;
+      ladderReadyDeckId?: LadderReadyDeckId;
       opponentArchetypeId: string;
+    }
+  | {
+      action: "activate_ladder_ready";
+      idempotencyKey: string;
+    }
+  | {
+      action: "claim_ladder_ready_deck";
+      idempotencyKey: string;
+      deckId: LadderReadyDeckId;
     }
   | {
       action: "save_deck";
@@ -190,6 +204,25 @@ export async function POST(request: Request): Promise<Response> {
           action: action.action,
           player: result.player,
           aiMatch: result.aiMatch,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "activate_ladder_ready": {
+        const result = await activateLadderReady(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          replayed: result.replayed,
+        }, 200, resolved.setCookie);
+      }
+      case "claim_ladder_ready_deck": {
+        const result = await claimLadderReadyDeck(identity, action);
+        return json({
+          ok: true,
+          action: action.action,
+          player: result.player,
+          claimedLadderReadyDeck: result.claimedLadderReadyDeck,
           replayed: result.replayed,
         }, 200, resolved.setCookie);
       }
@@ -497,13 +530,43 @@ function parseAction(value: unknown): GameAction {
   }
 
   switch (value.action) {
-    case "create_ai_match":
-      assertExactKeys(value, ["action", "deckId", "opponentArchetypeId"]);
+    case "create_ai_match": {
+      assertExactKeys(value, ["action", "opponentArchetypeId"], ["action", "opponentArchetypeId", "deckId", "ladderReadyDeckId"]);
+      const deckId = value.deckId === undefined ? undefined : parseIdentifier(value.deckId, "deckId");
+      const rawLadderReadyDeckId = value.ladderReadyDeckId === undefined
+        ? undefined
+        : parseIdentifier(value.ladderReadyDeckId, "ladderReadyDeckId");
+      if (Boolean(deckId) === Boolean(rawLadderReadyDeckId)) {
+        throw new PayloadError("deckId 与 ladderReadyDeckId 必须且只能提供一个。");
+      }
+      if (rawLadderReadyDeckId && !LADDER_READY_DECKS.some((deck) => deck.id === rawLadderReadyDeckId)) {
+        throw new PayloadError("ladderReadyDeckId 不是有效的天梯预备套牌。");
+      }
       return {
         action: "create_ai_match",
-        deckId: parseIdentifier(value.deckId, "deckId"),
+        ...(deckId ? { deckId } : {}),
+        ...(rawLadderReadyDeckId ? { ladderReadyDeckId: rawLadderReadyDeckId as LadderReadyDeckId } : {}),
         opponentArchetypeId: parseIdentifier(value.opponentArchetypeId, "opponentArchetypeId"),
       };
+    }
+    case "activate_ladder_ready":
+      assertExactKeys(value, ["action", "idempotencyKey"]);
+      return {
+        action: "activate_ladder_ready",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+      };
+    case "claim_ladder_ready_deck": {
+      assertExactKeys(value, ["action", "idempotencyKey", "deckId"]);
+      const deckId = parseIdentifier(value.deckId, "deckId");
+      if (!LADDER_READY_DECKS.some((deck) => deck.id === deckId)) {
+        throw new PayloadError("deckId 不是有效的天梯预备套牌。");
+      }
+      return {
+        action: "claim_ladder_ready_deck",
+        idempotencyKey: parseIdempotencyKey(value.idempotencyKey),
+        deckId: deckId as LadderReadyDeckId,
+      };
+    }
     case "save_deck": {
       assertExactKeys(value, ["action", "idempotencyKey", "deck"]);
       const idempotencyKey = parseIdempotencyKey(value.idempotencyKey);

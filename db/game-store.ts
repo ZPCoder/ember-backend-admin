@@ -3,15 +3,18 @@ import {
   AI_ARCHETYPES,
   CARD_CATALOG,
   DEFAULT_STARTER_DECK,
+  LADDER_READY_TRIAL_MS,
   aiMatchTicketMatchesProof,
   applyCommand,
   chooseAiMulliganIndexes,
   createMatch,
   derivePvpSettlement,
   runAiTurn,
+  getLadderReadyDeck,
+  ladderReadyTrialIsActive,
   validateDeck,
 } from "../lib/game";
-import type { BattleCommand, MatchState } from "../lib/game";
+import type { BattleCommand, LadderReadyDeckId, MatchState } from "../lib/game";
 import { drawPack } from "../lib/game/pack.ts";
 import {
   APPRENTICE_MILESTONES,
@@ -91,6 +94,12 @@ export type ApprenticeTrackState = {
   claimedMilestones: ApprenticeMilestoneId[];
 };
 
+export type LadderReadyState = {
+  activatedAt: string | null;
+  expiresAt: string | null;
+  claimedDeckId: LadderReadyDeckId | null;
+};
+
 export type PlayerLadder = {
   seasonKey: string;
   rating: number;
@@ -165,6 +174,7 @@ export type PlayerState = {
   progression: PlayerProgression;
   rewardTrack: RewardTrackState;
   apprenticeTrack: ApprenticeTrackState;
+  ladderReady: LadderReadyState;
   ladder: PlayerLadder;
   friends?: FriendSummary[];
   chatMessages?: SocialMessage[];
@@ -257,6 +267,17 @@ export type ClaimApprenticeRewardResult = {
   player: PlayerState;
   milestoneId: ApprenticeMilestoneId;
   reward: { title: string; kind: "gold" | "pack" | "dust"; amount: number };
+  replayed: boolean;
+};
+
+export type ActivateLadderReadyResult = {
+  player: PlayerState;
+  replayed: boolean;
+};
+
+export type ClaimLadderReadyDeckResult = {
+  player: PlayerState;
+  claimedLadderReadyDeck: PlayerDeck;
   replayed: boolean;
 };
 
@@ -441,7 +462,11 @@ export async function getPlayerState(
  */
 export async function createAiMatch(
   identity: GameIdentity,
-  input: { deckId: string; opponentArchetypeId: string },
+  input: {
+    deckId?: string;
+    ladderReadyDeckId?: LadderReadyDeckId;
+    opponentArchetypeId: string;
+  },
 ): Promise<CreateAiMatchResult> {
   const db = getD1();
   await ensureSchema(db);
@@ -469,15 +494,28 @@ export async function createAiMatch(
   }
 
   const state = parseStoredState((await loadStateRow(db, player.id)).stateJson);
-  const deck = state.decks.find((candidate) => candidate.id === input.deckId);
-  if (!deck) {
-    throw new GameStoreError("AI_DECK_NOT_SAVED", "AI 对局必须使用当前账号已保存的卡组。", 400);
+  const trialDeck = input.ladderReadyDeckId
+    ? getLadderReadyDeck(input.ladderReadyDeckId)
+    : undefined;
+  let selectedDeckId: string;
+  let selectedCardIds: readonly string[];
+  if (trialDeck) {
+    assertLadderReadyTrialActive(state.ladderReady, now);
+    selectedDeckId = `trial:${trialDeck.id}`;
+    selectedCardIds = trialDeck.deck;
+  } else {
+    const deck = state.decks.find((candidate) => candidate.id === input.deckId);
+    if (!deck) {
+      throw new GameStoreError("AI_DECK_NOT_SAVED", "AI 对局必须使用当前账号已保存的卡组或有效试玩套牌。", 400);
+    }
+    assertCardsOwned(deck.cardIds, state.collection);
+    selectedDeckId = deck.id;
+    selectedCardIds = deck.cardIds;
   }
-  const validation = validateDeck(deck.cardIds);
+  const validation = validateDeck(selectedCardIds);
   if (!validation.valid) {
     throw new GameStoreError("INVALID_DECK", "卡组不符合组牌规则。", 400, validation.errors);
   }
-  assertCardsOwned(deck.cardIds, state.collection);
   const archetype = AI_ARCHETYPES.find((candidate) => candidate.id === input.opponentArchetypeId);
   if (!archetype) {
     throw new GameStoreError("AI_ARCHETYPE_NOT_FOUND", "AI 对手原型不存在。", 400);
@@ -485,13 +523,16 @@ export async function createAiMatch(
 
   const randomness = new Uint32Array(2);
   crypto.getRandomValues(randomness);
+  const ticketExpiryMs = trialDeck && state.ladderReady.expiresAt
+    ? Math.min(now.getTime() + AI_MATCH_TICKET_TTL_MS, Date.parse(state.ladderReady.expiresAt))
+    : now.getTime() + AI_MATCH_TICKET_TTL_MS;
   const ticket: AiMatchTicket = {
     token: `ai-${crypto.randomUUID()}`,
     seed: (randomness[0] ?? 0) & 0x7fffffff,
     startingPlayer: ((randomness[1] ?? 0) & 1) as 0 | 1,
-    playerDeck: [...deck.cardIds],
+    playerDeck: [...selectedCardIds],
     opponentArchetypeId: archetype.id,
-    expiresAt: new Date(now.getTime() + AI_MATCH_TICKET_TTL_MS).toISOString(),
+    expiresAt: new Date(ticketExpiryMs).toISOString(),
   };
 
   try {
@@ -505,7 +546,7 @@ export async function createAiMatch(
       .bind(
         ticket.token,
         player.id,
-        deck.id,
+        selectedDeckId,
         JSON.stringify(ticket.playerDeck),
         ticket.opponentArchetypeId,
         ticket.seed,
@@ -1400,6 +1441,106 @@ export async function claimApprenticeReward(
     player: nextPlayer,
     milestoneId: result.milestoneId,
     reward: result.reward,
+    replayed,
+  }));
+}
+
+export async function activateLadderReady(
+  identity: GameIdentity,
+  input: { idempotencyKey: string },
+): Promise<ActivateLadderReadyResult> {
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+
+  return commitMutation(
+    db,
+    player,
+    "activate_ladder_ready",
+    input.idempotencyKey,
+    {},
+    (current) => {
+      if (current.ladderReady.claimedDeckId) {
+        throw new GameStoreError("LADDER_READY_ALREADY_CLAIMED", "本账号已经领取过一套天梯预备套牌。", 409);
+      }
+      if (current.ladderReady.activatedAt) {
+        throw new GameStoreError("LADDER_READY_ALREADY_ACTIVATED", "七日试玩已经激活。", 409);
+      }
+      const activatedAt = new Date();
+      return {
+        nextState: {
+          ...current,
+          ladderReady: {
+            activatedAt: activatedAt.toISOString(),
+            expiresAt: new Date(activatedAt.getTime() + LADDER_READY_TRIAL_MS).toISOString(),
+            claimedDeckId: null,
+          },
+        },
+        result: {},
+      };
+    },
+  ).then(({ player: nextPlayer, replayed }) => ({ player: nextPlayer, replayed }));
+}
+
+export async function claimLadderReadyDeck(
+  identity: GameIdentity,
+  input: { idempotencyKey: string; deckId: LadderReadyDeckId },
+): Promise<ClaimLadderReadyDeckResult> {
+  const offer = getLadderReadyDeck(input.deckId);
+  if (!offer) throw new GameStoreError("LADDER_READY_DECK_NOT_FOUND", "天梯预备套牌不存在。", 404);
+  const db = getD1();
+  await ensureSchema(db);
+  const player = await ensurePlayer(db, identity);
+
+  return commitMutation(
+    db,
+    player,
+    "claim_ladder_ready_deck",
+    input.idempotencyKey,
+    { deckId: offer.id },
+    (current) => {
+      if (!current.ladderReady.activatedAt) {
+        throw new GameStoreError("LADDER_READY_NOT_ACTIVATED", "请先激活七日试玩，再选择永久领取的套牌。", 409);
+      }
+      if (current.ladderReady.claimedDeckId) {
+        throw new GameStoreError("LADDER_READY_ALREADY_CLAIMED", "本账号已经领取过一套天梯预备套牌。", 409);
+      }
+      const validation = validateDeck(offer.deck);
+      if (!validation.valid) {
+        throw new GameStoreError("INVALID_DECK", "天梯预备套牌当前不可用。", 500, validation.errors);
+      }
+      const claimedDeck: PlayerDeck = {
+        id: `ladder-ready-${offer.id}`,
+        name: `${offer.faction} · ${offer.name}`,
+        cardIds: [...offer.deck],
+        updatedAt: new Date().toISOString(),
+      };
+      if (!current.decks.some((deck) => deck.id === claimedDeck.id) && current.decks.length >= 20) {
+        throw new GameStoreError("DECK_LIMIT_REACHED", "已保存卡组已达 20 套上限，请先整理卡组。", 409);
+      }
+      const required = cardCounts(offer.deck);
+      const collection = { ...current.collection };
+      for (const [cardId, count] of required) {
+        collection[cardId] = Math.max(collection[cardId] ?? 0, count);
+      }
+      const decks = [
+        ...current.decks.filter((deck) => deck.id !== claimedDeck.id),
+        claimedDeck,
+      ];
+      return {
+        nextState: {
+          ...current,
+          collection,
+          decks,
+          activeDeckId: claimedDeck.id,
+          ladderReady: { ...current.ladderReady, claimedDeckId: offer.id },
+        },
+        result: { claimedLadderReadyDeck: claimedDeck },
+      };
+    },
+  ).then(({ player: nextPlayer, result, replayed }) => ({
+    player: nextPlayer,
+    claimedLadderReadyDeck: result.claimedLadderReadyDeck,
     replayed,
   }));
 }
@@ -2976,6 +3117,7 @@ function createDefaultState(now: string): StoredPlayerState {
     progression: { xp: 0, level: 1 },
     rewardTrack: { claimedLevels: [] },
     apprenticeTrack: { claimedMilestones: [] },
+    ladderReady: { activatedAt: null, expiresAt: null, claimedDeckId: null },
     ladder: { seasonKey: utcSeasonKey(now), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 },
     stats: {
       wins: 0,
@@ -3072,6 +3214,15 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
         ),
       }
     : { claimedMilestones: [] };
+  const ladderReady = isRecord(value.ladderReady)
+    ? {
+        activatedAt: typeof value.ladderReady.activatedAt === "string" ? value.ladderReady.activatedAt : null,
+        expiresAt: typeof value.ladderReady.expiresAt === "string" ? value.ladderReady.expiresAt : null,
+        claimedDeckId: typeof value.ladderReady.claimedDeckId === "string" && getLadderReadyDeck(value.ladderReady.claimedDeckId)
+          ? value.ladderReady.claimedDeckId as LadderReadyDeckId
+          : null,
+      }
+    : { activatedAt: null, expiresAt: null, claimedDeckId: null };
   const ladder = isRecord(value.ladder)
     ? {
         seasonKey: typeof value.ladder.seasonKey === "string" ? value.ladder.seasonKey : utcSeasonKey(new Date().toISOString()),
@@ -3088,7 +3239,7 @@ function normalizeStoredState(value: unknown): StoredPlayerState | null {
     : { seasonKey: utcSeasonKey(new Date().toISOString()), rating: LADDER_START_RATING, tier: ladderTierForRating(LADDER_START_RATING), stars: ladderStarsForRating(LADDER_START_RATING), wins: 0, losses: 0, highestRating: LADDER_START_RATING, winStreak: 0 };
   ladder.tier = ladderTierForRating(ladder.rating);
   ladder.stars = ladderStarsForRating(ladder.rating);
-  return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladder } as StoredPlayerState;
+  return { ...value, tasks, taskCycle, packPity, progression, rewardTrack, apprenticeTrack, ladderReady, ladder } as StoredPlayerState;
 }
 
 function isStoredState(value: unknown): value is StoredPlayerState {
@@ -3113,6 +3264,7 @@ function isStoredState(value: unknown): value is StoredPlayerState {
     isProgression(value.progression) &&
     isRewardTrack(value.rewardTrack) &&
     isApprenticeTrack(value.apprenticeTrack) &&
+    isLadderReadyState(value.ladderReady) &&
     isLadder(value.ladder) &&
     value.decks.every(isDeck) &&
     value.tasks.every(isTask) &&
@@ -3160,6 +3312,19 @@ function isApprenticeTrack(value: unknown): value is ApprenticeTrackState {
     && value.claimedMilestones.every(
       (id) => typeof id === "string" && APPRENTICE_MILESTONES.some((milestone) => milestone.id === id),
     );
+}
+
+function isLadderReadyState(value: unknown): value is LadderReadyState {
+  if (!isRecord(value)) return false;
+  const activatedAt = value.activatedAt;
+  const expiresAt = value.expiresAt;
+  const claimedDeckId = value.claimedDeckId;
+  const noTrial = activatedAt === null && expiresAt === null;
+  const validTrial = typeof activatedAt === "string" && Number.isFinite(Date.parse(activatedAt))
+    && typeof expiresAt === "string" && Number.isFinite(Date.parse(expiresAt))
+    && Date.parse(expiresAt) > Date.parse(activatedAt);
+  return (noTrial || validTrial)
+    && (claimedDeckId === null || (typeof claimedDeckId === "string" && Boolean(getLadderReadyDeck(claimedDeckId))));
 }
 
 function isLadder(value: unknown): value is PlayerLadder {
@@ -3215,6 +3380,7 @@ function cloneState(state: StoredPlayerState): StoredPlayerState {
     progression: { ...state.progression },
     rewardTrack: { claimedLevels: [...state.rewardTrack.claimedLevels] },
     apprenticeTrack: { claimedMilestones: [...state.apprenticeTrack.claimedMilestones] },
+    ladderReady: { ...state.ladderReady },
     ladder: { ...state.ladder },
     stats: { ...state.stats },
   };
@@ -3248,6 +3414,8 @@ function isPristineState(state: StoredPlayerState): boolean {
     state.progression.xp === 0 &&
     state.rewardTrack.claimedLevels.length === 0 &&
     state.apprenticeTrack.claimedMilestones.length === 0 &&
+    state.ladderReady.activatedAt === null &&
+    state.ladderReady.claimedDeckId === null &&
     state.ladder.rating === 1000 &&
     state.tasks.every((task) => task.progress === 0 && !task.claimed)
   );
@@ -3448,14 +3616,29 @@ async function refreshPlayerCycle(db: D1DatabaseLike, player: PlayerRow): Promis
   }
 }
 
+function cardCounts(cardIds: readonly string[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const cardId of cardIds) counts.set(cardId, (counts.get(cardId) ?? 0) + 1);
+  return counts;
+}
+
+function assertLadderReadyTrialActive(state: LadderReadyState, now = new Date()): void {
+  if (!state.activatedAt || !state.expiresAt) {
+    throw new GameStoreError("LADDER_READY_NOT_ACTIVATED", "请先激活七日试玩。", 409);
+  }
+  if (state.claimedDeckId) {
+    throw new GameStoreError("LADDER_READY_TRIAL_ENDED", "永久领取后，其他天梯预备套牌试玩已经结束。", 409);
+  }
+  if (!ladderReadyTrialIsActive(state, now.getTime())) {
+    throw new GameStoreError("LADDER_READY_TRIAL_EXPIRED", "七日试玩已经结束，请选择一套永久领取。", 409);
+  }
+}
+
 function assertCardsOwned(
   cardIds: string[],
   collection: Record<string, number>,
 ): void {
-  const requested = new Map<string, number>();
-  for (const cardId of cardIds) {
-    requested.set(cardId, (requested.get(cardId) ?? 0) + 1);
-  }
+  const requested = cardCounts(cardIds);
 
   const missing = [...requested.entries()]
     .filter(([cardId, count]) => (collection[cardId] ?? 0) < count)
