@@ -188,6 +188,7 @@ function redactPvpStateForViewer(state: MatchState, viewer: 0 | 1): MatchState {
       spellsPlayedThisGame: [],
       spellsPlayedEntityIds: [],
       spellsPlayedFromStartingDeck: [],
+      cardGraveyard: [],
       secrets: (player.secrets ?? []).map((_, secretIndex) => ({
         entityId: `hidden-secret-${secretIndex}`,
         cardId: `hidden-secret-${secretIndex}`,
