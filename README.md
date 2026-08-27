@@ -42,6 +42,52 @@ flutter run                 # Android / iOS 设备
 
 本地开发时可在仓库根目录运行 `dart run server/multiplayer_server.dart 8787` 做 Flutter 房间 UI/连接协议测试。该内存服务不执行 TypeScript 权威规则，也不保存战绩；完整规则和正式结算请使用部署网页的 D1 联机入口。
 
+## Docker 试玩环境
+
+仓库提供由 Docker Compose 编排的 Flutter Web 与 Dart 房间服务。Nginx 在同一入口提供网页，并把 `/ws` 反向代理到内部房间服务；宿主机不直接暴露 8787 端口。
+
+需要 Docker Engine 与 Docker Compose v2。首次启动会下载固定版本的 Flutter、Dart、Nginx 和运行时基础镜像：
+
+```bash
+docker compose up --build -d
+docker compose ps
+```
+
+如果只需要运行已经发布到 GHCR 的镜像，不在服务器上编译源码：
+
+```bash
+docker compose pull
+docker compose up -d --no-build
+```
+
+默认镜像为 `ghcr.io/zpcoder/astra-web:latest` 与 `ghcr.io/zpcoder/astra-room-server:latest`。也可以通过 `IMAGE_TAG=sha-<提交短哈希>` 锁定不可变版本；如果镜像包保持私有，需要先使用具备 `read:packages` 权限的 GitHub Token 执行 `docker login ghcr.io`。
+
+默认访问 `http://127.0.0.1:8080`。需要更换宿主机端口时：
+
+```bash
+APP_PORT=9090 docker compose up --build -d
+```
+
+Flutter Web 会根据页面地址自动连接 `ws://当前域名/ws`；页面通过 HTTPS 发布时会自动改用 `wss://当前域名/ws`。云平台或外层反向代理需要负责 TLS 终止，并为 `/ws` 透传 WebSocket 的 `Upgrade` 和 `Connection` 请求头。
+
+常用检查命令：
+
+```bash
+curl --fail http://127.0.0.1:8080/healthz
+node server/multiplayer_smoke_test.mjs
+docker compose logs -f web room-server
+docker compose down
+```
+
+也可以分别构建两个最终镜像：
+
+```bash
+docker build --target web -t astra-web .
+docker build --target room-server -t astra-room-server .
+```
+
+房间服务仅保存当前进程内的两人房间和消息流，必须保持单副本运行；容器重启会清空房间。它不进行身份绑定、牌组与战斗规则校验、战绩保存或排位结算，因此只适合作为试玩和协议演示。
+
 ## 技术结构
 
 - `app/`：vinext/React 界面与游戏 API

@@ -21,22 +21,55 @@ class _Room {
 final _rooms = <String, _Room>{};
 final _peers = <WebSocket, _Peer>{};
 final _random = Random.secure();
+const _maxMessageBytes = 64 * 1024;
 
 void main(List<String> args) async {
+  if (args.isNotEmpty && args.first == '--health-check') {
+    final port = int.tryParse(args.length > 1 ? args[1] : '') ?? 8787;
+    await _runHealthCheck(port);
+    return;
+  }
+
   final port = int.tryParse(args.isEmpty ? '' : args.first) ?? 8787;
   final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
   print('ASTRA multiplayer server listening on ws://0.0.0.0:$port');
   await for (final request in server) {
-    if (WebSocketTransformer.isUpgradeRequest(request)) {
+    if (request.method == 'GET' && request.uri.path == '/healthz') {
+      request.response
+        ..statusCode = HttpStatus.ok
+        ..headers.contentType = ContentType.text
+        ..headers.set(HttpHeaders.cacheControlHeader, 'no-store')
+        ..write('ok\n');
+      await request.response.close();
+    } else if (WebSocketTransformer.isUpgradeRequest(request)) {
       final socket = await WebSocketTransformer.upgrade(request);
       _accept(socket);
     } else {
       request.response
         ..statusCode = HttpStatus.notFound
         ..headers.contentType = ContentType.text
-        ..write('ASTRA multiplayer server');
+        ..write('Not found\n');
       await request.response.close();
     }
+  }
+}
+
+Future<void> _runHealthCheck(int port) async {
+  final client = HttpClient()..connectionTimeout = const Duration(seconds: 2);
+  try {
+    final request = await client.getUrl(
+      Uri.parse('http://127.0.0.1:$port/healthz'),
+    );
+    final response = await request.close().timeout(const Duration(seconds: 2));
+    await response.drain<void>();
+    if (response.statusCode != HttpStatus.ok) {
+      throw HttpException('health endpoint returned ${response.statusCode}');
+    }
+  } catch (error) {
+    stderr.writeln('ASTRA multiplayer health check failed: $error');
+    exitCode = 1;
+  } finally {
+    client.close(force: true);
   }
 }
 
@@ -57,9 +90,27 @@ void _accept(WebSocket socket) {
 }
 
 void _handle(_Peer peer, Object? raw) {
-  if (raw is! String) return;
-  final decoded = jsonDecode(raw);
-  if (decoded is! Map) return;
+  if (raw is! String) {
+    _reject(peer, WebSocketStatus.unsupportedData, '仅支持文本消息');
+    return;
+  }
+  if (raw.length > _maxMessageBytes ||
+      utf8.encode(raw).length > _maxMessageBytes) {
+    _reject(peer, WebSocketStatus.messageTooBig, '消息不能超过 64 KiB');
+    return;
+  }
+
+  Object? decoded;
+  try {
+    decoded = jsonDecode(raw);
+  } on FormatException {
+    _error(peer, '消息必须是有效的 JSON 对象');
+    return;
+  }
+  if (decoded is! Map) {
+    _error(peer, '消息必须是 JSON 对象');
+    return;
+  }
   final message = Map<String, dynamic>.from(decoded);
   switch (message['type']) {
     case 'hello':
@@ -78,6 +129,8 @@ void _handle(_Peer peer, Object? raw) {
     case 'leave_room':
       _leaveRoom(peer);
       break;
+    default:
+      _error(peer, '未知的消息类型');
   }
 }
 
@@ -102,6 +155,10 @@ void _createRoom(_Peer peer) {
 }
 
 void _joinRoom(_Peer peer, String code) {
+  if (!RegExp(r'^[A-Z]{4}$').hasMatch(code)) {
+    _error(peer, '房间码必须是 4 位英文字母');
+    return;
+  }
   final room = _rooms[code];
   if (room == null) {
     _error(peer, '房间 $code 不存在');
@@ -192,6 +249,11 @@ void _leaveRoom(_Peer peer) {
 
 void _error(_Peer peer, String message) {
   _send(peer, <String, dynamic>{'type': 'error', 'message': message});
+}
+
+void _reject(_Peer peer, int statusCode, String reason) {
+  peer.socket.close(statusCode, reason);
+  _leave(peer);
 }
 
 void _send(_Peer peer, Map<String, dynamic> message) {
