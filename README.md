@@ -46,21 +46,23 @@ flutter run                 # Android / iOS 设备
 
 仓库提供由 Docker Compose 编排的 Flutter Web 与 Dart 房间服务。Nginx 在同一入口提供网页，并把 `/ws` 反向代理到内部房间服务；宿主机不直接暴露 8787 端口。
 
-需要 Docker Engine 与 Docker Compose v2。首次启动会下载固定版本的 Flutter、Dart、Nginx 和运行时基础镜像：
+需要 Docker Engine 与 Docker Compose v2。项目镜像直接在部署机器上从源码构建；Docker 会根据当前机器架构下载 Dockerfile 中固定版本的 Flutter、Dart、Nginx 和运行时基础镜像。
+
+首次部署：
 
 ```bash
 docker compose up --build -d
 docker compose ps
 ```
 
-如果只需要运行已经发布到 GHCR 的镜像，不在服务器上编译源码：
+更新源码并重新构建：
 
 ```bash
-docker compose pull
-docker compose up -d --no-build
+git pull
+docker compose up --build -d
 ```
 
-默认镜像为 `ghcr.io/zpcoder/astra-web:latest` 与 `ghcr.io/zpcoder/astra-room-server:latest`。也可以通过 `IMAGE_TAG=sha-<提交短哈希>` 锁定不可变版本；如果镜像包保持私有，需要先使用具备 `read:packages` 权限的 GitHub Token 执行 `docker login ghcr.io`。
+需要主动检查并更新上游基础镜像时，可以先执行 `docker compose build --pull`，再执行 `docker compose up -d`。首次构建需要下载完整工具链并编译 Flutter Web 和 Dart 房间服务，耗时会明显长于后续缓存构建。
 
 默认访问 `http://127.0.0.1:8080`。需要更换宿主机端口时：
 
