@@ -1745,6 +1745,23 @@ function canonicalCommand(value: unknown, role: 0 | 1): BattleCommand | null {
       const target = canonicalTarget(raw.target, role);
       return target ? { type: "hero-attack", ...metadata, target } : null;
     }
+    case "use-titan-ability": {
+      const unitId = canonicalCommandString(raw.unitId);
+      const abilityIndex = raw.abilityIndex;
+      if (
+        !unitId ||
+        typeof abilityIndex !== "number" ||
+        !Number.isSafeInteger(abilityIndex) ||
+        abilityIndex < 0
+      ) return null;
+      if (raw.target === undefined) {
+        return { type: "use-titan-ability", ...metadata, unitId, abilityIndex };
+      }
+      const target = canonicalTarget(raw.target, role);
+      return target
+        ? { type: "use-titan-ability", ...metadata, unitId, abilityIndex, target }
+        : null;
+    }
     case "choose-discover": {
       const cardId = canonicalCommandString(raw.cardId);
       const choiceIndex = raw.choiceIndex === undefined

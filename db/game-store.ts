@@ -5089,6 +5089,7 @@ const AI_PROOF_COMMAND_TYPES = new Set<string>([
   "attack",
   "hero-attack",
   "activate-location",
+  "use-titan-ability",
   "choose-discover",
   "choose-one",
   "hero-power",

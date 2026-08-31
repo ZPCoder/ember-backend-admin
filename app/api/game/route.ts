@@ -1060,7 +1060,7 @@ function parseAiMatchProof(value: unknown): AiMatchProof {
   }
   const allowedTypes = new Set([
     "mulligan", "play-card", "trade-card", "prepare-card", "attack", "hero-attack", "activate-location",
-    "choose-discover", "choose-one", "hero-power", "use-coin", "end-turn", "concede",
+    "choose-discover", "choose-one", "use-titan-ability", "hero-power", "use-coin", "end-turn", "concede",
   ]);
   const commands = value.commands.map((raw, index) => {
     if (!isRecord(raw) || typeof raw.type !== "string" || !allowedTypes.has(raw.type)) {
