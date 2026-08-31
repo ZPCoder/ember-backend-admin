@@ -1,0 +1,22 @@
+name: backend-admin-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - name: Validate canonical SQLite migration
+        run: sqlite3 ':memory:' '.bail on' '.read migrations/canonical/0000_canonical.sql' 'PRAGMA foreign_key_check;' "SELECT CASE count(*) WHEN 1 THEN 1 ELSE json_extract('invalid', '$') END FROM schema_metadata WHERE key='canonical_schema_version' AND value='1';"

@@ -1,0 +1,47 @@
+{
+  "protocolVersion": "1.0",
+  "matchId": "match_fixture_0001",
+  "cursor": 1,
+  "stateVersion": 1,
+  "events": [
+    {
+      "type": "command-accepted",
+      "occurredAt": "2026-08-31T00:00:01.000Z",
+      "payload": {
+        "actorPlayerId": "player-fixture-1",
+        "commandType": "end-turn"
+      }
+    }
+  ],
+  "snapshot": {
+    "matchId": "match_fixture_0001",
+    "stateVersion": 1,
+    "cursor": 1,
+    "phase": "playing",
+    "turn": 1,
+    "activePlayerId": "player-fixture-1",
+    "viewer": {
+      "playerId": "player-fixture-1",
+      "heroHealth": 30,
+      "heroArmor": 0,
+      "mana": 0,
+      "maxMana": 0,
+      "deckCount": 0,
+      "handCount": 0,
+      "board": [],
+      "hand": []
+    },
+    "opponent": {
+      "playerId": "pending-opponent",
+      "heroHealth": 30,
+      "heroArmor": 0,
+      "mana": 0,
+      "maxMana": 0,
+      "deckCount": 0,
+      "handCount": 0,
+      "board": []
+    },
+    "winnerId": null,
+    "deadlineAt": "2026-08-31T00:01:15.000Z"
+  }
+}

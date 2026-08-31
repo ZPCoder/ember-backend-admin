@@ -1,0 +1,32 @@
+{
+  "name": "@zpcoder/ember-backend-admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Authoritative backend and audited operator console for Ember Protocol.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@zpcoder/ember-config": "^0.1.0",
+    "@zpcoder/ember-protocol": "^0.1.0",
+    "@zpcoder/ember-sdk": "^0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@zpcoder/ember-config": { "optional": true },
+    "@zpcoder/ember-protocol": { "optional": true },
+    "@zpcoder/ember-sdk": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>余烬协议 · 管理控制台</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="masthead">
+      <div>
+        <p class="eyebrow">EMBER PROTOCOL / CONTROL PLANE</p>
+        <h1>管理控制台</h1>
+      </div>
+      <div class="status"><span aria-hidden="true"></span> 权威服务</div>
+    </header>
+
+    <main>
+      <section class="panel" aria-labelledby="config-title">
+        <div class="panel-heading">
+          <div><p class="step">系统</p><h2 id="config-title">当前配置</h2></div>
+          <button id="refresh-config" type="button">刷新</button>
+        </div>
+        <pre id="config-output" class="output">尚未加载</pre>
+      </section>
+
+      <section class="panel" aria-labelledby="player-title">
+        <div class="panel-heading"><div><p class="step">玩家资产</p><h2 id="player-title">玩家查询</h2></div></div>
+        <form id="player-search" class="form-row">
+          <label>玩家 ID 或指挥官名<input id="player-query" minlength="2" required autocomplete="off" /></label>
+          <button type="submit">查询</button>
+        </form>
+        <pre id="player-output" class="output">输入至少两个字符</pre>
+      </section>
+
+      <section class="panel panel-wide" aria-labelledby="migration-title">
+        <div class="panel-heading">
+          <div><p class="step">受控迁移</p><h2 id="migration-title">Flutter 存档审核</h2></div>
+          <span class="danger-note">所有写操作均要求二次确认并写入审计</span>
+        </div>
+        <form id="migration-preview" class="migration-grid">
+          <label>Migration ID<input id="migration-id" value="migration_" pattern="migration_[A-Za-z0-9_-]{8,128}" required /></label>
+          <label>玩家 ID<input id="migration-player-id" required /></label>
+          <label class="full">LegacyFlutterSaveV1 JSON<textarea id="migration-json" rows="14" spellcheck="false" required></textarea></label>
+          <div class="actions full">
+            <button type="submit">预览资产差异</button>
+            <button id="apply-migration" class="danger" type="button" disabled>一次性应用</button>
+            <button id="rollback-migration" class="ghost" type="button" disabled>安全回滚</button>
+          </div>
+        </form>
+        <pre id="migration-output" class="output">等待迁移预览</pre>
+      </section>
+
+      <section class="panel" aria-labelledby="replay-title">
+        <div class="panel-heading"><div><p class="step">正式 PVP</p><h2 id="replay-title">对局回放</h2></div></div>
+        <form id="replay-form" class="form-row">
+          <label>Session ID<input id="replay-session-id" required /></label>
+          <button type="submit">读取事件</button>
+        </form>
+        <pre id="replay-output" class="output">尚未选择对局</pre>
+      </section>
+
+      <section class="panel" aria-labelledby="audit-title">
+        <div class="panel-heading">
+          <div><p class="step">不可抵赖</p><h2 id="audit-title">管理员审计</h2></div>
+          <button id="refresh-audit" type="button">刷新</button>
+        </div>
+        <pre id="audit-output" class="output">尚未加载</pre>
+      </section>
+    </main>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="./admin.js"></script>
+  </body>
+</html>

@@ -1,123 +1,48 @@
-# 余烬协议
+# Ember backend + admin
 
-根据《回合制卡牌对战游戏客户需求整理》实现的第一期可玩纵向切片。项目覆盖卡牌收集、30 张卡组构筑、任务奖励、抽包、AI 对战与玩家进度持久化，面向桌面与移动端浏览器。
+Authoritative player assets, channel identity, formal PVP persistence, social data, Flutter save review, analytics ingestion schema, and the operator console live here. The package is intentionally framework-neutral: services accept narrow ports, the router adapts them to `/v1`, and Cloudflare D1 or Node/PostgreSQL/Redis adapters can implement `BackendStore` without changing protocol semantics.
 
-## 已实现
+## Implemented vertical slice
 
-- 1000 张原创卡牌及独立卡面资源，覆盖 20 个卡牌体系；每个体系 50 张卡牌并配套单位、战术、武器曲线、首张英雄牌与首张可激活地点
-- 卡牌搜索、体系/卡牌类型/9 类随从类型/7 类法术派系/稀有度/特质/关键词筛选、20 体系图鉴与分批加载
-- 30 张卡组编辑、重复数量限制、曲线统计、合法性校验与保存
-- 可完整游玩的回合制战斗：能量、每回合一次 2 费核心脉冲、出牌、选取目标、单位/武器英雄攻击、护盾、嘲讽、冲锋、突袭、风怒、剧毒、潜行、扰魔、本回合/牌面常驻/条件光环/角色攻击时免疫、两回合休眠与唤醒效果、复生、角色冻结、亡语、投降与胜负结算
-- 炉石式进阶战斗链：武器与英雄攻击、英雄牌变身/护甲/技能替换、与单位共享七格战场的地点（部署休眠、免费激活、跨己方回合冷却、耐久耗尽离场）、奥秘反制、按标准/狂野动态过滤且排除自身的发现牌池、抉择、连击、过载、可交易、逐手牌入手回合与快枪、预备、贿赂、伪装敌方战场部署、永久/随机控制权转移、保留当前费用的敌方手牌/牌库实体复制与来源脱敏、Draw/Add/Copy/Overdraw 独立事件、随从完整状态复制/复制变形/印刷复制入手、手牌施法历史/上一张敌方法术随机目标重施放、起始牌组来源/每局一次多法术重施放、破碎手牌两端与重组、先驱进度、巨型本体/附肢组装、灾变多选、生成牌洗入与固定费用、永久/双随从类型与万象匹配、类型增益与牌库检索、法术派系定向检索/当回合共鸣/上回合历史、公开死亡历史/印刷状态复活/清除增益回手、随机弃牌/弃牌触发/本局弃牌找回、法术伤害、沉默、变形、临时增益、回合开始/结束触发与慢速战斗回放
-- 真实抽牌支持“抽到时施放”、不进手牌、满手仍触发、连锁替代抽牌与对手牌库洗入；发现、复制和找回不会误触发
-- 每张物理卡拥有稳定实体 ID；抽牌、换牌、交易、洗牌、单位上场与回手均保持身份，法术历史、武器、奥秘和英雄牌变身继续沿用原手牌 ID，并以有序非单位墓地记录结算、反制、触发、替换、损毁和燃毁原因；破碎片各自唯一，PVP 隐藏区域只下发匿名槽位别名
-- 幸运币作为真正的通用手牌拥有非收藏比赛卡定义和独立实体 ID，可参与十牌上限、随机弃牌与敌方手牌复制；正常使用进入非起始牌组法术历史与墓地，被反制只记录反制离场，免费重施放可解析同一临时法力效果
-- 确定性 AI 回合与可复现的随机数种子
-- 每日/每周任务、重随、卡包重复保护、制作/分解、奖励轨道、赛季天梯与反刷奖励
-- ChatGPT 身份识别、匿名设备档案与登录后安全绑定；本地开发时自动使用演示身份
-- 好友请求、私聊、屏蔽、举报、幂等审计和服务端权威 PVP 结算
-- Cloudflare D1 玩家档案、卡组、任务、开包、战绩和审计事件持久化
-- 本地演示档案在 API 暂不可用时会按邮箱写入浏览器缓存，刷新不丢进度；运营台提供显式重置入口
-- 卡组工坊支持保存多套卡组、切换已保存卡组与新建卡组草稿
-- 响应式中文界面、键盘操作、ARIA 标签与社交分享图
-- 三关首领教学战役：无需预先保存卡组，依次挑战“雾门哨兵、棱镜守门人、逆流档案官”；每关使用独立对手、固定先手与种子重现确定性牌序，并通过剧情台词教授冲锋直击、护盾交换、后手幸运币与发现选择。关卡按账号持久进度顺序解锁，非指定卡牌、目标和越级指令均被拦截；完成记录必须由服务器签发票据并重放部分对局指令后才写入，训练不结算正式战绩或奖励，失败后可保留已完成步骤并安全重试
-- 服务端校验的新兵晋升轨道：开包、首战、首胜和等级目标各自提供一次性成长奖励，并与本地演示档案保持一致
-- 天梯预备军械库：六套完整卡组提供七日 AI/PVP 试玩，每个主要扩展窗口自动发布一份不可变目录；激活时由账号锁定版本，旧档案按激活时间迁移，服务端校验时限、目录、卡组内容和每期一次免费领取；领取后可用金币购买同目录其余套牌，离开满 90 天后进入新资格周期，首页与卡组导航会主动提示新资格，旧卡牌与版本化保存卡组不会被覆盖或回收
-- 回归任务链与追赶包：按“启动扶持→保存标准卡组→完成对战”顺序推进三环任务；具名且内容冻结的“圣甲虫回归追赶包”固定包含猛禽年与圣甲虫年，每个扩展独立按逐卡曾获得完成度提供 1–10 张（非传说最多计 2 张、传说最多计 1 张，分解不倒退；合计 2–20 张）；普通开包、制作、永久套牌、天梯卡牌奖励与追赶奖励统一写入历史；包内优先补齐合法缺失复制、保证至少 20% 稀有或更高品质，并以独立逐系列账本保证前 50 张内出现传说，由服务端幂等记录累计结果
-- 回归试玩卡：扶持计划同步开放猛禽年与圣甲虫年两个当前扩展七日构筑权限；组牌、智能补全、AI 与 PVP 都认可临时卡牌，真实收藏、制作和分解保持隔离，到期后自动停用
+- `Platform4399Adapter` accepts only an opaque one-time ticket and delegates official server-to-server verification. It declares `supportsPayment=false`; there is no product or recharge API.
+- Opaque access tokens expire after 15 minutes by default. Only SHA-256 token and ticket hashes cross the storage boundary, and a consumed ticket cannot be replayed.
+- Player commands and PVP commands enforce `idempotencyKey` plus `expectedVersion`. The memory adapter demonstrates the atomic contract used by durable adapters.
+- Polling and WebSocket delivery use the same `PvpEventEnvelope`; WebSocket is not a second game protocol.
+- Public PVP uses canonical `matchId`, cursor/state versions and
+  `RedactedMatchSnapshot`; opponent hand contents never enter the envelope.
+- Flutter saves are size/card/range/slot validated, previewed as a diff, applied once, audited, and rolled back automatically only while the applied player version remains current.
+- Administrator reads require granular RBAC. Every write requires both a role and an exact typed confirmation.
+- The canonical empty-database migration creates player assets, 27 deck slots, social/PVP state, channel accounts, sessions, audit, migration and event tables with constraints and indexes.
+- Runtime readiness performs one `SELECT` against `schema_metadata`. It never executes `CREATE`, `ALTER`, or opportunistic repair; an unready deployment returns HTTP 503.
 
-网页纵向切片默认进入 AI 练习；战术对战页同时提供正式 PVP 房间大厅。发布网页通过同站 `/api/pvp-poll` 连接 D1 持久化大厅，手机和电脑打开同一网址即可用房间码进行 1v1；Ranked 队列按赛季 rating 近邻匹配并随等待时间放宽，Casual 不影响段位。生产 Worker 负责权威规则校验、隐藏信息、回合时限、断线同步和终局归档。仓库也提供 `flutter_app/` 全端离线练习客户端，支持 Web、macOS、Windows、Linux、iOS、Android；其 WebSocket 房间界面是本地协议调试工具，不记入正式排位战绩。
+## API surface
 
-## Flutter 全端客户端
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/v1/auth/channel/exchange` | Verify a one-time platform ticket and issue a short session |
+| GET | `/v1/player` | Read the server-authoritative player projection |
+| POST | `/v1/player/commands` | Apply an idempotent, versioned player command |
+| POST | `/v1/pvp/sessions` | Enter a formal PVP session |
+| POST | `/v1/pvp/commands` | Submit an authoritative battle command |
+| GET | `/v1/pvp/events` | Poll events after a cursor |
+| GET | `/v1/admin/players` | Search players |
+| POST | `/v1/admin/migrations/{preview,apply,rollback}` | Audited legacy-save workflow |
+| GET | `/v1/admin/{audit,pvp/replay,config-version}` | Audit, replay and release diagnostics |
 
-```bash
-cd flutter_app
-flutter pub get
-flutter run -d chrome       # Web
-flutter run -d macos        # macOS
-flutter run                 # Android / iOS 设备
-```
+`AdminAuthenticator` must be backed by the organisation identity proxy. Never construct administrator roles from browser headers. The static console under `admin/` relies on a same-origin authenticated gateway.
 
-联机房间服务器和双客户端协议烟测见 [`flutter_app/README.md`](flutter_app/README.md)。
+## Local verification
 
-本地开发时可在仓库根目录运行 `dart run server/multiplayer_server.dart 8787` 做 Flutter 房间 UI/连接协议测试。该内存服务不执行 TypeScript 权威规则，也不保存战绩；完整规则和正式结算请使用部署网页的 D1 联机入口。
-
-## Docker 试玩环境
-
-仓库提供由 Docker Compose 编排的 Flutter Web 与 Dart 房间服务。Nginx 在同一入口提供网页，并把 `/ws` 反向代理到内部房间服务；宿主机不直接暴露 8787 端口。
-
-需要 Docker Engine 与 Docker Compose v2。项目镜像直接在部署机器上从源码构建；Docker 会根据当前机器架构下载 Dockerfile 中固定版本的 Flutter、Dart、Nginx 和运行时基础镜像。
-
-首次部署：
-
-```bash
-docker compose up --build -d
-docker compose ps
-```
-
-更新源码并重新构建：
-
-```bash
-git pull
-docker compose up --build -d
-```
-
-需要主动检查并更新上游基础镜像时，可以先执行 `docker compose build --pull`，再执行 `docker compose up -d`。首次构建需要下载完整工具链并编译 Flutter Web 和 Dart 房间服务，耗时会明显长于后续缓存构建。
-
-默认访问 `http://127.0.0.1:8080`。需要更换宿主机端口时：
-
-```bash
-APP_PORT=9090 docker compose up --build -d
-```
-
-Flutter Web 会根据页面地址自动连接 `ws://当前域名/ws`；页面通过 HTTPS 发布时会自动改用 `wss://当前域名/ws`。云平台或外层反向代理需要负责 TLS 终止，并为 `/ws` 透传 WebSocket 的 `Upgrade` 和 `Connection` 请求头。
-
-常用检查命令：
-
-```bash
-curl --fail http://127.0.0.1:8080/healthz
-node server/multiplayer_smoke_test.mjs
-docker compose logs -f web room-server
-docker compose down
-```
-
-也可以分别构建两个最终镜像：
-
-```bash
-docker build --target web -t astra-web .
-docker build --target room-server -t astra-room-server .
-```
-
-房间服务仅保存当前进程内的两人房间和消息流，必须保持单副本运行；容器重启会清空房间。它不进行身份绑定、牌组与战斗规则校验、战绩保存或排位结算，因此只适合作为试玩和协议演示。
-
-## 技术结构
-
-- `app/`：vinext/React 界面与游戏 API
-- `lib/game/`：纯 TypeScript 卡牌目录、卡组规则与战斗引擎
-- `db/`：Drizzle D1 数据模型和持久化服务
-- `drizzle/`：数据库迁移
-- `tests/`：战斗规则和发布产物检查
-- `worker/`：Cloudflare Worker 入口
-
-规则语义、与《炉石传说》的逐项差异、已支持关键词及后续扩展门槛见
-[`docs/HEARTHSTONE_RULES_AUDIT.md`](docs/HEARTHSTONE_RULES_AUDIT.md)。
-
-服务端写操作使用平台注入的 ChatGPT 身份头；生产环境不会接受客户端伪造的用户标识。玩家状态更新使用版本号和命令幂等键，避免重复领奖或重复结算。PVP 胜负由参赛身份和终局快照推导，并会在下次登录时自动补记，关闭败局页面不能逃避战绩。AI 开局参数由服务端一次性票据固定，结算重放与奖励写入会在同一 D1 batch 内消费票据，客户端不能通过重抽 seed 或更换幂等键重复领取奖励。
-
-## 本地运行
-
-需要 Node.js `>=22.13.0`。
-
-```bash
+```sh
 npm install
-npm run dev
+npm run check
+sqlite3 ':memory:' '.bail on' '.read migrations/canonical/0000_canonical.sql' \
+  'PRAGMA foreign_key_check;' \
+  "SELECT CASE count(*) WHEN 1 THEN 1 ELSE json_extract('invalid', '$') END FROM schema_metadata WHERE key='canonical_schema_version' AND value='1';"
 ```
 
-常用命令：
+The test suite covers ticket replay, session expiry, optimistic concurrency, idempotency-key misuse, equivalent PVP transports, migration validation/apply/rollback, RBAC confirmation, CORS, schema readiness, absence of runtime DDL, and canonical schema coverage.
 
-- `npm test`：执行战斗引擎测试、生产构建和发布产物检查
-- `npm run lint`：运行 ESLint
-- `npm run build`：生成 Sites/Cloudflare Worker 发布包
-- `npm run db:generate`：数据模型变化后生成 Drizzle 迁移
+## Production gates
 
-本地 D1 数据由 vinext 开发环境模拟；部署时绑定名为 `DB` 的 D1 数据库。
+The 4399 gateway remains an injected interface until current official documents and a sandbox account are supplied. Business must confirm the no-recharge H5 submission path in writing; payment work is deliberately out of scope. The in-memory store is for deterministic tests only. A production release must provide a transactional D1 or PostgreSQL implementation and pass the migration, replay and 500-CCU gates managed by `ember-ops`.
